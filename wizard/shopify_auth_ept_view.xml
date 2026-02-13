@@ -1,0 +1,41 @@
+<odoo>
+    <record id="view_shopify_auth_process_ept_form" model="ir.ui.view">
+        <field name="name">shopify.auth.process.ept.form</field>
+        <field name="model">shopify.auth.process.ept</field>
+        <field name="arch" type="xml">
+
+            <form string="Generate Shopify OAuth Link (ept)">
+                <sheet>
+                    <div class="oe_title" style="margin-bottom: 8px;">
+                        <h2 style="font-size: 1.6em; font-weight: 600; color: #2c3e50;">
+                            Shopify Set OAuth Details
+                        </h2>
+                    </div>
+                    <group>
+                        <field name="shopify_host" placeholder="e.g. demo.myshopify.com"/>
+
+                        <field name="shopify_client_id" placeholder="Your Shopify App Client ID (API Key)"/>
+
+                        <field name="shopify_secret_id" placeholder="Your Shopify App Secret Key"/>
+                    </group>
+
+                    <!-- APP URL BLOCK (SEPARATE GROUP) -->
+                    <group string="App Integration URLs" col="2">
+                        <field name="redirect_url" readonly="1"/>
+                        <field name="app_url" readonly="1"/>
+                    </group>
+
+                    <!-- FOOTER -->
+                    <footer>
+                        <button name="generate_auth_link" type="object"
+                                string="Set Authorization details"
+                                class="btn-primary"
+                                style="margin-right: 8px;"/>
+
+                        <button string="Cancel" class="btn-secondary" special="cancel"/>
+                    </footer>
+                </sheet>
+            </form>
+        </field>
+    </record>
+</odoo>
