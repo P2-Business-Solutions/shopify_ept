@@ -239,6 +239,25 @@
                                 </field>
                             </div>
                         </page>
+                        <page string="Discount Code Mapping" name="discount_code_mapping"
+                              groups="analytic.group_analytic_accounting">
+                            <group>
+                                <group>
+                                    <field name="free_product_cogs_account_id"
+                                           options="{'no_create':True,'no_create_edit': True}"
+                                           string="Free Product COGS Expense Account"/>
+                                </group>
+                            </group>
+                            <div name="discount_code_config">
+                                <field name="discount_code_config_ids" colspan="4" nolabel="1">
+                                    <list nolabel="1" editable="bottom">
+                                        <field name="discount_code" required="1"/>
+                                        <field name="analytic_account_id" required="1"
+                                               options="{'no_create':True,'no_create_edit': True}"/>
+                                    </list>
+                                </field>
+                            </div>
+                        </page>
                         <page string="Default products" name="default_order_product">
                             <group name="group_default_order_product">
                                 <group name="default_product">

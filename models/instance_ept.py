@@ -304,6 +304,15 @@ class ShopifyInstanceEpt(models.Model):
                                      domain=[('type', '=', 'service')],
                                      default=_default_tip_product,
                                      help="This is used for set Tip product in a sale order lines")
+    # Discount Code Configuration
+    discount_code_config_ids = fields.One2many(
+        "shopify.discount.code.config.ept", "instance_id",
+        string="Discount Code Configurations")
+    free_product_cogs_account_id = fields.Many2one(
+        "account.account", string="Free Product COGS Expense Account",
+        help="When a product is 100% discounted, COGS posts to this expense account "
+             "instead of the normal COGS account.")
+
     # Analytic
     shopify_is_use_analytic_account = fields.Boolean(default=True)
     shopify_analytic_account_id = fields.Many2one('account.analytic.account', string='Analytic Account',

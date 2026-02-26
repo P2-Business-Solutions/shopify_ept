@@ -385,6 +385,10 @@ class ResConfigSettings(models.TransientModel):
     #                                             string='Shopify Analytic Tags',
     #                                             domain="['|', ('company_id', '=', False),
     #                                             ('company_id', '=', shopify_company_id)]")
+    free_product_cogs_account_id = fields.Many2one(
+        'account.account', string='Free Product COGS Expense Account',
+        help="When a product is 100% discounted, COGS posts to this expense account "
+             "instead of the normal COGS account.")
     shopify_lang_id = fields.Many2one('res.lang', string='Shopify Instance Language',
                                       help="Select language for Shopify customer.")
     # presentment currency
@@ -502,6 +506,7 @@ class ResConfigSettings(models.TransientModel):
             self.shopify_is_use_analytic_account = instance.shopify_is_use_analytic_account or False
             self.shopify_analytic_account_id = instance.shopify_analytic_account_id.id or False
             # self.shopify_analytic_tag_ids = instance.shopify_analytic_tag_ids.ids
+            self.free_product_cogs_account_id = instance.free_product_cogs_account_id.id or False
             self.shopify_lang_id = instance.shopify_lang_id and instance.shopify_lang_id.id or False
             self.order_visible_currency = instance.order_visible_currency or False
             self.is_shopify_digest = instance.is_shopify_digest or False
@@ -579,6 +584,8 @@ class ResConfigSettings(models.TransientModel):
             values["shopify_analytic_account_id"] = self.shopify_analytic_account_id and \
                                                     self.shopify_analytic_account_id.id or False
             # values["shopify_analytic_tag_ids"] = [(6, 0, self.shopify_analytic_tag_ids.ids)]
+            values["free_product_cogs_account_id"] = self.free_product_cogs_account_id and \
+                                                     self.free_product_cogs_account_id.id or False
             values['shopify_lang_id'] = self.shopify_lang_id and self.shopify_lang_id.id or False
             values['order_visible_currency'] = self.order_visible_currency or False
             values['is_shopify_digest'] = self.is_shopify_digest or False
@@ -789,6 +796,7 @@ class ResConfigSettings(models.TransientModel):
                 'shopify_is_use_analytic_account': self.shopify_is_use_analytic_account or False,
                 'shopify_analytic_account_id': self.shopify_analytic_account_id.id or False,
                 # 'shopify_analytic_tag_ids': self.shopify_analytic_tag_ids.ids or False,
+                'free_product_cogs_account_id': self.free_product_cogs_account_id.id or False,
                 'shopify_lang_id': self.shopify_lang_id and self.shopify_lang_id.id or False,
                 'is_delivery_fee': self.is_delivery_fee,
                 'delivery_fee_name': self.delivery_fee_name,

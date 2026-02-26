@@ -40,3 +40,4 @@ from . import export_stock_queue_ept
 from . import export_stock_queue_line_ept
 from . import onboarding_onboarding
 from . import onboarding_onboarding_step
+from . import shopify_discount_code_config

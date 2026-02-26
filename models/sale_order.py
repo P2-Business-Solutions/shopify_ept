@@ -107,6 +107,8 @@ class SaleOrder(models.Model):
     shopify_payment_ids = fields.One2many('shopify.order.payment.ept', 'order_id',
                                           string="Payment Lines")
     is_buy_with_prime_order = fields.Boolean("Buy with Prime Order", default=False, copy=False)
+    shopify_discount_codes = fields.Char("Shopify Discount Codes", copy=False,
+                                         help="Comma-separated discount codes from the Shopify order")
 
     _sql_constraints = [('unique_shopify_order',
                          'unique(shopify_instance_id,shopify_order_id,shopify_order_number)',
@@ -248,10 +250,26 @@ class SaleOrder(models.Model):
                 if discount_amount > 0.0:
                     _logger.info("Creating discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
-                    self.shopify_create_sale_order_line({}, instance.discount_product_id, 1,
-                                                        product.name, float(discount_amount) * -1,
-                                                        order_response, previous_line=order_line,
-                                                        is_discount=True)
+                    line_discount_code = self._get_discount_code_for_line(line, order_response)
+                    discount_config = self._get_discount_code_config(instance, line_discount_code)
+                    discount_line = self.shopify_create_sale_order_line(
+                        {}, instance.discount_product_id, 1,
+                        product.name, float(discount_amount) * -1,
+                        order_response, previous_line=order_line,
+                        is_discount=True)
+                    # Apply discount-code-specific analytic account and mark free products
+                    discount_line_vals = {}
+                    if line_discount_code:
+                        discount_line_vals['shopify_discount_code'] = line_discount_code
+                    if discount_config and discount_config.analytic_account_id:
+                        discount_line_vals['analytic_distribution'] = {
+                            str(discount_config.analytic_account_id.id): 100}
+                    if discount_line_vals:
+                        discount_line.write(discount_line_vals)
+                    # Mark product line as free if discount covers full price
+                    line_price = float(line.get("price", 0)) * int(line.get("quantity", 1))
+                    if line_discount_code and discount_amount >= line_price and line_price > 0:
+                        order_line.write({'shopify_discount_code': line_discount_code})
                     _logger.info("Created discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
         # add gift card as product in sale order line
@@ -401,10 +419,21 @@ class SaleOrder(models.Model):
                 if discount_amount > 0.0:
                     _logger.info("Creating discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
-                    self.shopify_create_sale_order_line({}, instance.discount_product_id, 1,
-                                                        shipping_product.name, float(discount_amount) * -1,
-                                                        order_response, previous_line=order_line,
-                                                        is_discount=True)
+                    line_discount_code = self._get_discount_code_for_line(line, order_response)
+                    discount_config = self._get_discount_code_config(instance, line_discount_code)
+                    discount_line = self.shopify_create_sale_order_line(
+                        {}, instance.discount_product_id, 1,
+                        shipping_product.name, float(discount_amount) * -1,
+                        order_response, previous_line=order_line,
+                        is_discount=True)
+                    discount_line_vals = {}
+                    if line_discount_code:
+                        discount_line_vals['shopify_discount_code'] = line_discount_code
+                    if discount_config and discount_config.analytic_account_id:
+                        discount_line_vals['analytic_distribution'] = {
+                            str(discount_config.analytic_account_id.id): 100}
+                    if discount_line_vals:
+                        discount_line.write(discount_line_vals)
                     _logger.info("Created discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
 
@@ -1072,6 +1101,29 @@ class SaleOrder(models.Model):
             exists_tag = crm_tag_obj.create({'name': tag})
         return exists_tag.id
 
+    def _get_discount_code_for_line(self, line, order_response):
+        """Given a line item from the Shopify API, determine which discount code
+        applies by tracing discount_allocations -> discount_application_index ->
+        discount_applications[index].code. Returns first code found or False."""
+        discount_applications = order_response.get("discount_applications", [])
+        for alloc in line.get("discount_allocations", []):
+            idx = alloc.get("discount_application_index")
+            if idx is not None and idx < len(discount_applications):
+                app = discount_applications[idx]
+                if app.get("code"):
+                    return app["code"]
+        return False
+
+    def _get_discount_code_config(self, instance, discount_code):
+        """Look up the analytic config for a discount code from the mapping table.
+        Returns a shopify.discount.code.config.ept record or False."""
+        if not discount_code:
+            return False
+        return self.env["shopify.discount.code.config.ept"].search([
+            ("instance_id", "=", instance.id),
+            ("discount_code", "=ilike", discount_code)
+        ], limit=1)
+
     def convert_order_date(self, order_response):
         """ This method is used to convert the order date in UTC and formate("%Y-%m-%d %H:%M:%S").
             :param order_response: Order response
@@ -1120,6 +1172,12 @@ class SaleOrder(models.Model):
             "campaign_id": utm_campaign and utm_campaign.id or False,
             "is_buy_with_prime_order": order_response.get("buy_with_prime") or False,
         }
+        # Capture discount codes from the Shopify order response
+        shopify_discount_codes = order_response.get("discount_codes", [])
+        if shopify_discount_codes:
+            codes_str = ",".join([dc.get("code", "") for dc in shopify_discount_codes if dc.get("code")])
+            if codes_str:
+                order_vals["shopify_discount_codes"] = codes_str
         if self.env["ir.config_parameter"].sudo().get_param("shopify_ept.use_default_terms_and_condition_of_odoo"):
             order_vals = self.prepare_order_note_with_customer_note(order_vals)
         return order_vals
@@ -1171,6 +1229,14 @@ class SaleOrder(models.Model):
                 if fulfillment.get('tracking_number'):
                     vals.update({'tracking_reference': fulfillment.get('tracking_number')})
                 break
+            # Check if this order line is a free product (100% discounted)
+            if order_line.shopify_discount_code:
+                related_discount_lines = self.order_line.filtered(
+                    lambda l: l.shopify_related_line_id == "discount_%s" % order_line.shopify_line_id)
+                total_discount = sum(abs(dl.price_unit) * dl.product_uom_qty for dl in related_discount_lines)
+                line_total = order_line.price_unit * order_line.product_uom_qty
+                if float_is_zero(line_total - total_discount, precision_digits=2):
+                    vals['shopify_is_free_product'] = True
             stock_move = self.env['stock.move'].create(vals)
             stock_move._action_assign()
             stock_move._set_quantity_done(product_qty)
@@ -2530,10 +2596,24 @@ class SaleOrder(models.Model):
                 if discount_amount > 0.0:
                     _logger.info("Creating discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
-                    self.shopify_create_sale_order_line({}, instance.discount_product_id, 1,
-                                                        product.name, float(discount_amount) * -1,
-                                                        order_response, previous_line=order_line,
-                                                        is_discount=True)
+                    line_discount_code = self._get_discount_code_for_line(line, order_response)
+                    discount_config = self._get_discount_code_config(instance, line_discount_code)
+                    discount_line = self.shopify_create_sale_order_line(
+                        {}, instance.discount_product_id, 1,
+                        product.name, float(discount_amount) * -1,
+                        order_response, previous_line=order_line,
+                        is_discount=True)
+                    discount_line_vals = {}
+                    if line_discount_code:
+                        discount_line_vals['shopify_discount_code'] = line_discount_code
+                    if discount_config and discount_config.analytic_account_id:
+                        discount_line_vals['analytic_distribution'] = {
+                            str(discount_config.analytic_account_id.id): 100}
+                    if discount_line_vals:
+                        discount_line.write(discount_line_vals)
+                    line_price = float(line.get("price", 0)) * int(line.get("quantity", 1))
+                    if line_discount_code and discount_amount >= line_price and line_price > 0:
+                        order_line.write({'shopify_discount_code': line_discount_code})
                     _logger.info("Created discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
 
@@ -2721,13 +2801,27 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                 if discount_line_record.product_uom_qty > 0:
                     discount_line_record.write({'product_uom_qty': 0.0})
                 new_price_unit = float(new_total_discount_amount) * -1
-                order_line = self.shopify_create_sale_order_line({}, instance.discount_product_id,
-                                                    1,  # Quantity is 1
-                                                    original_product_line_record.product_id.name,
-                                                    # Product name for line description
-                                                    new_price_unit, order_response,
-                                                    previous_line=original_product_line_record, is_discount=True
-                                                    )
+                discount_line = self.shopify_create_sale_order_line(
+                    {}, instance.discount_product_id,
+                    1,
+                    original_product_line_record.product_id.name,
+                    new_price_unit, order_response,
+                    previous_line=original_product_line_record, is_discount=True)
+                # Look up discount code from the original line item in the response
+                line_discount_code = False
+                for resp_line in order_response.get('line_items', []):
+                    if str(resp_line.get('id')) == original_shopify_id:
+                        line_discount_code = self._get_discount_code_for_line(resp_line, order_response)
+                        break
+                discount_config = self._get_discount_code_config(instance, line_discount_code)
+                discount_line_vals = {}
+                if line_discount_code:
+                    discount_line_vals['shopify_discount_code'] = line_discount_code
+                if discount_config and discount_config.analytic_account_id:
+                    discount_line_vals['analytic_distribution'] = {
+                        str(discount_config.analytic_account_id.id): 100}
+                if discount_line_vals:
+                    discount_line.write(discount_line_vals)
                 is_updated = True
             # If the discount decreased/removed, the update is skipped.
         return is_updated
@@ -3524,6 +3618,9 @@ class SaleOrderLine(models.Model):
     shopify_fulfillment_order_status = fields.Char("Fulfillment Order Status")
     shopify_related_line_id = fields.Char(string='Shopify Related Order Line',
                                                help='Links discount/duties lines to the main product line for Shopify sync.')
+    shopify_discount_code = fields.Char("Discount Code", copy=False,
+                                        help="The Shopify discount code that applies to this discount line "
+                                             "or made this product free")
 
     def unlink(self):
         """

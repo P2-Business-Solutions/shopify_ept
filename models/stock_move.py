@@ -15,6 +15,8 @@ class StockMove(models.Model):
     carrier_id = fields.Many2one('delivery.carrier', string="Shipping Carrier",
                                  help="Carrier extracted from Shopify Fulfillment")
     tracking_reference = fields.Char(string="Tracking Reference", help="Tracking number from Shopify fulfillment")
+    shopify_is_free_product = fields.Boolean("Free Product (Discount)", default=False,
+                                             help="True if linked sale order line was 100%% discounted")
 
     def _get_new_picking_values(self):
         """We need this method to set Shopify Instance in Stock Pickin"""
@@ -33,6 +35,31 @@ class StockMove(models.Model):
                 picking.write(
                     {'shopify_instance_id': picking.sale_id.shopify_instance_id.id, 'is_shopify_delivery_order': True})
         return res
+
+    def _generate_valuation_lines_data(self, partner_id, qty, debit_value, credit_value,
+                                        debit_account_id, credit_account_id, svl_id, description):
+        """Override COGS account and analytic for free products from Shopify orders.
+        When a product is 100% discounted (free), redirect the COGS debit entry to the
+        configured expense account with a discount-code-specific analytic account."""
+        rslt = super()._generate_valuation_lines_data(
+            partner_id, qty, debit_value, credit_value,
+            debit_account_id, credit_account_id, svl_id, description)
+
+        if self.shopify_is_free_product and self.sale_line_id:
+            order = self.sale_line_id.order_id
+            instance = order.shopify_instance_id
+            if instance and instance.free_product_cogs_account_id:
+                if rslt.get('debit_line_vals'):
+                    rslt['debit_line_vals']['account_id'] = instance.free_product_cogs_account_id.id
+                discount_code = self.sale_line_id.shopify_discount_code
+                if discount_code:
+                    config = order._get_discount_code_config(instance, discount_code)
+                    if config and config.analytic_account_id:
+                        if rslt.get('debit_line_vals'):
+                            rslt['debit_line_vals']['analytic_distribution'] = {
+                                str(config.analytic_account_id.id): 100}
+
+        return rslt
 
     def auto_process_stock_move_ept(self):
         """

@@ -93,6 +93,7 @@
                                 <field name="shopify_instance_id" readonly="True"
                                        options="{'no_create':True,'no_create_edit':True}"/>
                                 <field name="shopify_order_status" readonly="True"/>
+                                <field name="shopify_discount_codes" readonly="True"/>
                             </group>
                             <group>
                                 <field name="is_risky_order"/>
