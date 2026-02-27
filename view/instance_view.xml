@@ -251,7 +251,8 @@
                             <div name="discount_code_config">
                                 <field name="discount_code_config_ids" colspan="4" nolabel="1">
                                     <list nolabel="1" editable="bottom">
-                                        <field name="discount_code" required="1"/>
+                                        <field name="discount_code" required="1"
+                                               string="Discount Code Prefix"/>
                                         <field name="analytic_account_id" required="1"
                                                options="{'no_create':True,'no_create_edit': True}"/>
                                     </list>

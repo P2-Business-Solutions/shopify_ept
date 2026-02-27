@@ -1115,14 +1115,27 @@ class SaleOrder(models.Model):
         return False
 
     def _get_discount_code_config(self, instance, discount_code):
-        """Look up the analytic config for a discount code from the mapping table.
+        """Look up the analytic config for a discount code using prefix matching.
+        Checks all configured prefixes for this instance and returns the longest
+        (most specific) match. For example, if configured prefixes are 'EMPLOYEE'
+        and 'EMPLOYEE_VIP', the code 'EMPLOYEE_VIP_50' matches 'EMPLOYEE_VIP'.
         Returns a shopify.discount.code.config.ept record or False."""
         if not discount_code:
             return False
-        return self.env["shopify.discount.code.config.ept"].search([
-            ("instance_id", "=", instance.id),
-            ("discount_code", "=ilike", discount_code)
-        ], limit=1)
+        configs = self.env["shopify.discount.code.config.ept"].search([
+            ("instance_id", "=", instance.id)
+        ])
+        if not configs:
+            return False
+        code_upper = discount_code.upper()
+        best_match = False
+        best_len = 0
+        for config in configs:
+            prefix = config.discount_code.upper()
+            if code_upper.startswith(prefix) and len(prefix) > best_len:
+                best_match = config
+                best_len = len(prefix)
+        return best_match
 
     def convert_order_date(self, order_response):
         """ This method is used to convert the order date in UTC and formate("%Y-%m-%d %H:%M:%S").
