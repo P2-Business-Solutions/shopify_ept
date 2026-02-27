@@ -312,6 +312,10 @@ class ShopifyInstanceEpt(models.Model):
         "account.account", string="Free Product COGS Expense Account",
         help="When a product is 100% discounted, COGS posts to this expense account "
              "instead of the normal COGS account.")
+    gift_card_deferred_revenue_account_id = fields.Many2one(
+        "account.account", string="Gift Card Deferred Revenue Account",
+        help="When a gift card is redeemed as payment, the invoice line posts to this "
+             "Deferred Revenue (liability) account instead of the product's income account.")
 
     # Analytic
     shopify_is_use_analytic_account = fields.Boolean(default=True)

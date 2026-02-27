@@ -301,7 +301,8 @@ class SaleOrder(models.Model):
             "product_uom": uom_id,
             "name": "Gift card for " + str(product_name),
             "price_unit": float(price_unit) * -1,
-            "product_uom_qty": order_qty
+            "product_uom_qty": order_qty,
+            "is_gift_card_payment_line": True,
         }
         if instance.shopify_analytic_account_id:
             analytic_distribution_dict = {}
@@ -3626,6 +3627,9 @@ class SaleOrderLine(models.Model):
 
     shopify_line_id = fields.Char("Shopify Line", copy=False)
     is_gift_card_line = fields.Boolean(copy=False, default=False)
+    is_gift_card_payment_line = fields.Boolean("Gift Card Payment", copy=False, default=False,
+                                                help="True if this line represents a gift card used as payment "
+                                                     "(deferred revenue drawdown)")
     shopify_fulfillment_order_id = fields.Char("Fulfillment Order ID")
     shopify_fulfillment_line_id = fields.Char("Fulfillment Line ID")
     shopify_fulfillment_order_status = fields.Char("Fulfillment Order Status")
@@ -3647,6 +3651,17 @@ class SaleOrderLine(models.Model):
                     "Shopify line id while we are doing update order status")
                 raise UserError(msg)
         return super(SaleOrderLine, self).unlink()
+
+    def _prepare_invoice_line(self, **optional_values):
+        """Override to use Deferred Revenue account for gift card payment lines.
+        When a gift card is redeemed as payment, the invoice line should debit
+        Deferred Revenue (liability) instead of the product's default income account."""
+        vals = super()._prepare_invoice_line(**optional_values)
+        if self.is_gift_card_payment_line and self.order_id.shopify_instance_id:
+            deferred_account = self.order_id.shopify_instance_id.gift_card_deferred_revenue_account_id
+            if deferred_account:
+                vals['account_id'] = deferred_account.id
+        return vals
 
 
 class ImportShopifyOrderStatus(models.Model):

@@ -242,10 +242,13 @@
                         <page string="Discount Code Mapping" name="discount_code_mapping"
                               groups="analytic.group_analytic_accounting">
                             <group>
-                                <group>
+                                <group string="Account Overrides">
                                     <field name="free_product_cogs_account_id"
                                            options="{'no_create':True,'no_create_edit': True}"
                                            string="Free Product COGS Expense Account"/>
+                                    <field name="gift_card_deferred_revenue_account_id"
+                                           options="{'no_create':True,'no_create_edit': True}"
+                                           string="Gift Card Deferred Revenue Account"/>
                                 </group>
                             </group>
                             <div name="discount_code_config">
