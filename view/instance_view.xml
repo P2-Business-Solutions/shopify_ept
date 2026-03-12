@@ -257,7 +257,8 @@
                                         <field name="discount_code" required="1"
                                                string="Discount Code Prefix"/>
                                         <field name="analytic_account_id" required="1"
-                                               options="{'no_create':True,'no_create_edit': True}"/>
+                                               options="{'no_create':True,'no_create_edit': True}"
+                                               domain="['|', ('company_id', '=', False), ('company_id', '=', parent.shopify_company_id)]"/>
                                     </list>
                                 </field>
                             </div>
