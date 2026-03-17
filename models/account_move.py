@@ -78,7 +78,7 @@ class AccountMove(models.Model):
         """Route COGS to configured Shopify expense account during invoice posting.
 
         This avoids a separate reclassification entry for discounted/free Shopify lines by
-        replacing the generated COGS account directly in anglo-saxon lines.
+        replacing the generated COGS debit account directly in anglo-saxon lines.
         """
         lines_vals_list = super()._stock_account_prepare_anglo_saxon_out_lines_vals()
         if not lines_vals_list:
@@ -94,7 +94,9 @@ class AccountMove(models.Model):
             return lines_vals_list
 
         account_by_product = {}
+        account_by_label = {}
         analytic_by_product = {}
+        analytic_by_label = {}
         for invoice_line in discounted_invoice_lines:
             sale_line = invoice_line.sale_line_ids.filtered(lambda sl: sl.shopify_discount_code)[:1]
             if not sale_line:
@@ -104,37 +106,45 @@ class AccountMove(models.Model):
             if not instance or not instance.free_product_cogs_account_id:
                 continue
 
-            account_by_product[invoice_line.product_id.id] = instance.free_product_cogs_account_id.id
+            target_account_id = instance.free_product_cogs_account_id.id
+            if invoice_line.product_id:
+                account_by_product[invoice_line.product_id.id] = target_account_id
+            if invoice_line.name:
+                account_by_label[invoice_line.name] = target_account_id
 
             discount_code = sale_line.shopify_discount_code
             if discount_code:
                 config = order._get_discount_code_config(instance, discount_code)
                 if config and config.analytic_account_id:
-                    analytic_by_product[invoice_line.product_id.id] = {
-                        str(config.analytic_account_id.id): 100
-                    }
+                    analytic_dist = {str(config.analytic_account_id.id): 100}
+                    if invoice_line.product_id:
+                        analytic_by_product[invoice_line.product_id.id] = analytic_dist
+                    if invoice_line.name:
+                        analytic_by_label[invoice_line.name] = analytic_dist
 
-        if not account_by_product:
+        if not account_by_product and not account_by_label:
             return lines_vals_list
 
         for line_vals in lines_vals_list:
-            product_id = line_vals.get('product_id')
-            if product_id not in account_by_product:
-                continue
-
             # Only replace the debit (COGS) side; keep the credit side on the
             # default stock valuation/output account.
-            is_debit_line = False
             if 'balance' in line_vals:
                 is_debit_line = line_vals.get('balance', 0.0) > 0
             else:
                 is_debit_line = line_vals.get('debit', 0.0) > 0 and line_vals.get('credit', 0.0) <= 0
-
             if not is_debit_line:
                 continue
 
-            line_vals['account_id'] = account_by_product[product_id]
-            if product_id in analytic_by_product:
-                line_vals['analytic_distribution'] = analytic_by_product[product_id]
+            product_id = line_vals.get('product_id')
+            label = line_vals.get('name')
+
+            target_account_id = account_by_product.get(product_id) or account_by_label.get(label)
+            if not target_account_id:
+                continue
+
+            line_vals['account_id'] = target_account_id
+            analytic_distribution = analytic_by_product.get(product_id) or analytic_by_label.get(label)
+            if analytic_distribution:
+                line_vals['analytic_distribution'] = analytic_distribution
 
         return lines_vals_list
