@@ -45,7 +45,7 @@ class StockMove(models.Model):
             partner_id, qty, debit_value, credit_value,
             debit_account_id, credit_account_id, svl_id, description)
 
-        if self.shopify_is_free_product and self.sale_line_id:
+        if self.sale_line_id and (self.shopify_is_free_product or self.sale_line_id.shopify_discount_code):
             order = self.sale_line_id.order_id
             instance = order.shopify_instance_id
             if instance and instance.free_product_cogs_account_id:
