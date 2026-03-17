@@ -74,3 +74,54 @@ class AccountMove(models.Model):
             return reverse_moves
         return super(AccountMove, self)._reconcile_reversed_moves(reverse_moves, move_reverse_cancel)
 
+    def _stock_account_prepare_anglo_saxon_out_lines_vals(self):
+        """Route COGS to configured Shopify expense account during invoice posting.
+
+        This avoids a separate reclassification entry for discounted/free Shopify lines by
+        replacing the generated COGS account directly in anglo-saxon lines.
+        """
+        lines_vals_list = super()._stock_account_prepare_anglo_saxon_out_lines_vals()
+        if not lines_vals_list:
+            return lines_vals_list
+
+        discounted_invoice_lines = self.invoice_line_ids.filtered(
+            lambda line: line.sale_line_ids.filtered(
+                lambda sale_line: sale_line.shopify_discount_code and sale_line.order_id.shopify_instance_id and
+                sale_line.order_id.shopify_instance_id.free_product_cogs_account_id
+            )
+        )
+        if not discounted_invoice_lines:
+            return lines_vals_list
+
+        account_by_product = {}
+        analytic_by_product = {}
+        for invoice_line in discounted_invoice_lines:
+            sale_line = invoice_line.sale_line_ids.filtered(lambda sl: sl.shopify_discount_code)[:1]
+            if not sale_line:
+                continue
+            order = sale_line.order_id
+            instance = order.shopify_instance_id
+            if not instance or not instance.free_product_cogs_account_id:
+                continue
+
+            account_by_product[invoice_line.product_id.id] = instance.free_product_cogs_account_id.id
+
+            discount_code = sale_line.shopify_discount_code
+            if discount_code:
+                config = order._get_discount_code_config(instance, discount_code)
+                if config and config.analytic_account_id:
+                    analytic_by_product[invoice_line.product_id.id] = {
+                        str(config.analytic_account_id.id): 100
+                    }
+
+        if not account_by_product:
+            return lines_vals_list
+
+        for line_vals in lines_vals_list:
+            product_id = line_vals.get('product_id')
+            if product_id in account_by_product:
+                line_vals['account_id'] = account_by_product[product_id]
+                if product_id in analytic_by_product:
+                    line_vals['analytic_distribution'] = analytic_by_product[product_id]
+
+        return lines_vals_list
