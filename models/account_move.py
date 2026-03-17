@@ -119,9 +119,22 @@ class AccountMove(models.Model):
 
         for line_vals in lines_vals_list:
             product_id = line_vals.get('product_id')
-            if product_id in account_by_product:
-                line_vals['account_id'] = account_by_product[product_id]
-                if product_id in analytic_by_product:
-                    line_vals['analytic_distribution'] = analytic_by_product[product_id]
+            if product_id not in account_by_product:
+                continue
+
+            # Only replace the debit (COGS) side; keep the credit side on the
+            # default stock valuation/output account.
+            is_debit_line = False
+            if 'balance' in line_vals:
+                is_debit_line = line_vals.get('balance', 0.0) > 0
+            else:
+                is_debit_line = line_vals.get('debit', 0.0) > 0 and line_vals.get('credit', 0.0) <= 0
+
+            if not is_debit_line:
+                continue
+
+            line_vals['account_id'] = account_by_product[product_id]
+            if product_id in analytic_by_product:
+                line_vals['analytic_distribution'] = analytic_by_product[product_id]
 
         return lines_vals_list
