@@ -74,3 +74,94 @@ class AccountMove(models.Model):
             return reverse_moves
         return super(AccountMove, self)._reconcile_reversed_moves(reverse_moves, move_reverse_cancel)
 
+    def _stock_account_prepare_anglo_saxon_out_lines_vals(self):
+        """Route COGS to configured Shopify expense account during invoice posting.
+
+        This avoids a separate reclassification entry for discounted/free Shopify lines by
+        replacing the generated COGS debit account directly in anglo-saxon lines.
+        """
+        lines_vals_list = super()._stock_account_prepare_anglo_saxon_out_lines_vals()
+        if not lines_vals_list:
+            return lines_vals_list
+
+        account_by_product = {}
+        account_by_label = {}
+        analytic_by_product = {}
+        analytic_by_label = {}
+
+        for invoice_line in self.invoice_line_ids:
+            if not invoice_line.sale_line_ids:
+                continue
+
+            selected_sale_line = False
+            selected_discount_code = False
+            selected_instance = False
+
+            for sale_line in invoice_line.sale_line_ids:
+                order = sale_line.order_id
+                instance = order.shopify_instance_id
+                if not instance or not instance.free_product_cogs_account_id:
+                    continue
+
+                # Primary trigger: discount code on the product sale line itself.
+                discount_code = sale_line.shopify_discount_code
+
+                # Fallback trigger: discount code exists on the related discount line
+                # (common when the product line itself isn't flagged).
+                if not discount_code and sale_line.shopify_line_id:
+                    related_discount_line = order.order_line.filtered(
+                        lambda line: line.shopify_related_line_id == "discount_%s" % sale_line.shopify_line_id and
+                        line.shopify_discount_code
+                    )[:1]
+                    if related_discount_line:
+                        discount_code = related_discount_line.shopify_discount_code
+
+                if discount_code:
+                    selected_sale_line = sale_line
+                    selected_discount_code = discount_code
+                    selected_instance = instance
+                    break
+
+            if not selected_sale_line:
+                continue
+
+            target_account_id = selected_instance.free_product_cogs_account_id.id
+            if invoice_line.product_id:
+                account_by_product[invoice_line.product_id.id] = target_account_id
+            if invoice_line.name:
+                account_by_label[invoice_line.name] = target_account_id
+
+            config = selected_sale_line.order_id._get_discount_code_config(selected_instance, selected_discount_code)
+            if config and config.analytic_account_id:
+                analytic_dist = {str(config.analytic_account_id.id): 100}
+                if invoice_line.product_id:
+                    analytic_by_product[invoice_line.product_id.id] = analytic_dist
+                if invoice_line.name:
+                    analytic_by_label[invoice_line.name] = analytic_dist
+
+        if not account_by_product and not account_by_label:
+            return lines_vals_list
+
+        for line_vals in lines_vals_list:
+            # Only replace the debit (COGS) side; keep the credit side on the
+            # default stock valuation/output account.
+            if 'balance' in line_vals:
+                is_debit_line = line_vals.get('balance', 0.0) > 0
+            else:
+                is_debit_line = line_vals.get('debit', 0.0) > 0 and line_vals.get('credit', 0.0) <= 0
+            if not is_debit_line:
+                continue
+
+            product_id = line_vals.get('product_id')
+            label = line_vals.get('name')
+
+            target_account_id = account_by_product.get(product_id) or account_by_label.get(label)
+            if not target_account_id:
+                continue
+
+            line_vals['account_id'] = target_account_id
+            analytic_distribution = analytic_by_product.get(product_id) or analytic_by_label.get(label)
+            if analytic_distribution:
+                line_vals['analytic_distribution'] = analytic_distribution
+
+        return lines_vals_list
