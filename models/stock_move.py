@@ -38,28 +38,14 @@ class StockMove(models.Model):
 
     def _generate_valuation_lines_data(self, partner_id, qty, debit_value, credit_value,
                                         debit_account_id, credit_account_id, svl_id, description):
-        """Override COGS account and analytic for free products from Shopify orders.
-        When a product is 100% discounted (free), redirect the COGS debit entry to the
-        configured expense account with a discount-code-specific analytic account."""
-        rslt = super()._generate_valuation_lines_data(
+        """Keep stock valuation posting standard for Shopify discounted/free lines.
+
+        The COGS override is applied at invoice posting (anglo-saxon out lines) so the
+        inventory move does not perform a separate stock->expense reclassification.
+        """
+        return super()._generate_valuation_lines_data(
             partner_id, qty, debit_value, credit_value,
             debit_account_id, credit_account_id, svl_id, description)
-
-        if self.sale_line_id and (self.shopify_is_free_product or self.sale_line_id.shopify_discount_code):
-            order = self.sale_line_id.order_id
-            instance = order.shopify_instance_id
-            if instance and instance.free_product_cogs_account_id:
-                if rslt.get('debit_line_vals'):
-                    rslt['debit_line_vals']['account_id'] = instance.free_product_cogs_account_id.id
-                discount_code = self.sale_line_id.shopify_discount_code
-                if discount_code:
-                    config = order._get_discount_code_config(instance, discount_code)
-                    if config and config.analytic_account_id:
-                        if rslt.get('debit_line_vals'):
-                            rslt['debit_line_vals']['analytic_distribution'] = {
-                                str(config.analytic_account_id.id): 100}
-
-        return rslt
 
     def auto_process_stock_move_ept(self):
         """
