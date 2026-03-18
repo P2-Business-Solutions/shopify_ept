@@ -84,43 +84,60 @@ class AccountMove(models.Model):
         if not lines_vals_list:
             return lines_vals_list
 
-        discounted_invoice_lines = self.invoice_line_ids.filtered(
-            lambda line: line.sale_line_ids.filtered(
-                lambda sale_line: sale_line.shopify_discount_code and sale_line.order_id.shopify_instance_id and
-                sale_line.order_id.shopify_instance_id.free_product_cogs_account_id
-            )
-        )
-        if not discounted_invoice_lines:
-            return lines_vals_list
-
         account_by_product = {}
         account_by_label = {}
         analytic_by_product = {}
         analytic_by_label = {}
-        for invoice_line in discounted_invoice_lines:
-            sale_line = invoice_line.sale_line_ids.filtered(lambda sl: sl.shopify_discount_code)[:1]
-            if not sale_line:
-                continue
-            order = sale_line.order_id
-            instance = order.shopify_instance_id
-            if not instance or not instance.free_product_cogs_account_id:
+
+        for invoice_line in self.invoice_line_ids:
+            if not invoice_line.sale_line_ids:
                 continue
 
-            target_account_id = instance.free_product_cogs_account_id.id
+            selected_sale_line = False
+            selected_discount_code = False
+            selected_instance = False
+
+            for sale_line in invoice_line.sale_line_ids:
+                order = sale_line.order_id
+                instance = order.shopify_instance_id
+                if not instance or not instance.free_product_cogs_account_id:
+                    continue
+
+                # Primary trigger: discount code on the product sale line itself.
+                discount_code = sale_line.shopify_discount_code
+
+                # Fallback trigger: discount code exists on the related discount line
+                # (common when the product line itself isn't flagged).
+                if not discount_code and sale_line.shopify_line_id:
+                    related_discount_line = order.order_line.filtered(
+                        lambda line: line.shopify_related_line_id == "discount_%s" % sale_line.shopify_line_id and
+                        line.shopify_discount_code
+                    )[:1]
+                    if related_discount_line:
+                        discount_code = related_discount_line.shopify_discount_code
+
+                if discount_code:
+                    selected_sale_line = sale_line
+                    selected_discount_code = discount_code
+                    selected_instance = instance
+                    break
+
+            if not selected_sale_line:
+                continue
+
+            target_account_id = selected_instance.free_product_cogs_account_id.id
             if invoice_line.product_id:
                 account_by_product[invoice_line.product_id.id] = target_account_id
             if invoice_line.name:
                 account_by_label[invoice_line.name] = target_account_id
 
-            discount_code = sale_line.shopify_discount_code
-            if discount_code:
-                config = order._get_discount_code_config(instance, discount_code)
-                if config and config.analytic_account_id:
-                    analytic_dist = {str(config.analytic_account_id.id): 100}
-                    if invoice_line.product_id:
-                        analytic_by_product[invoice_line.product_id.id] = analytic_dist
-                    if invoice_line.name:
-                        analytic_by_label[invoice_line.name] = analytic_dist
+            config = selected_sale_line.order_id._get_discount_code_config(selected_instance, selected_discount_code)
+            if config and config.analytic_account_id:
+                analytic_dist = {str(config.analytic_account_id.id): 100}
+                if invoice_line.product_id:
+                    analytic_by_product[invoice_line.product_id.id] = analytic_dist
+                if invoice_line.name:
+                    analytic_by_label[invoice_line.name] = analytic_dist
 
         if not account_by_product and not account_by_label:
             return lines_vals_list
