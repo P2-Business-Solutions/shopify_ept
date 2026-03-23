@@ -147,8 +147,12 @@ class AccountMove(models.Model):
             # default stock valuation/output account.
             if 'balance' in line_vals:
                 is_debit_line = line_vals.get('balance', 0.0) > 0
-            else:
+            elif 'debit' in line_vals or 'credit' in line_vals:
                 is_debit_line = line_vals.get('debit', 0.0) > 0 and line_vals.get('credit', 0.0) <= 0
+            else:
+                # Odoo 18: anglo-saxon line dicts use amount_currency, not balance/debit/credit.
+                # Positive amount_currency = COGS expense (debit) side.
+                is_debit_line = line_vals.get('amount_currency', 0.0) > 0
             if not is_debit_line:
                 continue
 
