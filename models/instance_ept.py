@@ -316,6 +316,14 @@ class ShopifyInstanceEpt(models.Model):
         "account.account", string="Gift Card Deferred Revenue Account",
         help="When a gift card is redeemed as payment, the invoice line posts to this "
              "Deferred Revenue (liability) account instead of the product's income account.")
+    gift_card_redemption_tag_ids = fields.Many2many(
+        "crm.tag", "shopify_instance_gift_card_tag_rel",
+        "instance_id", "tag_id",
+        string="Gift Card Redemption Tags",
+        help="Order tags that indicate the order was paid with a gift card. "
+             "When an order carries any of these tags, its discount lines are "
+             "treated as gift card payment lines and routed to the Deferred "
+             "Revenue account instead of being treated as regular discounts.")
 
     # Analytic
     shopify_is_use_analytic_account = fields.Boolean(default=True)
