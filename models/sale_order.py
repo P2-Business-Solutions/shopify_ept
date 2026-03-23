@@ -1080,6 +1080,7 @@ class SaleOrder(models.Model):
 
     def create_or_search_sale_tag(self, tag):
         crm_tag_obj = self.env['crm.tag']
+        tag = tag.strip()
         exists_tag = crm_tag_obj.search([('name', '=ilike', tag)], limit=1)
         if not exists_tag:
             exists_tag = crm_tag_obj.create({'name': tag})
@@ -1124,11 +1125,16 @@ class SaleOrder(models.Model):
     def _is_gift_card_redemption_order(self, instance):
         """Check whether this order should treat discounts as gift card payments.
         Returns True when any of the order's tags match the instance's
-        gift_card_redemption_tag_ids configuration."""
+        gift_card_redemption_tag_ids configuration.  Comparison is by
+        normalised name (stripped, case-insensitive) so that whitespace
+        differences between Shopify-imported tags and manually-configured
+        tags do not cause a mismatch."""
         gc_tags = instance.gift_card_redemption_tag_ids
         if not gc_tags:
             return False
-        return bool(self.tag_ids & gc_tags)
+        gc_names = {name.strip().upper() for name in gc_tags.mapped('name')}
+        order_names = {name.strip().upper() for name in self.tag_ids.mapped('name')}
+        return bool(gc_names & order_names)
 
     def _create_discount_or_gift_card_line(self, instance, discount_config, line_discount_code,
                                            product_name, discount_amount, order_response,
