@@ -252,20 +252,11 @@ class SaleOrder(models.Model):
                                  order_number)
                     line_discount_code = self._get_discount_code_for_line(line, order_response)
                     discount_config = self._get_discount_code_config(instance, line_discount_code)
-                    discount_line = self.shopify_create_sale_order_line(
-                        {}, instance.discount_product_id, 1,
-                        product.name, float(discount_amount) * -1,
-                        order_response, previous_line=order_line,
-                        is_discount=True)
-                    # Apply discount-code-specific analytic account and mark free products
-                    discount_line_vals = {}
-                    if line_discount_code:
-                        discount_line_vals['shopify_discount_code'] = line_discount_code
-                    if discount_config and discount_config.analytic_account_id:
-                        discount_line_vals['analytic_distribution'] = {
-                            str(discount_config.analytic_account_id.id): 100}
-                    if discount_line_vals:
-                        discount_line.write(discount_line_vals)
+                    is_gc = self._is_gift_card_redemption_order(instance)
+                    self._create_discount_or_gift_card_line(
+                        instance, discount_config, line_discount_code,
+                        product.name, discount_amount, order_response,
+                        previous_line=order_line, is_gift_card_redemption=is_gc)
                     # Mark product line as free if discount covers full price
                     line_price = float(line.get("price", 0)) * int(line.get("quantity", 1))
                     if line_discount_code and discount_amount >= line_price and line_price > 0:
@@ -422,19 +413,11 @@ class SaleOrder(models.Model):
                                  order_number)
                     line_discount_code = self._get_discount_code_for_line(line, order_response)
                     discount_config = self._get_discount_code_config(instance, line_discount_code)
-                    discount_line = self.shopify_create_sale_order_line(
-                        {}, instance.discount_product_id, 1,
-                        shipping_product.name, float(discount_amount) * -1,
-                        order_response, previous_line=order_line,
-                        is_discount=True)
-                    discount_line_vals = {}
-                    if line_discount_code:
-                        discount_line_vals['shopify_discount_code'] = line_discount_code
-                    if discount_config and discount_config.analytic_account_id:
-                        discount_line_vals['analytic_distribution'] = {
-                            str(discount_config.analytic_account_id.id): 100}
-                    if discount_line_vals:
-                        discount_line.write(discount_line_vals)
+                    is_gc = self._is_gift_card_redemption_order(instance)
+                    self._create_discount_or_gift_card_line(
+                        instance, discount_config, line_discount_code,
+                        shipping_product.name, discount_amount, order_response,
+                        previous_line=order_line, is_gift_card_redemption=is_gc)
                     _logger.info("Created discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
 
@@ -1137,6 +1120,54 @@ class SaleOrder(models.Model):
                 best_match = config
                 best_len = len(prefix)
         return best_match
+
+    def _is_gift_card_redemption_order(self, instance):
+        """Check whether this order should treat discounts as gift card payments.
+        Returns True when any of the order's tags match the instance's
+        gift_card_redemption_tag_ids configuration."""
+        gc_tags = instance.gift_card_redemption_tag_ids
+        if not gc_tags:
+            return False
+        return bool(self.tag_ids & gc_tags)
+
+    def _create_discount_or_gift_card_line(self, instance, discount_config, line_discount_code,
+                                           product_name, discount_amount, order_response,
+                                           previous_line, is_gift_card_redemption):
+        """Create either a gift-card payment line or a normal discount line.
+
+        When *is_gift_card_redemption* is True the discount is treated as a
+        gift-card redemption: uses ``gift_card_product_id``, marks the line
+        with ``is_gift_card_payment_line=True`` so that the existing
+        ``_prepare_invoice_line`` override routes it to the Deferred Revenue
+        account.
+        """
+        sale_order_line_obj = self.env["sale.order.line"]
+        if is_gift_card_redemption:
+            gift_product = instance.gift_card_product_id
+            line_vals = self.prepare_vals_for_gift_card_sale_order_line(
+                gift_product, product_name, discount_amount, 1)
+            line_vals['name'] = "Gift card redemption for %s" % product_name
+            if line_discount_code:
+                line_vals['shopify_discount_code'] = line_discount_code
+            if discount_config and discount_config.analytic_account_id:
+                line_vals['analytic_distribution'] = {
+                    str(discount_config.analytic_account_id.id): 100}
+            return sale_order_line_obj.create(line_vals)
+        else:
+            discount_line = self.shopify_create_sale_order_line(
+                {}, instance.discount_product_id, 1,
+                product_name, float(discount_amount) * -1,
+                order_response, previous_line=previous_line,
+                is_discount=True)
+            discount_line_vals = {}
+            if line_discount_code:
+                discount_line_vals['shopify_discount_code'] = line_discount_code
+            if discount_config and discount_config.analytic_account_id:
+                discount_line_vals['analytic_distribution'] = {
+                    str(discount_config.analytic_account_id.id): 100}
+            if discount_line_vals:
+                discount_line.write(discount_line_vals)
+            return discount_line
 
     def convert_order_date(self, order_response):
         """ This method is used to convert the order date in UTC and formate("%Y-%m-%d %H:%M:%S").
@@ -2612,19 +2643,11 @@ class SaleOrder(models.Model):
                                  order_number)
                     line_discount_code = self._get_discount_code_for_line(line, order_response)
                     discount_config = self._get_discount_code_config(instance, line_discount_code)
-                    discount_line = self.shopify_create_sale_order_line(
-                        {}, instance.discount_product_id, 1,
-                        product.name, float(discount_amount) * -1,
-                        order_response, previous_line=order_line,
-                        is_discount=True)
-                    discount_line_vals = {}
-                    if line_discount_code:
-                        discount_line_vals['shopify_discount_code'] = line_discount_code
-                    if discount_config and discount_config.analytic_account_id:
-                        discount_line_vals['analytic_distribution'] = {
-                            str(discount_config.analytic_account_id.id): 100}
-                    if discount_line_vals:
-                        discount_line.write(discount_line_vals)
+                    is_gc = self._is_gift_card_redemption_order(instance)
+                    self._create_discount_or_gift_card_line(
+                        instance, discount_config, line_discount_code,
+                        product.name, discount_amount, order_response,
+                        previous_line=order_line, is_gift_card_redemption=is_gc)
                     line_price = float(line.get("price", 0)) * int(line.get("quantity", 1))
                     if line_discount_code and discount_amount >= line_price and line_price > 0:
                         order_line.write({'shopify_discount_code': line_discount_code})
@@ -2814,13 +2837,6 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                     original_shopify_id, self.name)
                 if discount_line_record.product_uom_qty > 0:
                     discount_line_record.write({'product_uom_qty': 0.0})
-                new_price_unit = float(new_total_discount_amount) * -1
-                discount_line = self.shopify_create_sale_order_line(
-                    {}, instance.discount_product_id,
-                    1,
-                    original_product_line_record.product_id.name,
-                    new_price_unit, order_response,
-                    previous_line=original_product_line_record, is_discount=True)
                 # Look up discount code from the original line item in the response
                 line_discount_code = False
                 for resp_line in order_response.get('line_items', []):
@@ -2828,14 +2844,13 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                         line_discount_code = self._get_discount_code_for_line(resp_line, order_response)
                         break
                 discount_config = self._get_discount_code_config(instance, line_discount_code)
-                discount_line_vals = {}
-                if line_discount_code:
-                    discount_line_vals['shopify_discount_code'] = line_discount_code
-                if discount_config and discount_config.analytic_account_id:
-                    discount_line_vals['analytic_distribution'] = {
-                        str(discount_config.analytic_account_id.id): 100}
-                if discount_line_vals:
-                    discount_line.write(discount_line_vals)
+                is_gc = self._is_gift_card_redemption_order(instance)
+                self._create_discount_or_gift_card_line(
+                    instance, discount_config, line_discount_code,
+                    original_product_line_record.product_id.name,
+                    new_total_discount_amount, order_response,
+                    previous_line=original_product_line_record,
+                    is_gift_card_redemption=is_gc)
                 is_updated = True
             # If the discount decreased/removed, the update is skipped.
         return is_updated
