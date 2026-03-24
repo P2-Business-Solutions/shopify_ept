@@ -321,9 +321,14 @@ class ShopifyInstanceEpt(models.Model):
         "instance_id", "tag_id",
         string="Gift Card Redemption Tags",
         help="Order tags that indicate the order was paid with a gift card. "
-             "When an order carries any of these tags, its discount lines are "
-             "treated as gift card payment lines and routed to the Deferred "
-             "Revenue account instead of being treated as regular discounts.")
+             "The wholesale value is parsed from the numeric portion of the "
+             "tag name (e.g. GIFT110E → $110). Two extra balancing lines are "
+             "added to the order to transfer that amount from Deferred Revenue "
+             "to Sales.")
+    gift_card_revenue_account_id = fields.Many2one(
+        "account.account", string="Gift Card Revenue Account",
+        help="When a gift card is redeemed, the revenue-recognition line "
+             "credits this account (typically a Sales / Revenue account).")
 
     # Analytic
     shopify_is_use_analytic_account = fields.Boolean(default=True)
