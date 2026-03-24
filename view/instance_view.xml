@@ -249,6 +249,9 @@
                                     <field name="gift_card_deferred_revenue_account_id"
                                            options="{'no_create':True,'no_create_edit': True}"
                                            string="Gift Card Deferred Revenue Account"/>
+                                    <field name="gift_card_revenue_account_id"
+                                           options="{'no_create':True,'no_create_edit': True}"
+                                           string="Gift Card Revenue Account"/>
                                     <field name="gift_card_redemption_tag_ids" widget="many2many_tags"
                                            string="Gift Card Redemption Tags"/>
                                 </group>
