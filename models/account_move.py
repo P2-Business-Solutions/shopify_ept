@@ -116,11 +116,20 @@ class AccountMove(models.Model):
                     if related_discount_line:
                         discount_code = related_discount_line.shopify_discount_code
 
-                if discount_code:
-                    selected_sale_line = sale_line
-                    selected_discount_code = discount_code
-                    selected_instance = instance
-                    break
+                if not discount_code:
+                    continue
+
+                # Only override COGS account when the discount code matches
+                # a configured prefix — not for arbitrary discount codes.
+                config = order._get_discount_code_config(instance, discount_code)
+                if not config:
+                    continue
+
+                selected_sale_line = sale_line
+                selected_discount_code = discount_code
+                selected_instance = instance
+                selected_config = config
+                break
 
             if not selected_sale_line:
                 continue
@@ -131,9 +140,8 @@ class AccountMove(models.Model):
             if invoice_line.name:
                 account_by_label[invoice_line.name] = target_account_id
 
-            config = selected_sale_line.order_id._get_discount_code_config(selected_instance, selected_discount_code)
-            if config and config.analytic_account_id:
-                analytic_dist = {str(config.analytic_account_id.id): 100}
+            if selected_config and selected_config.analytic_account_id:
+                analytic_dist = {str(selected_config.analytic_account_id.id): 100}
                 if invoice_line.product_id:
                     analytic_by_product[invoice_line.product_id.id] = analytic_dist
                 if invoice_line.name:
