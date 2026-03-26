@@ -821,6 +821,48 @@
                         <!--                                </div>-->
                         <!--                            </div>-->
                         <!--                        </div>-->
+                        <div class="row mt16 o_settings_container" groups="analytic.group_analytic_accounting"
+                             invisible="not shopify_instance_id" style="padding: 0px 1px 10px 0px;">
+                            <div class="col-xs-12 col-md-6 o_setting_box"
+                                 invisible="not shopify_is_use_analytic_account">
+                                <div class="o_setting_right_pane">
+                                    <label for="free_product_cogs_account_id"
+                                           string="Free Product COGS Expense Account"/>
+                                    <div class="text-muted">
+                                        When a product is 100% discounted (free), COGS journal
+                                        entries will post to this expense account instead of the
+                                        normal COGS account.
+                                    </div>
+                                    <div class="content-group">
+                                        <div class="mt16">
+                                            <field name="free_product_cogs_account_id" class="o_light_label"
+                                                   options="{'no_create':True,'no_create_edit': True}"/>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="row mt16 o_settings_container"
+                             invisible="not shopify_instance_id" style="padding: 0px 1px 10px 0px;">
+                            <div class="col-xs-12 col-md-6 o_setting_box">
+                                <div class="o_setting_right_pane">
+                                    <label for="gift_card_deferred_revenue_account_id"
+                                           string="Gift Card Deferred Revenue Account"/>
+                                    <div class="text-muted">
+                                        When a gift card is redeemed as payment, the invoice line
+                                        posts to this Deferred Revenue account instead of the
+                                        product's default income account.
+                                    </div>
+                                    <div class="content-group">
+                                        <div class="mt16">
+                                            <field name="gift_card_deferred_revenue_account_id"
+                                                   class="o_light_label"
+                                                   options="{'no_create':True,'no_create_edit': True}"/>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                         <div class="col-xs-12 col-md-6 o_setting_box">
                             <div class="o_setting_left_pane">
                                 <field name="shopify_is_use_default_sequence"

@@ -15,6 +15,8 @@ class StockMove(models.Model):
     carrier_id = fields.Many2one('delivery.carrier', string="Shipping Carrier",
                                  help="Carrier extracted from Shopify Fulfillment")
     tracking_reference = fields.Char(string="Tracking Reference", help="Tracking number from Shopify fulfillment")
+    shopify_is_free_product = fields.Boolean("Free Product (Discount)", default=False,
+                                             help="True if linked sale order line was 100%% discounted")
 
     def _get_new_picking_values(self):
         """We need this method to set Shopify Instance in Stock Pickin"""
@@ -33,6 +35,17 @@ class StockMove(models.Model):
                 picking.write(
                     {'shopify_instance_id': picking.sale_id.shopify_instance_id.id, 'is_shopify_delivery_order': True})
         return res
+
+    def _generate_valuation_lines_data(self, partner_id, qty, debit_value, credit_value,
+                                        debit_account_id, credit_account_id, svl_id, description):
+        """Keep stock valuation posting standard for Shopify discounted/free lines.
+
+        The COGS override is applied at invoice posting (anglo-saxon out lines) so the
+        inventory move does not perform a separate stock->expense reclassification.
+        """
+        return super()._generate_valuation_lines_data(
+            partner_id, qty, debit_value, credit_value,
+            debit_account_id, credit_account_id, svl_id, description)
 
     def auto_process_stock_move_ept(self):
         """

@@ -304,6 +304,32 @@ class ShopifyInstanceEpt(models.Model):
                                      domain=[('type', '=', 'service')],
                                      default=_default_tip_product,
                                      help="This is used for set Tip product in a sale order lines")
+    # Discount Code Configuration
+    discount_code_config_ids = fields.One2many(
+        "shopify.discount.code.config.ept", "instance_id",
+        string="Discount Code Configurations")
+    free_product_cogs_account_id = fields.Many2one(
+        "account.account", string="Free Product COGS Expense Account",
+        help="When a product is 100% discounted, COGS posts to this expense account "
+             "instead of the normal COGS account.")
+    gift_card_deferred_revenue_account_id = fields.Many2one(
+        "account.account", string="Gift Card Deferred Revenue Account",
+        help="When a gift card is redeemed as payment, the invoice line posts to this "
+             "Deferred Revenue (liability) account instead of the product's income account.")
+    gift_card_redemption_tag_ids = fields.Many2many(
+        "crm.tag", "shopify_instance_gift_card_tag_rel",
+        "instance_id", "tag_id",
+        string="Gift Card Redemption Tags",
+        help="Order tags that indicate the order was paid with a gift card. "
+             "The wholesale value is parsed from the numeric portion of the "
+             "tag name (e.g. GIFT110E → $110). Two extra balancing lines are "
+             "added to the order to transfer that amount from Deferred Revenue "
+             "to Sales.")
+    gift_card_revenue_account_id = fields.Many2one(
+        "account.account", string="Gift Card Revenue Account",
+        help="When a gift card is redeemed, the revenue-recognition line "
+             "credits this account (typically a Sales / Revenue account).")
+
     # Analytic
     shopify_is_use_analytic_account = fields.Boolean(default=True)
     shopify_analytic_account_id = fields.Many2one('account.analytic.account', string='Analytic Account',
