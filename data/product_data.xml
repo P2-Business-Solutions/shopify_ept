@@ -16,6 +16,13 @@
             <field name="default_code">shopifyshippingproduct</field>
         </record>
 
+        <!--Create a shopify tax product-->
+        <record id="shopify_tax_product" model="product.product">
+            <field name="name">Shopify Tax Product</field>
+            <field name="type">service</field>
+            <field name="default_code">shopifytaxproduct</field>
+        </record>
+
         <!--Create a shopify gift card product-->
         <record id="shopify_gift_card_product" model="product.product">
             <field name="name">Shopify Gift Card Product</field>
@@ -63,5 +70,4 @@
         <function model="shopify.instance.ept" name="create_update_correct_shipping_product"/>
     </data>
 </odoo>
-
 

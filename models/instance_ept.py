@@ -71,6 +71,12 @@ class ShopifyInstanceEpt(models.Model):
         return shipping_product
 
     @api.model
+    def _default_tax_product(self):
+        """Set the default product used for exact Shopify tax import lines."""
+        tax_product = self.env.ref('shopify_ept.shopify_tax_product', False)
+        return tax_product
+
+    @api.model
     def _default_gift_card_product(self):
         """
         This method is used to set the gift card product in an instance.
@@ -269,6 +275,10 @@ class ShopifyInstanceEpt(models.Model):
     shipping_product_id = fields.Many2one("product.product", domain=[('type', '=', 'service')],
                                           default=_default_shipping_product,
                                           help="This is used for set shipping product in a Carrier.")
+    tax_product_id = fields.Many2one("product.product", "Tax",
+                                     domain=[('type', '=', 'service')],
+                                     default=_default_tax_product,
+                                     help="This is used to import Shopify's exact collected tax amount as a sale order line.")
     shopify_order_data = fields.Text(compute="_compute_kanban_shopify_order_data")
     shopify_order_status_ids = fields.Many2many('import.shopify.order.status', 'shopify_instance_order_status_rel',
                                                 'instance_id', 'status_id', "Shopify Import Order Status",

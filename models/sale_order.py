@@ -871,6 +871,8 @@ class SaleOrder(models.Model):
             order.create_shopify_Delivery_Fee_lines(order_response, instance)
             _logger.info("Created Delivery Fee for order (%s).", order.name)
 
+        order.create_shopify_tax_line(order_response, instance)
+
         if instance.is_delivery_multi_warehouse:
             self.set_line_warehouse_based_on_location(order, instance, order_response)
         # self.set_fulfilment_order_id_and_fulfillment_line_id(order, instance, order_response)
@@ -1043,6 +1045,40 @@ class SaleOrder(models.Model):
                                                                  delivery_fee_price,
                                                                  order_response)
                 order_line.name = line.get('title')
+
+    def create_shopify_tax_line(self, order_response, instance):
+        """Create one untaxed sale order line for Shopify's exact collected tax."""
+        if instance.apply_tax_in_order != "create_shopify_tax":
+            return False
+
+        tax_amount = self._get_shopify_order_tax_amount(instance, order_response)
+        if float_is_zero(tax_amount, precision_digits=2):
+            return False
+
+        tax_product = instance.tax_product_id or self.env.ref('shopify_ept.shopify_tax_product', False)
+        if not tax_product:
+            _logger.info("Shopify tax product is not configured for order (%s).", self.name)
+            return False
+
+        line_vals = self.prepare_vals_for_sale_order_line(tax_product, tax_product.name, tax_amount, 1)
+        line_vals.update({
+            "name": tax_product.name,
+            "tax_id": [],
+            "shopify_line_id": False,
+        })
+        order_line = self.env["sale.order.line"].create(line_vals)
+        order_line.with_context(round=False)._compute_amount()
+        _logger.info("Created Shopify exact tax line for Odoo order(%s) and Shopify order is (%s)",
+                     self.name, order_response.get("order_number"))
+        return order_line
+
+    def _get_shopify_order_tax_amount(self, instance, order_response):
+        """Return the Shopify total tax in the currency used for the imported order."""
+        tax_amount = order_response.get("total_tax") or 0.0
+        if instance.order_visible_currency and order_response.get("total_tax_set"):
+            tax_amount = self.get_price_based_on_customer_visible_currency(
+                order_response.get("total_tax_set"), order_response, tax_amount)
+        return float(tax_amount or 0.0)
 
     def prepare_shopify_order_vals(self, instance, partner, shipping_address,
                                    invoice_address, order_response, payment_gateway,
@@ -1550,39 +1586,7 @@ class SaleOrder(models.Model):
             Task_id: 167537
         """
         if instance.apply_tax_in_order == "create_shopify_tax":
-            taxes_included = order_response.get("taxes_included") or False
-            tax_ids = []
-            if line and line.get("tax_lines"):
-                if line.get("taxable"):
-                    # This is used for when the one product is taxable and another product is not
-                    # taxable
-                    tax_ids = self.shopify_get_tax_id_ept(instance,
-                                                          line.get("tax_lines"),
-                                                          taxes_included)
-                if is_shipping:
-                    # In the Shopify store there is configuration regarding tax is applicable on shipping or not,
-                    # if applicable then this use.
-                    tax_ids = self.shopify_get_tax_id_ept(instance,
-                                                          line.get("tax_lines"),
-                                                          taxes_included)
-                if is_duties:
-                    # In the Shopify store there is configuration regarding tax is applicable on line duties or not,
-                    # if applicable then this use.
-                    tax_ids = self.shopify_get_tax_id_ept(instance,
-                                                          line.get("tax_lines"),
-                                                          taxes_included)
-            elif not line and previous_line:
-                # Before modification, connector set order taxes on discount line but as per connector design,
-                # we are creating discount line base on sale order line so it should apply sale order line taxes
-                # in discount line not order taxes. It creates a problem while the customer is using multi taxes
-                # in sale orders. so set the previous line taxes on the discount line.
-                tax_ids = [(6, 0, previous_line.tax_id.ids)]
-            order_line_vals["tax_id"] = tax_ids
-            # When the one order with two products one product with tax and another product
-            # without tax and apply the discount on order that time not apply tax on discount
-            # which is
-            if is_discount and previous_line and not previous_line.tax_id:
-                order_line_vals["tax_id"] = []
+            order_line_vals["tax_id"] = []
         return order_line_vals
 
     @api.model
