@@ -1048,11 +1048,10 @@ class SaleOrder(models.Model):
 
     def create_shopify_tax_line(self, order_response, instance):
         """Create one untaxed sale order line for Shopify's exact collected tax."""
-        if instance.apply_tax_in_order != "create_shopify_tax":
-            return False
-
         tax_amount = self._get_shopify_order_tax_amount(instance, order_response)
         if float_is_zero(tax_amount, precision_digits=2):
+            _logger.info("Skipping Shopify exact tax line for Odoo order(%s) and Shopify order(%s): total tax is zero.",
+                         self.name, order_response.get("order_number"))
             return False
 
         tax_product = instance.tax_product_id or self.env.ref('shopify_ept.shopify_tax_product', False)
@@ -1585,8 +1584,7 @@ class SaleOrder(models.Model):
             @author: Haresh Mori @Emipro Technologies Pvt. Ltd on date 20 October 2020 .
             Task_id: 167537
         """
-        if instance.apply_tax_in_order == "create_shopify_tax":
-            order_line_vals["tax_id"] = []
+        order_line_vals["tax_id"] = []
         return order_line_vals
 
     @api.model
