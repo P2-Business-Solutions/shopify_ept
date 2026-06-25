@@ -393,19 +393,17 @@ class SaleOrder(models.Model):
             if carrier:
                 self.write({"carrier_id": carrier.id})
                 shipping_product = carrier.product_id
-            # Some order in If shipping carrier is not there and Shipping amount is there then create shipping line.
-            # Changes suggested by dipesh sir.
+            order_line = False
             if shipping_product:
-                if float(line.get("price")) > 0.0:
-                    shipping_price = line.get("price")
-                    if instance.order_visible_currency:
-                        shipping_price = self.get_price_based_on_customer_visible_currency(line.get("price_set"),
-                                                                                           order_response,
-                                                                                           shipping_price)
-                    order_line = self.shopify_create_sale_order_line(line, shipping_product, 1,
-                                                                     shipping_product.name or line.get("title"),
-                                                                     shipping_price,
-                                                                     order_response, is_shipping=True)
+                shipping_price = line.get("price") or 0.0
+                if instance.order_visible_currency:
+                    shipping_price = self.get_price_based_on_customer_visible_currency(line.get("price_set"),
+                                                                                       order_response,
+                                                                                       shipping_price)
+                order_line = self.shopify_create_sale_order_line(line, shipping_product, 1,
+                                                                 shipping_product.name or line.get("title"),
+                                                                 shipping_price,
+                                                                 order_response, is_shipping=True)
                 discount_amount = self._get_shopify_discount_allocation_amount(instance, line, order_response)
                 if discount_amount > 0.0:
                     _logger.info("Creating discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
