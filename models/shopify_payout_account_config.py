@@ -14,7 +14,8 @@ class ShopifyPaymentReportEpt(models.Model):
     transaction_type = fields.Selection(
         [('dispute', 'Dispute'),
          ('reserve', 'Reserve'), ('adjustment', 'Adjustment'), ('credit', 'Credit'),
-         ('debit', 'Debit'), ('payout', 'Payout'), ('payout_failure', 'Payout Failure'),
+         ('debit', 'Debit'), ('tax_adjustment', 'Marketplace Sales Tax'),
+         ('payout', 'Payout'), ('payout_failure', 'Payout Failure'),
          ('payout_cancellation', 'Payout Cancellation'), ('fees', 'Fees'),
          ('shopify_collective_debit_reversal', 'Shopify Collective Debit Reversal'),
          ('seller_protection_credit_reversal','Seller Protection Credit Reversal'),

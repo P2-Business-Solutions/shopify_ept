@@ -107,6 +107,8 @@
                                 <list decoration-danger="is_remaining_statement==True" limit="50"
                                       create="false" readonly="1">
                                     <field name="transaction_type" readonly="1"/>
+                                    <field name="raw_transaction_type" readonly="1" optional="hide"/>
+                                    <field name="adjustment_reason" readonly="1" optional="hide"/>
                                     <field name="transaction_id" readonly="1"/>
                                     <field name="order_id" readonly="1"/>
                                     <field name="net_amount" readonly="1"/>
@@ -130,6 +132,8 @@
                                         <group>
                                             <field name="transaction_id" readonly="1"/>
                                             <field name="transaction_type" readonly="1"/>
+                                            <field name="raw_transaction_type" readonly="1"/>
+                                            <field name="adjustment_reason" readonly="1"/>
                                             <field name="currency_id" readonly="1"/>
                                             <field name="source_type" readonly="1"/>
                                         </group>

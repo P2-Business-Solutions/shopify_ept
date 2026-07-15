@@ -189,7 +189,9 @@ class ShopifyPaymentReportEpt(models.Model):
         sale_order_obj = self.env['sale.order']
         transaction_id = data.get('id', '')
         source_order_id = data.get('source_order_id', '')
-        transaction_type = data.get('type', '')
+        raw_transaction_type = data.get('type', '')
+        adjustment_reason = data.get('adjustment_reason', '')
+        transaction_type = 'tax_adjustment' if adjustment_reason == 'tax_adjustment' else raw_transaction_type
         amount = data.get('amount', 0.0)
         fee = data.get('fee', 0.0)
         net_amount = data.get('net', 0.0)
@@ -206,6 +208,8 @@ class ShopifyPaymentReportEpt(models.Model):
             'transaction_id': transaction_id,
             'source_order_id': source_order_id,
             'transaction_type': transaction_type,
+            'raw_transaction_type': raw_transaction_type,
+            'adjustment_reason': adjustment_reason,
             'order_id': order_id and order_id.id,
             'amount': amount,
             'fee': fee,

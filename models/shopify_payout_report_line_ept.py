@@ -15,12 +15,19 @@ class ShopifyPayoutReportLineEpt(models.Model):
     transaction_type = fields.Selection(
         [('charge', 'Charge'), ('refund', 'Refund'), ('dispute', 'Dispute'),
          ('reserve', 'Reserve'), ('adjustment', 'Adjustment'), ('credit', 'Credit'),
-         ('debit', 'Debit'), ('payout', 'Payout'), ('payout_failure', 'Payout Failure'),
+         ('debit', 'Debit'), ('tax_adjustment', 'Marketplace Sales Tax'),
+         ('payout', 'Payout'), ('payout_failure', 'Payout Failure'),
          ('payout_cancellation', 'Payout Cancellation'), ('fees', 'Fees'), ('payment_refund', 'Payment Refund'),
          ('shopify_collective_debit_reversal', 'Shopify Collective Debit Reversal'),
          ('seller_protection_credit_reversal','Seller Protection Credit Reversal'),
          ('refund_failure', 'Refund Failure')],
         help="The type of the balance transaction", string="Balance Transaction Type")
+    raw_transaction_type = fields.Char(
+        string="Shopify Balance Transaction Type",
+        help="The original balance transaction type returned by Shopify before accounting classification.")
+    adjustment_reason = fields.Char(
+        string="Adjustment Reason",
+        help="The adjustment reason returned by Shopify, when applicable.")
     currency_id = fields.Many2one('res.currency', string='Currency', help="currency code of the payout.")
     source_type = fields.Selection(
         [('charge', 'Charge'), ('refund', 'Refund'), ('dispute', 'Dispute'),
