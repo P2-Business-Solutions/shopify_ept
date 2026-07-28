@@ -1097,6 +1097,10 @@ class SaleOrder(models.Model):
             "partner_shipping_id": shipping_address.ids[0],
             "warehouse_id": instance.shopify_warehouse_id.id if instance.shopify_warehouse_id else False,
             "date_order": date_order,
+            # Shopify orders do not expose a native delivery date. Use the
+            # normalized order date so integrations such as EDI invoice export
+            # always receive Odoo's Delivery Date (commitment_date).
+            "commitment_date": date_order,
             "state": "draft",
             "pricelist_id": pricelist_id.id if pricelist_id else False,
             "team_id": instance.shopify_section_id.id if instance.shopify_section_id else False,
