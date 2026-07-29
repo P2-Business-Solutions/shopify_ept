@@ -318,6 +318,12 @@ class ShopifyInstanceEpt(models.Model):
     discount_code_config_ids = fields.One2many(
         "shopify.discount.code.config.ept", "instance_id",
         string="Discount Code Configurations")
+    shopify_order_type_mapping_ids = fields.One2many(
+        "shopify.order.type.mapping.ept",
+        "instance_id",
+        string="Order Type Mappings",
+        help="Assign an order type when an imported order has a matching Shopify tag.",
+    )
     free_product_cogs_account_id = fields.Many2one(
         "account.account", string="Free Product COGS Expense Account",
         help="When a product is 100% discounted, COGS posts to this expense account "

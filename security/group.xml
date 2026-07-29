@@ -84,6 +84,13 @@
             </field>
         </record>
 
+        <record model="ir.rule" id="shopify_order_type_mapping_company_rule">
+            <field name="name">Shopify Order Type Mapping multi-company</field>
+            <field name="model_id" ref="model_shopify_order_type_mapping_ept"/>
+            <field name="global" eval="True"/>
+            <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+        </record>
+
         <!-- Multi - Company Payout report -->
         <record model="ir.rule" id="shopify_multi_com_payout_report_rule">
             <field name="name">Shopify payout report multi-company</field>

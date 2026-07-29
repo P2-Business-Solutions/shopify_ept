@@ -42,6 +42,34 @@ class TestShopifyOrderUtils(unittest.TestCase):
     def test_missing_lines_are_handled(self):
         self.assertEqual(UTILS.filter_importable_order_lines(None), [])
 
+    def test_shopify_tags_are_normalized(self):
+        self.assertEqual(
+            UTILS.normalize_shopify_tags(" Wholesale,VIP , wholesale "),
+            {"wholesale", "vip"},
+        )
+
+    def test_first_configured_matching_tag_wins(self):
+        self.assertEqual(
+            UTILS.find_matching_shopify_tag(
+                "Wholesale, VIP",
+                ["vip", "wholesale"],
+            ),
+            "vip",
+        )
+
+    def test_order_type_tag_matching_is_exact(self):
+        self.assertFalse(
+            UTILS.find_matching_shopify_tag(
+                "Wholesale Customer",
+                ["Wholesale"],
+            )
+        )
+
+    def test_missing_shopify_tags_do_not_match(self):
+        self.assertFalse(
+            UTILS.find_matching_shopify_tag(None, ["Wholesale"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

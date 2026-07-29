@@ -23,7 +23,10 @@ from .shopify_fulfillment_utils import (
     get_single_order_location_id,
     normalize_fulfillment_orders,
 )
-from .shopify_order_utils import filter_importable_order_lines
+from .shopify_order_utils import (
+    filter_importable_order_lines,
+    find_matching_shopify_tag,
+)
 
 utc = pytz.utc
 
@@ -1346,10 +1349,11 @@ class SaleOrder(models.Model):
             @change : pass tag_ids on vals by Nilam Kubavat for task id : 190111 at 19/05/2022
         """
         utm_source, utm_medium, utm_campaign = self.set_utm_source_medium_campaign(order_response)
-        tags = order_response.get("tags").split(",") if order_response.get("tags") != '' else order_response.get("tags")
+        tags = (order_response.get("tags") or "").split(",")
         tag_ids = []
-        for tag in tags:
+        for tag in filter(str.strip, tags):
             tag_ids.append(self.create_or_search_sale_tag(tag))
+        order_type = self._get_shopify_order_type(order_response, instance)
         order_vals = {
             "checkout_id": order_response.get("checkout_id"),
             "note": order_response.get("note") if order_response.get("note") else '',
@@ -1363,6 +1367,7 @@ class SaleOrder(models.Model):
             "client_order_ref": order_response.get("name"),
             # "analytic_account_id": instance.shopify_analytic_account_id.id if instance.shopify_analytic_account_id else False,
             "tag_ids": tag_ids,
+            "order_type_id": order_type.id,
             "source_id": utm_source and utm_source.id or False,
             "medium_id": utm_medium and utm_medium.id or False,
             "campaign_id": utm_campaign and utm_campaign.id or False,
@@ -1377,6 +1382,33 @@ class SaleOrder(models.Model):
         if self.env["ir.config_parameter"].sudo().get_param("shopify_ept.use_default_terms_and_condition_of_odoo"):
             order_vals = self.prepare_order_note_with_customer_note(order_vals)
         return order_vals
+
+    def _get_shopify_order_type(self, order_response, instance):
+        """Resolve an imported order's type from its tags, defaulting to Regular."""
+        mappings = instance.shopify_order_type_mapping_ids.sorted(
+            key=lambda mapping: (mapping.sequence, mapping.id)
+        )
+        matching_tag = find_matching_shopify_tag(
+            order_response.get("tags"),
+            mappings.mapped("shopify_tag"),
+        )
+        if matching_tag:
+            normalized_matching_tag = matching_tag.strip().casefold()
+            mapping = mappings.filtered(
+                lambda item: item.shopify_tag.strip().casefold()
+                == normalized_matching_tag
+            )[:1]
+            if mapping:
+                return mapping.order_type_id
+
+        regular_order_type = self.env.ref(
+            "sale_order_type.sale_order_type_regular", False
+        )
+        if regular_order_type:
+            return regular_order_type
+        return self.env["sale.order.type"].with_company(
+            instance.shopify_company_id
+        )._get_default_order_type()
 
     def create_and_done_stock_move_ept(self, order_line, customers_location, bom_line=False, vendor_location=False):
         """
