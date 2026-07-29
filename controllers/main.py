@@ -3,6 +3,7 @@
 
 import logging
 import requests
+from urllib.parse import urlencode
 from odoo import http
 from odoo.http import request
 from .. import shopify
@@ -184,10 +185,12 @@ class Main(http.Controller):
             'read_shopify_payments_payouts'
         )
 
-        authorize_url = (
-            f"https://{shop}/admin/oauth/authorize?"
-            f"client_id={client_id}&scope={scope}&redirect_uri={redirect_uri}"
-        )
+        authorize_query = urlencode({
+            "client_id": client_id,
+            "scope": ",".join(scope),
+            "redirect_uri": redirect_uri,
+        })
+        authorize_url = f"https://{shop}/admin/oauth/authorize?{authorize_query}"
 
         return redirect(authorize_url)
 
@@ -255,5 +258,4 @@ class Main(http.Controller):
                 'error': 'Token Exchange Failed',
                 'error_description': str(e),
             })
-
 

@@ -23,6 +23,7 @@ from .shopify_fulfillment_utils import (
     get_single_order_location_id,
     normalize_fulfillment_orders,
 )
+from .shopify_order_utils import filter_importable_order_lines
 
 utc = pytz.utc
 
@@ -206,6 +207,20 @@ class SaleOrder(models.Model):
                 time.sleep(int(float(error.response.headers.get('Retry-After', 5))))
                 fulfillment_orders = shopify.fulfillment.FulfillmentOrders.find(
                     order_id=int(shopify_order_id))
+            elif hasattr(error, "response") and error.response.code == 403:
+                raise UserError(_(
+                    "Shopify denied access to Fulfillment Orders.\n\n"
+                    "Grant the app the "
+                    "read_merchant_managed_fulfillment_orders Admin API scope. "
+                    "Also grant read_third_party_fulfillment_orders for locations "
+                    "managed by another fulfillment service, and "
+                    "read_assigned_fulfillment_orders if this app owns fulfillment "
+                    "service locations.\n\n"
+                    "Reinstall or reauthorize the app so Shopify issues a token "
+                    "with the updated scopes.\n\n"
+                    "After updating the access token on the Shopify instance, "
+                    "retry the order import."
+                )) from error
             else:
                 raise
 
@@ -263,7 +278,7 @@ class SaleOrder(models.Model):
         sale_order_line_obj = self.env["sale.order.line"]
         total_discount = order_response.get("total_discounts", 0.0)
         order_number = order_response.get("order_number")
-        for line in lines:
+        for line in filter_importable_order_lines(lines):
             is_custom_line, is_gift_card_line, product = self.search_custom_tip_gift_card_product(line, instance)
             price = line.get("price")
             if instance.order_visible_currency:
@@ -517,7 +532,8 @@ class SaleOrder(models.Model):
             if not partner:
                 continue
 
-            lines = order_response.get("line_items")
+            lines = filter_importable_order_lines(
+                order_response.get("line_items"))
             if self.check_mismatch_details(lines, instance, order_number, order_data_line):
                 _logger.info("Mismatch details found in this Shopify Order(%s) and id (%s)", order_number,
                              order_response.get("id"))
@@ -770,7 +786,7 @@ class SaleOrder(models.Model):
         common_log_line_obj = self.env["common.log.lines.ept"]
         mismatch = False
 
-        for line in lines:
+        for line in filter_importable_order_lines(lines):
             shopify_variant = self.search_shopify_variant(line, instance)
             if shopify_variant:
                 continue
@@ -2712,7 +2728,8 @@ class SaleOrder(models.Model):
         @author: Haresh Mori @Emipro Technologies Pvt. Ltd on date 16 October 2023 .
         """
         new_line_data = []
-        for response_line in order_data.get('line_items'):
+        for response_line in filter_importable_order_lines(
+                order_data.get('line_items')):
             sl_id = response_line.get('id')
             if self.order_line.filtered(lambda ol: ol.shopify_line_id == str(sl_id)):
                 continue
@@ -2722,7 +2739,7 @@ class SaleOrder(models.Model):
     def webhook_create_shopify_order_lines(self, lines, order_response, instance):
         total_discount = order_response.get("total_discounts", 0.0)
         order_number = order_response.get("order_number")
-        for line in lines:
+        for line in filter_importable_order_lines(lines):
             is_custom_line, is_gift_card_line, product = self.search_custom_tip_gift_card_product(line, instance)
             price = line.get("price")
             if instance.order_visible_currency:
@@ -3434,7 +3451,8 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         """
         module_obj = self.env['ir.module.module']
         mrp_module = module_obj.sudo().search([('name', '=', 'mrp'), ('state', '=', 'installed')])
-        lines = order_response.get("line_items")
+        lines = filter_importable_order_lines(
+            order_response.get("line_items"))
         bom_lines = []
         for line in lines:
             shopify_line_id = line.get('id')

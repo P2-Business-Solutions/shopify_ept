@@ -188,8 +188,9 @@ class ShopifyInstanceConfig(models.TransientModel):
         instance_id = context.get("shopify_instance_id")
 
         instance = shopify_instance_obj.browse(instance_id)
-        if instance.shopify_api_key == self.shopify_api_key or instance.shopify_password == self.shopify_password or \
-                instance.shopify_shared_secret == self.shopify_shared_secret:
+        if (instance.shopify_api_key == self.shopify_api_key
+                and instance.shopify_password == self.shopify_password
+                and instance.shopify_shared_secret == self.shopify_shared_secret):
             raise UserError(_("Entered credentials are same as previous.\nPlease verify the credentials once."))
 
         vals = {"shopify_api_key": self.shopify_api_key,
