@@ -19,6 +19,10 @@ from odoo.tools.float_utils import float_is_zero
 import re
 import urllib.parse
 from odoo.tools.float_utils import float_is_zero, float_compare
+from .shopify_fulfillment_utils import (
+    get_single_order_location_id,
+    normalize_fulfillment_orders,
+)
 
 utc = pytz.utc
 
@@ -187,22 +191,37 @@ class SaleOrder(models.Model):
 
         return partner, delivery_address, invoice_address
 
+    @api.model
+    def get_shopify_fulfillment_orders(self, shopify_order_id):
+        """Return fulfillment orders for a Shopify order as dictionaries."""
+        if not shopify_order_id:
+            return []
+
+        try:
+            fulfillment_orders = shopify.fulfillment.FulfillmentOrders.find(
+                order_id=int(shopify_order_id))
+        except ClientError as error:
+            if (hasattr(error, "response") and error.response.code == 429
+                    and error.response.msg == "Too Many Requests"):
+                time.sleep(int(float(error.response.headers.get('Retry-After', 5))))
+                fulfillment_orders = shopify.fulfillment.FulfillmentOrders.find(
+                    order_id=int(shopify_order_id))
+            else:
+                raise
+
+        return normalize_fulfillment_orders(fulfillment_orders)
+
     def set_shopify_location_and_warehouse(self, order_response, instance, pos_order, sale_order):
         """
         This method sets shopify location and warehouse related to that location in order.
         @author: Maulik Barad on Date 11-Sep-2020.
         """
         shopify_location = shopify_location_obj = self.env["shopify.location.ept"]
-        if order_response.get("location_id"):
-            shopify_location_id = order_response.get("location_id")
-        elif order_response.get("fulfillments"):
-            shopify_location_id = order_response.get("fulfillments")[0].get("location_id")
-        else:
-            shopify_location_id = False
+        shopify_location_id = get_single_order_location_id(order_response)
 
         if shopify_location_id:
             shopify_location = shopify_location_obj.search(
-                [("shopify_location_id", "=", shopify_location_id),
+                [("shopify_location_id", "=", str(shopify_location_id)),
                  ("instance_id", "=", instance.id)],
                 limit=1)
 
@@ -216,6 +235,25 @@ class SaleOrder(models.Model):
 
         return {"shopify_location_id": shopify_location and shopify_location.id or False,
                 "warehouse_id": warehouse_id, "is_pos_order": pos_order}
+
+    def apply_shopify_location_and_warehouse(self, order_response, instance, pos_order=False):
+        """Apply Shopify fulfillment locations to an order and its lines."""
+        self.ensure_one()
+
+        if instance.is_delivery_multi_warehouse:
+            self.set_line_warehouse_based_on_location(self, instance, order_response)
+
+        location_vals = self.set_shopify_location_and_warehouse(
+            order_response, instance, pos_order, self)
+
+        if instance.is_delivery_multi_warehouse:
+            warehouses = self.order_line.filtered(
+                lambda line_item: line_item.warehouse_id_ept).mapped('warehouse_id_ept')
+            if warehouses and len(set(warehouses.ids)) == 1:
+                location_vals.update({"warehouse_id": warehouses.id})
+
+        self.write(location_vals)
+        return location_vals
 
     def create_shopify_order_lines(self, lines, order_response, instance):
         """
@@ -461,16 +499,19 @@ class SaleOrder(models.Model):
                 order_data_line.write({'state': 'failed', 'processed_at': datetime.now()})
                 continue
 
+            pos_order = order_response.get("source_name", "") == "pos"
             sale_order = self.search_existing_shopify_order(order_response, instance, order_number)
 
             if sale_order:
+                if instance.is_delivery_multi_warehouse and sale_order.state in ("draft", "sent"):
+                    sale_order.apply_shopify_location_and_warehouse(
+                        order_response, instance, pos_order)
                 order_data_line.write({"state": "done", "processed_at": datetime.now(),
                                        "sale_order_id": sale_order.id, "order_data": False})
                 _logger.info("Done the Process of order Because Shopify Order(%s) is exist in Odoo and Odoo order is("
                              "%s)", order_number, sale_order.name)
                 continue
 
-            pos_order = order_response.get("source_name", "") == "pos"
             partner, delivery_address, invoice_address = self.prepare_shopify_customer_and_addresses(
                 order_response, pos_order, instance, order_data_line)
             if not partner:
@@ -497,15 +538,8 @@ class SaleOrder(models.Model):
                 continue
             order_ids.append(sale_order.id)
 
-            location_vals = self.set_shopify_location_and_warehouse(order_response, instance, pos_order, sale_order)
-
-            if instance.is_delivery_multi_warehouse:
-                warehouses = sale_order.order_line.filtered(lambda line_item: line_item.warehouse_id_ept).mapped(
-                    'warehouse_id_ept')
-                if warehouses and len(set(warehouses.ids)) == 1:
-                    location_vals.update({"warehouse_id": warehouses.id})
-
-            sale_order.write(location_vals)
+            sale_order.apply_shopify_location_and_warehouse(
+                order_response, instance, pos_order)
 
             if sale_order.shopify_order_status != "fulfilled":
                 risk_result = shopify.OrderRisk().find(order_id=order_response.get("id"))
@@ -871,8 +905,6 @@ class SaleOrder(models.Model):
 
         order.create_shopify_tax_line(order_response, instance)
 
-        if instance.is_delivery_multi_warehouse:
-            self.set_line_warehouse_based_on_location(order, instance, order_response)
         # self.set_fulfilment_order_id_and_fulfillment_line_id(order, instance, order_response)
 
         # Gift-card redemption: add DR → Sales transfer lines
@@ -1005,21 +1037,17 @@ class SaleOrder(models.Model):
         shopify_location_obj = self.env['shopify.location.ept']
         shopify_order_id = order.shopify_order_id
         if not order_response.get('fulfillment_data'):
-            shopify_order = shopify.Order().find(shopify_order_id)
-            try:
-                order_response["fulfillment_data"] = shopify_order.get('fulfillment_orders')
-            except ClientError as error:
-                if hasattr(error,
-                           "response") and error.response.code == 429 and error.response.msg == "Too Many Requests":
-                    time.sleep(int(float(error.response.headers.get('Retry-After', 5))))
-                    order_response["fulfillment_data"] = shopify_order.get('fulfillment_orders')
-        fulfillment_data = order_response.get('fulfillment_data')
+            order_response["fulfillment_data"] = self.get_shopify_fulfillment_orders(shopify_order_id)
+        fulfillment_data = order_response.get('fulfillment_data', [])
         for data in fulfillment_data:
             shopify_location_id = data.get('assigned_location_id')
-            line_item_ids = [str(line.get('line_item_id')) for line in data.get('line_items')]
+            line_item_ids = [str(line.get('line_item_id')) for line in data.get('line_items', [])]
             order_line = order.order_line.filtered(lambda line_item: line_item.shopify_line_id in line_item_ids)
-            line_warehouse_id = shopify_location_obj.search(
-                [('shopify_location_id', '=', shopify_location_id)]).warehouse_for_order
+            shopify_location = shopify_location_obj.search(
+                [('shopify_location_id', '=', str(shopify_location_id)),
+                 ('instance_id', '=', instance.id)],
+                limit=1)
+            line_warehouse_id = shopify_location.warehouse_for_order
             order_line.write(
                 {'warehouse_id_ept': line_warehouse_id.id if line_warehouse_id else instance.shopify_warehouse_id.id})
         return True
@@ -2349,6 +2377,10 @@ class SaleOrder(models.Model):
                 return True
             try:
                 need_to_done_queue = True
+                if instance.is_delivery_multi_warehouse and order.state in ("draft", "sent"):
+                    pos_order = order_data.get("source_name", "") == "pos"
+                    order.apply_shopify_location_and_warehouse(
+                        order_data, instance, pos_order)
                 if order_data.get('cancel_reason'):
                     need_to_done_queue = False
                     self.process_cancel_order_webhook_ept(order, instance, queue_line, order_data)

@@ -105,18 +105,15 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
         need_to_create_queue = True
         orders_data.reverse()
         order_queue_list = []
-        fulfillment_data = []
         is_new_order = bool(self._context.get('is_new_order'))
         queue_type_is_buy_with_prime = False
+        if queue_type != 'shipped' and instance.is_delivery_multi_warehouse:
+            instance.connect_in_shopify()
         for order in orders_data:
+            fulfillment_data = []
             if queue_type != 'shipped' and instance.is_delivery_multi_warehouse:
-                try:
-                    fulfillment_data = order.get('fulfillment_orders')
-                except ClientError as error:
-                    if hasattr(error,
-                               "response") and error.response.code == 429 and error.response.msg == "Too Many Requests":
-                        time.sleep(int(float(error.response.headers.get('Retry-After', 5))))
-                        fulfillment_data = order.get('fulfillment_orders')
+                order_id = order.get('id') if isinstance(order, dict) else order.id
+                fulfillment_data = self.env["sale.order"].get_shopify_fulfillment_orders(order_id)
             if created_by == "webhook" and not is_new_order:
                 order_queue, need_to_create_queue = self.search_webhook_order_queue(created_by, instance, order,
                                                                                     queue_type, need_to_create_queue)
