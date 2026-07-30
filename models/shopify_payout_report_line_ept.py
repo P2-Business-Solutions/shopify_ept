@@ -38,10 +38,10 @@ class ShopifyPayoutReportLineEpt(models.Model):
         string="Adjustment Reason",
         help="The adjustment reason returned by Shopify, when applicable.")
     currency_id = fields.Many2one('res.currency', string='Currency', help="currency code of the payout.")
-    source_type = fields.Selection(
-        [('charge', 'Charge'), ('refund', 'Refund'), ('dispute', 'Dispute'),
-         ('reserve', 'Reserve'), ('adjustment', 'Adjustment'), ('payout', 'Payout'), ],
-        help="The type of the balance transaction", string="Resource Leading Transaction")
+    source_type = fields.Char(
+        string="Resource Leading Transaction",
+        help="The Shopify Payments resource class that originated the balance transaction.",
+    )
     amount = fields.Float(string="Amount", help="The gross amount of the transaction.")
     fee = fields.Float(string="Fees", help="The total amount of fees deducted from the transaction amount.")
     net_amount = fields.Float(string="Net Amount", help="The net amount of the transaction.")
