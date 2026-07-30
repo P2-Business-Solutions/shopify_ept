@@ -15,6 +15,7 @@ import pytz
 from odoo import models, fields, api
 from .. import shopify
 from ..shopify.pyactiveresource.connection import ClientError
+from .shopify_product_utils import find_duplicate_match_field
 
 utc = pytz.utc
 _logger = logging.getLogger("Shopify Template")
@@ -349,9 +350,32 @@ class ShopifyProductTemplateEpt(models.Model):
             company_uom = instance._default_UOM_category()
             weight = instance.shopify_product_uom_id._compute_quantity(variant.get("weight"),
                                                                        company_uom)
-            product_varinat = shopify_template.product_tmpl_id.product_variant_ids.filtered(
-                lambda x: x.default_code == variant.get('sku'))
-            product_varinat.write({'weight': weight})
+            variant_id = str(variant.get("id") or "")
+            shopify_variant = shopify_template.shopify_product_ids.filtered(
+                lambda product: product.variant_id == variant_id)[:1]
+            product_variant = shopify_variant.product_id
+
+            if not product_variant:
+                product_variants = shopify_template.product_tmpl_id.product_variant_ids
+                match_by = instance.shopify_sync_product_with
+                candidates = self.env["product.product"]
+
+                if match_by in ("sku", "sku_or_barcode") and variant.get("sku"):
+                    candidates = product_variants.filtered(
+                        lambda product: product.default_code == variant.get("sku"))
+                if len(candidates) != 1 and match_by in ("barcode", "sku_or_barcode") and variant.get("barcode"):
+                    candidates = product_variants.filtered(
+                        lambda product: product.barcode == variant.get("barcode"))
+                if len(candidates) == 1:
+                    product_variant = candidates
+
+            if product_variant:
+                product_variant.write({"weight": weight})
+            else:
+                _logger.warning(
+                    "Could not identify a unique Odoo variant for Shopify variant %s while updating weight.",
+                    variant.get("id"),
+                )
 
     def convert_shopify_template_response(self, shopify_tmpl_id, product_data_line_id, model_name,
                                           order_data_line_id, instance):
@@ -429,22 +453,30 @@ class ShopifyProductTemplateEpt(models.Model):
             # are updating same existing product so.
             shopify_product, odoo_product = self.shopify_search_odoo_product_variant(instance, variant_id, False, False)
             variant_vals = self.prepare_variant_vals(instance, variant)
-            domain = [("variant_id", "=", False), ("shopify_instance_id", "=", instance.id),
-                      ("shopify_template_id", "=", shopify_template.id)]
-            if not shopify_product:
-                domain.append(("default_code", "=", sku))
-                shopify_product = shopify_product_obj.search(domain, limit=1)
+            base_domain = [
+                ("variant_id", "=", False),
+                ("shopify_instance_id", "=", instance.id),
+                ("shopify_template_id", "=", shopify_template.id),
+            ]
+            match_fields = []
+            if instance.shopify_sync_product_with in ("sku", "sku_or_barcode") and sku:
+                match_fields.append(("default_code", sku))
+            if instance.shopify_sync_product_with in ("barcode", "sku_or_barcode") and barcode:
+                match_fields.append(("product_id.barcode", barcode))
+
+            for field_name, field_value in match_fields:
+                if shopify_product:
+                    break
+                shopify_product = shopify_product_obj.search(
+                    base_domain + [(field_name, "=", field_value)], limit=1)
 
             if not shopify_product:
-                domain.append(("product_id.barcode", "=", barcode))
-                shopify_product = shopify_product_obj.search(domain, limit=1)
+                attribute_value_domain = self.find_template_attribute_values(shopify_attributes, odoo_template.id,
+                                                                             variant)
+                if attribute_value_domain:
+                    odoo_product = odoo_product.search(attribute_value_domain)
 
-                if not shopify_product:
-                    attribute_value_domain = self.find_template_attribute_values(shopify_attributes, odoo_template.id,
-                                                                                 variant)
-                    if attribute_value_domain:
-                        odoo_product = odoo_product.search(attribute_value_domain)
-
+            if not shopify_product:
                 message = self.is_product_importable(template_data, instance, odoo_product, shopify_product)
                 if message:
                     self.create_log_line_for_queue_line(instance, message, model_name, product_data_line_id,
@@ -457,7 +489,7 @@ class ShopifyProductTemplateEpt(models.Model):
 
                 elif not shopify_product:
                     shopify_product, odoo_product = self.shopify_search_odoo_product_variant(instance, variant_id, sku,
-                                                                                             False)
+                                                                                             barcode)
                     shopify_product = self.create_or_update_shopify_variant(variant_vals, shopify_product,
                                                                             shopify_template, odoo_product)
                     if not shopify_product:
@@ -1198,15 +1230,10 @@ class ShopifyProductTemplateEpt(models.Model):
         template_title = template_data.get("title", "")
         template_id = template_data.get("id", "")
 
-        shopify_skus = []
-        shopify_barcodes = []
         shopify_product_ids_list = []
         for variant in variants:
             variant_id = variant.get("id") or False
-            sku = variant.get("sku", "")
             barcode = variant.get("barcode", "")
-            sku and shopify_skus.append(sku)
-            barcode and shopify_barcodes.append(barcode)
             if barcode:
                 duplicate_barcode = odoo_product_obj.search([("barcode", "=", barcode)])
                 shopify_variant = shopify_product_obj.search([
@@ -1234,8 +1261,9 @@ class ShopifyProductTemplateEpt(models.Model):
                 #                                                                           template_id)
                 #     return message
 
-        total_shopify_sku = len(set(shopify_skus))
-        if len(shopify_skus) != total_shopify_sku:
+        duplicate_match_field = find_duplicate_match_field(
+            variants, instance.shopify_sync_product_with)
+        if duplicate_match_field == "sku":
             message = ("Attempted to create a new product, but there is more than one variant found for same SKU, with Product: %s, and Template ID: %s \n"
 					   "Action Items:\n"
 					   "- Change the SKU in the existing Odoo product variants, archive the product,or update the SKU in the Shopify store.\n"
@@ -1243,8 +1271,7 @@ class ShopifyProductTemplateEpt(models.Model):
 					   template_title, template_id)
             return message
 
-        total_shopify_barcodes = len(set(shopify_barcodes))
-        if len(shopify_barcodes) != total_shopify_barcodes:
+        if duplicate_match_field == "barcode":
             message = (
 						  "Attempted to create a new product, but a product already exists in Odoo with same Barcode, Product: %s, and Template ID: %s \n"
 						  "Action Items:\n"
