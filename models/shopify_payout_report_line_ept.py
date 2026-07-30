@@ -9,9 +9,18 @@ class ShopifyPayoutReportLineEpt(models.Model):
     _rec_name = "transaction_id"
 
     payout_id = fields.Many2one('shopify.payout.report.ept', string="Payout ID", ondelete="cascade")
-    transaction_id = fields.Char(string="Transaction ID", help="The unique identifier of the transaction.")
+    transaction_id = fields.Char(string="Transaction ID", help="The unique identifier of the transaction.", index=True)
+    source_id = fields.Char(
+        string="Source ID",
+        help="The Shopify Payments resource that originated this balance transaction.",
+    )
     source_order_id = fields.Char(string="Order Reference ID", help="The id of the Order that this transaction  "
                                                                     "ultimately originated from")
+    source_order_transaction_id = fields.Char(
+        string="Order Transaction ID",
+        help="The Shopify order transaction that originated this balance transaction.",
+        index=True,
+    )
     transaction_type = fields.Selection(
         [('charge', 'Charge'), ('refund', 'Refund'), ('dispute', 'Dispute'),
          ('reserve', 'Reserve'), ('adjustment', 'Adjustment'), ('credit', 'Credit'),

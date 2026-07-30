@@ -37,7 +37,9 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
                                                          help="Log lines created against which line.")
     name = fields.Char(help="Order Name")
 
-    def create_order_queue_line(self, order_dict, instance, order_data, customer_name, customer_email, order_queue_id):
+    def create_order_queue_line(
+            self, order_dict, instance, order_data, customer_name, customer_email,
+            order_queue_id, created_by="import"):
         """
         Creates order data queue line from order data.
         :param order_dict: The response of order in the dictionary.
@@ -51,7 +53,7 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
         result = []
         transactions = []
         in_shop_currency = (not instance.order_visible_currency)
-        if len(order_dict.get('payment_gateway_names')) >= 1:
+        if order_dict.get('payment_gateway_names'):
             try:
                 transactions = shopify.Transaction().find(order_id=order_dict.get('id'),
                                                           in_shop_currency=in_shop_currency)
@@ -72,9 +74,12 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
         # new_order_data.update({'fulfillment_data': fulfillment_data})
 
         order_data = json.dumps(order_data)
-        existing_data = order_data_queue_line_obj.search(
-            [('shopify_order_id', '=', order_dict.get('id')), ('shopify_instance_id', '=', instance.id),
-             ('state', 'in', ['draft', 'failed']), ('shopify_order_data_queue_id.is_action_require', '=', False)], limit=1)
+        existing_data = order_data_queue_line_obj
+        if created_by != "manual_update":
+            existing_data = order_data_queue_line_obj.search(
+                [('shopify_order_id', '=', order_dict.get('id')), ('shopify_instance_id', '=', instance.id),
+                 ('state', 'in', ['draft', 'failed']),
+                 ('shopify_order_data_queue_id.is_action_require', '=', False)], limit=1)
         existing_queue = existing_data.shopify_order_data_queue_id
         order_queue_line_vals = {"shopify_order_id": order_dict.get("id", False),
                                  "shopify_instance_id": instance.id,
@@ -117,7 +122,7 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
             if created_by == "webhook" and not is_new_order:
                 order_queue, need_to_create_queue = self.search_webhook_order_queue(created_by, instance, order,
                                                                                     queue_type, need_to_create_queue)
-            elif not is_new_order:
+            elif not is_new_order and not isinstance(order, dict):
                 order = order.to_dict()
 
             if need_to_create_queue:
@@ -137,7 +142,10 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
                     instance.buy_with_prime_tag_ids)
             data.update({'fulfillment_data': fulfillment_data, "buy_with_prime": queue_type_is_buy_with_prime})
             customer_name, customer_email = self.get_customer_name_and_email(order)
-            self.create_order_queue_line(order, instance, data, customer_name, customer_email, order_queue)
+            self.create_order_queue_line(
+                order, instance, data, customer_name, customer_email, order_queue,
+                created_by=created_by
+            )
             if created_by == "webhook" and len(order_queue.order_data_queue_line_ids) >= 50:
                 order_queue.order_data_queue_line_ids.process_import_order_queue_data(update_order=True)
 
@@ -298,8 +306,8 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
 
             queue_id.is_process_queue = True
             # Below two line used for When the update order webhook calls.
-            if update_order or queue_id.created_by == "webhook":
-                created_by = 'Webhook'
+            if update_order or queue_id.created_by in ("webhook", "manual_update"):
+                created_by = 'Manual Update' if queue_id.created_by == "manual_update" else 'Webhook'
                 sale_order_obj.update_shopify_order(self, created_by, instance)
             else:
                 sale_order_obj.import_shopify_orders(self, instance)

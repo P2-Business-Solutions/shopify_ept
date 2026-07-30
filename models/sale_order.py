@@ -27,6 +27,7 @@ from .shopify_order_utils import (
     filter_importable_order_lines,
     find_matching_shopify_tag,
 )
+from .shopify_transaction_utils import find_transaction_id
 
 utc = pytz.utc
 
@@ -473,6 +474,109 @@ class SaleOrder(models.Model):
                     _logger.info("Created discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
 
+    def update_shopify_shipping_lines_ept(self, instance, order_response):
+        """Synchronize a manually refreshed order's current Shopify shipping charge.
+
+        If the original delivery line has already been invoiced, preserve it and
+        create one idempotent adjustment line for the difference. This lets the
+        normal workflow create an incremental invoice instead of rewriting
+        posted accounting.
+        """
+        self.ensure_one()
+        shipping_lines = order_response.get("shipping_lines") or []
+        if not shipping_lines:
+            return False
+
+        delivery_carrier_obj = self.env["delivery.carrier"]
+        changed = False
+        existing_delivery_lines = self.order_line.filtered("is_delivery")
+        for shipping_line in shipping_lines:
+            carrier = delivery_carrier_obj.shopify_search_create_delivery_carrier(
+                shipping_line, instance
+            )
+            shipping_product = carrier.product_id if carrier else instance.shipping_product_id
+            if carrier and self.carrier_id != carrier:
+                self.carrier_id = carrier
+                self.picking_ids.filtered(
+                    lambda picking: picking.location_dest_id.usage == "customer"
+                    and picking.state not in ("done", "cancel")
+                ).write({"carrier_id": carrier.id})
+                changed = True
+            if not shipping_product:
+                continue
+
+            remote_id = str(shipping_line.get("id") or "shipping")
+            adjustment_id = "%s-shipping-adjustment" % remote_id
+            adjustment_line = existing_delivery_lines.filtered(
+                lambda line: line.shopify_line_id == adjustment_id
+            )[:1]
+            delivery_line = existing_delivery_lines.filtered(
+                lambda line: line.shopify_line_id == remote_id
+            )[:1]
+            if not delivery_line:
+                delivery_line = existing_delivery_lines.filtered(
+                    lambda line: not (line.shopify_line_id or "").endswith("-shipping-adjustment")
+                )[:1]
+
+            shipping_price = shipping_line.get("price") or 0.0
+            if instance.order_visible_currency:
+                shipping_price = self.get_price_based_on_customer_visible_currency(
+                    shipping_line.get("price_set"), order_response, shipping_price
+                )
+            shipping_price = float(shipping_price)
+            shipping_name = shipping_line.get("title") or shipping_product.name
+
+            if not delivery_line:
+                self.shopify_create_sale_order_line(
+                    shipping_line, shipping_product, 1, shipping_name,
+                    shipping_price, order_response, is_shipping=True
+                )
+                existing_delivery_lines = self.order_line.filtered("is_delivery")
+                changed = True
+                continue
+
+            delivery_line.write({"name": shipping_name})
+            if float_compare(delivery_line.price_unit, shipping_price, precision_digits=2) == 0:
+                if adjustment_line and not float_is_zero(
+                        adjustment_line.price_unit, precision_digits=2):
+                    adjustment_line.price_unit = 0.0
+                    changed = True
+                continue
+
+            if float_is_zero(delivery_line.qty_invoiced, precision_digits=2):
+                delivery_line.write({
+                    "price_unit": shipping_price,
+                    "product_id": shipping_product.id,
+                    "shopify_line_id": remote_id,
+                })
+                if adjustment_line:
+                    adjustment_line.price_unit = 0.0
+                changed = True
+                continue
+
+            adjustment_amount = shipping_price - delivery_line.price_unit
+            if adjustment_line:
+                if float_compare(
+                        adjustment_line.price_unit, adjustment_amount, precision_digits=2) != 0:
+                    adjustment_line.write({
+                        "name": _("%s - shipping adjustment") % shipping_name,
+                        "price_unit": adjustment_amount,
+                    })
+                    changed = True
+            elif not float_is_zero(adjustment_amount, precision_digits=2):
+                adjustment_data = dict(shipping_line, id=adjustment_id)
+                self.shopify_create_sale_order_line(
+                    adjustment_data, shipping_product, 1,
+                    _("%s - shipping adjustment") % shipping_name,
+                    adjustment_amount, order_response, is_shipping=True
+                )
+                existing_delivery_lines = self.order_line.filtered("is_delivery")
+                changed = True
+
+        if changed:
+            self.message_post(body=_("Shipping method and charges updated from Shopify."))
+        return changed
+
     def import_shopify_orders(self, order_data_lines, instance):
         """
         This method used to create a sale orders in Odoo.
@@ -590,8 +694,10 @@ class SaleOrder(models.Model):
                 elif not sale_order.is_risky_order:
                     if sale_order.shopify_order_status == "partial":
                         sale_order.process_order_fullfield_qty(order_response)
-                        sale_order.with_context(shopify_order_financial_status=order_response.get(
-                            "financial_status")).process_orders_and_invoices_ept()
+                        sale_order.with_context(
+                            shopify_order_financial_status=order_response.get("financial_status"),
+                            shopify_order_transactions=order_response.get("transaction", []),
+                        ).process_orders_and_invoices_ept()
                         if order_data_line and order_data_line.shopify_order_data_queue_id.created_by == \
                                 "scheduled_action":
                             created_by = 'Scheduled Action'
@@ -601,8 +707,10 @@ class SaleOrder(models.Model):
                         message = self.create_shipped_order_refund(shopify_financial_status, order_response, sale_order,
                                                                    created_by)
                     else:
-                        sale_order.with_context(shopify_order_financial_status=order_response.get(
-                            "financial_status")).process_orders_and_invoices_ept()
+                        sale_order.with_context(
+                            shopify_order_financial_status=order_response.get("financial_status"),
+                            shopify_order_transactions=order_response.get("transaction", []),
+                        ).process_orders_and_invoices_ept()
 
 
             except Exception as error:
@@ -1123,6 +1231,64 @@ class SaleOrder(models.Model):
             tax_amount = self.get_price_based_on_customer_visible_currency(
                 order_response.get("total_tax_set"), order_response, tax_amount)
         return float(tax_amount or 0.0)
+
+    def update_shopify_tax_line_ept(self, instance, order_response):
+        """Synchronize exact Shopify tax without changing posted invoice lines."""
+        self.ensure_one()
+        tax_product = instance.tax_product_id or self.env.ref(
+            'shopify_ept.shopify_tax_product', False
+        )
+        if not tax_product:
+            return False
+
+        tax_amount = self._get_shopify_order_tax_amount(instance, order_response)
+        adjustment_id = "shopify-tax-adjustment"
+        tax_lines = self.order_line.filtered(
+            lambda line: line.product_id == tax_product
+        )
+        adjustment_line = tax_lines.filtered(
+            lambda line: line.shopify_line_id == adjustment_id
+        )[:1]
+        tax_line = (tax_lines - adjustment_line)[:1]
+        if not tax_line:
+            return bool(self.create_shopify_tax_line(order_response, instance))
+
+        if float_compare(tax_line.price_unit, tax_amount, precision_digits=2) == 0:
+            if adjustment_line and not float_is_zero(
+                    adjustment_line.price_unit, precision_digits=2):
+                adjustment_line.price_unit = 0.0
+                return True
+            return False
+
+        if float_is_zero(tax_line.qty_invoiced, precision_digits=2):
+            tax_line.price_unit = tax_amount
+            if adjustment_line:
+                adjustment_line.price_unit = 0.0
+            return True
+
+        adjustment_amount = tax_amount - tax_line.price_unit
+        if adjustment_line:
+            if float_compare(
+                    adjustment_line.price_unit, adjustment_amount, precision_digits=2) != 0:
+                adjustment_line.price_unit = adjustment_amount
+                return True
+            return False
+        if float_is_zero(adjustment_amount, precision_digits=2):
+            return False
+
+        line_vals = self.prepare_vals_for_sale_order_line(
+            tax_product, _("%s - adjustment") % tax_product.name,
+            adjustment_amount, 1
+        )
+        line_vals.update({
+            "name": _("%s - adjustment") % tax_product.name,
+            "tax_id": [],
+            "shopify_line_id": adjustment_id,
+        })
+        self.env["sale.order.line"].create(line_vals).with_context(
+            round=False
+        )._compute_amount()
+        return True
 
     def prepare_shopify_order_vals(self, instance, partner, shipping_address,
                                    invoice_address, order_response, payment_gateway,
@@ -2348,7 +2514,8 @@ class SaleOrder(models.Model):
         return True
 
     @api.model
-    def process_shopify_order_via_webhook(self, order_data, instance, update_order=False):
+    def process_shopify_order_via_webhook(
+            self, order_data, instance, update_order=False, created_by="webhook"):
         """
         Creates order data queue and process it.
         This method is for order imported via create and update webhook.
@@ -2356,6 +2523,8 @@ class SaleOrder(models.Model):
         @param order_data: Dictionary of order's data.
         @param instance: Instance of Shopify.
         @param update_order: If update order webhook id called.
+        @param created_by: Queue source. Manual updates use the same update
+                          processor without being mislabeled as webhooks.
         """
         order_queue_obj = self.env["shopify.order.data.queue.ept"]
         order_queue_line_obj = self.env["shopify.order.data.queue.line.ept"]
@@ -2365,16 +2534,19 @@ class SaleOrder(models.Model):
         queue = order_queue_line_obj.create_order_data_queue_line([order_data],
                                                                   instance,
                                                                   queue_type,
-                                                                  created_by='webhook')
+                                                                  created_by=created_by)
         if queue:
             order_queue_cron = self.env.ref("shopify_ept.process_shopify_order_queue")
-            if not order_queue_cron.active:
-                _logger.info("Active the Order data process queue cron job")
-                order_queue_cron.write({'active': True, 'nextcall': datetime.now() + timedelta(seconds=120)})
+            nextcall = datetime.now() + timedelta(seconds=120)
+            cron_vals = {'active': True}
+            if not order_queue_cron.active or not order_queue_cron.nextcall or \
+                    order_queue_cron.nextcall > nextcall:
+                cron_vals['nextcall'] = nextcall
+            order_queue_cron.write(cron_vals)
         if not update_order:
             order_queue_obj.browse(queue).order_data_queue_line_ids.process_import_order_queue_data()
         self._cr.commit()
-        return True
+        return queue
 
     @api.model
     def update_shopify_order(self, queue_lines, created_by, instance):
@@ -2425,6 +2597,10 @@ class SaleOrder(models.Model):
                 return True
             try:
                 need_to_done_queue = True
+                is_manual_update = created_by == 'Manual Update'
+                order_with_transactions = order.with_context(
+                    shopify_order_transactions=order_data.get("transaction", [])
+                )
                 if instance.is_delivery_multi_warehouse and order.state in ("draft", "sent"):
                     pos_order = order_data.get("source_name", "") == "pos"
                     order.apply_shopify_location_and_warehouse(
@@ -2437,17 +2613,24 @@ class SaleOrder(models.Model):
                     need_to_done_queue = False
                     order.shopify_change_customer_in_order_webhook(instance, queue_line, order_data)
 
-                if instance.add_new_product_order_webhook and order_data.get('fulfillment_status') != 'fulfilled':
+                if (instance.add_new_product_order_webhook or is_manual_update) and \
+                        order_data.get('fulfillment_status') != 'fulfilled':
                     need_to_done_queue = False
-                    order.add_new_product_in_order_webhook_ept(instance, queue_line, order_data)
+                    order_with_transactions.add_new_product_in_order_webhook_ept(instance, queue_line, order_data)
 
-                if instance.update_qty_order_webhook and order_data.get('fulfillment_status') not in ['fulfilled',
-                                                                                                      'partial']:
+                if (instance.update_qty_order_webhook or is_manual_update) and \
+                        order_data.get('fulfillment_status') not in ['fulfilled', 'partial']:
                     need_to_done_queue = False
-                    order.update_qty_in_order_webhook_ept(instance, queue_line, order_data)
+                    order_with_transactions.update_qty_in_order_webhook_ept(instance, queue_line, order_data)
+
+                if is_manual_update:
+                    order_with_transactions.update_shopify_shipping_lines_ept(instance, order_data)
+                    order_with_transactions.update_shopify_tax_line_ept(instance, order_data)
 
                 if shopify_status == 'paid':
-                    self.webhook_paid_workflow_process_ept(order, instance, queue_line, order_data, shopify_status)
+                    self.webhook_paid_workflow_process_ept(
+                        order_with_transactions, instance, queue_line, order_data, shopify_status
+                    )
                     need_to_done_queue = True
 
                 if order_data.get('fulfillment_status') in (
@@ -2456,10 +2639,11 @@ class SaleOrder(models.Model):
                     self.process_order_fulfillment_ept(order, shopify_instance, order_data, queue_line)
 
                 if shopify_status in ["refunded", "partially_refunded"] and order_data.get(
-                        "refunds") and instance.refund_order_webhook:
+                        "refunds") and (instance.refund_order_webhook or is_manual_update):
                     need_to_done_queue = False
-                    self.process_order_refund_data_ept(shopify_status, order_data, order, created_by, instance,
-                                                       queue_line)
+                    self.process_order_refund_data_ept(
+                        shopify_status, order_data, order_with_transactions, created_by, instance, queue_line
+                    )
                     if instance.return_picking_order:
                         self.process_picking_return(shopify_status, order_data, order, created_by, instance,
                                                     queue_line)
@@ -3324,7 +3508,12 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         new_move = move_reversal.new_move_ids
         # code for create payment for credit note
         if self.shopify_instance_id.credit_note_register_payment:
-            payment_id = self.credit_note_register_payment(new_move)
+            refund_transaction_id = find_transaction_id(
+                refunds_data.get("transactions"), kinds=("refund",)
+            )
+            payment_id = self.credit_note_register_payment(
+                new_move, refund_transaction_id=refund_transaction_id
+            )
         # code for create payment for credit note
         new_move.write({'is_refund_in_shopify': True, 'shopify_refund_id': refunds_data.get('id')})
         total_qty = 0.0
@@ -3360,14 +3549,18 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
             # new_move.with_context(check_move_validity=False)._recompute_dynamic_lines()
         return new_move, payment_id
 
-    def credit_note_register_payment(self, new_move):
+    def credit_note_register_payment(self, new_move, refund_transaction_id=""):
         """
         This Method is used for register payment for credit note
         """
         account_payment_obj = self.env['account.payment']
         instance_id = new_move.shopify_instance_id
         vals = self.shopify_prepare_credit_note_payment_dict(instance_id, new_move)
-        vals.update({'amount': new_move.amount_total})
+        vals.update({
+            'amount': new_move.amount_total,
+            'shopify_instance_id': instance_id.id,
+            'shopify_order_transaction_id': refund_transaction_id or False,
+        })
         payment_id = account_payment_obj.create(vals)
         return payment_id
 
@@ -3580,6 +3773,7 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         """
         self.ensure_one()
         account_payment_obj = self.env['account.payment']
+        existing_payments = invoices.mapped("matched_payment_ids")
         if self.is_shopify_multi_payment:
             for invoice in invoices:
                 total_payment_sum = sum(
@@ -3589,13 +3783,57 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                     if invoice.amount_residual:
                         for payment in self.shopify_payment_ids:
                             if payment.payment_gateway_id.code != 'gift_card':
+                                existing_transaction_payment = account_payment_obj.search([
+                                    ('shopify_instance_id', '=', self.shopify_instance_id.id),
+                                    ('shopify_order_transaction_id', '=',
+                                     payment.payment_transaction_id),
+                                ], limit=1)
+                                if payment.payment_transaction_id and existing_transaction_payment:
+                                    continue
                                 vals = invoice.prepare_payment_dict(payment.workflow_id)
-                                vals.update({'amount': payment.amount})
+                                vals.update({
+                                    'amount': payment.amount,
+                                    'shopify_instance_id': self.shopify_instance_id.id,
+                                    'shopify_order_transaction_id':
+                                        payment.payment_transaction_id or False,
+                                })
                                 payment_id = account_payment_obj.create(vals)
                                 payment_id.action_post()
                                 self.reconcile_payment_ept(payment_id, invoice)
             return True
-        super(SaleOrder, self).paid_invoice_ept(invoices)
+        result = super(SaleOrder, self).paid_invoice_ept(invoices)
+        new_payments = invoices.mapped("matched_payment_ids") - existing_payments
+        transactions = self._get_shopify_order_transactions_ept()
+        used_transaction_ids = account_payment_obj.search([
+            ('shopify_instance_id', '=', self.shopify_instance_id.id),
+            ('shopify_order_transaction_id', '!=', False),
+        ]).mapped('shopify_order_transaction_id')
+        for payment in new_payments:
+            transaction_id = find_transaction_id(
+                transactions,
+                amount=payment.amount,
+                excluded_ids=used_transaction_ids,
+            )
+            if transaction_id:
+                payment.write({
+                    'shopify_instance_id': self.shopify_instance_id.id,
+                    'shopify_order_transaction_id': transaction_id,
+                })
+                used_transaction_ids.append(transaction_id)
+        return result
+
+    def _get_shopify_order_transactions_ept(self):
+        """Get the Shopify transactions carried by an import or update queue."""
+        transactions = self.env.context.get("shopify_order_transactions")
+        if transactions is not None:
+            return transactions
+        order_data_line = self.env.context.get("order_data_line")
+        if order_data_line and order_data_line.order_data:
+            try:
+                return json.loads(order_data_line.order_data).get("transaction", [])
+            except (TypeError, ValueError):
+                return []
+        return []
 
     def create_schedule_activity_against_loglines(self, log_lines, note):
         """

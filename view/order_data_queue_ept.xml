@@ -115,6 +115,7 @@
                     <group>
                         <group>
                             <field name="shopify_instance_id"/>
+                            <field name="created_by"/>
                             <label for="create_date" string="Imported at"/>
                             <field name="create_date" nolabel="1"/>
                         </group>
@@ -165,6 +166,7 @@
                 <field name="name"
                        context='{"dashboard_model": "shopify.order.data.queue.ept", "queue_line_model": "shopify.order.data.queue.line.ept", "unshipped":"True"}'/>
                 <field name="shopify_instance_id"/>
+                <field name="created_by" optional="show"/>
                 <field name="create_date"/>
                 <field name="state" decoration-success="state == 'completed'" decoration-info="state == 'draft'"
                        decoration-warning="state == 'partially_completed'" decoration-danger="state == 'failed'"
@@ -235,6 +237,8 @@
                 <separator/>
                 <filter string="Created by Sync Process"
                         domain="[('created_by', '=', 'import')]" name="created_by_import"/>
+                <filter string="Created by Manual Update"
+                        domain="[('created_by', '=', 'manual_update')]" name="created_by_manual_update"/>
                 <filter string="Created by Scheduled Action"
                         domain="[('created_by', '=', 'scheduled_action')]" name="created_by_scheduled_action"/>
                 <filter string="Created by Webhook"

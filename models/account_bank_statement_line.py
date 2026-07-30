@@ -12,6 +12,9 @@ class AccountBankStatementLine(models.Model):
     _inherit = "account.bank.statement.line"
 
     shopify_transaction_id = fields.Char("Shopify Transaction")
+    shopify_order_transaction_id = fields.Char(
+        "Shopify Order Transaction", copy=False, index=True
+    )
     shopify_transaction_type = fields.Selection([('charge', 'Charge'), ('refund', 'Refund'), ('dispute', 'Dispute'),
                                                  ('reserve', 'Reserve'), ('adjustment', 'Adjustment'),
                                                  ('credit', 'Credit'),

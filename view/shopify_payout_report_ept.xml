@@ -110,6 +110,7 @@
                                     <field name="raw_transaction_type" readonly="1" optional="hide"/>
                                     <field name="adjustment_reason" readonly="1" optional="hide"/>
                                     <field name="transaction_id" readonly="1"/>
+                                    <field name="source_order_transaction_id" readonly="1" optional="show"/>
                                     <field name="order_id" readonly="1"/>
                                     <field name="net_amount" readonly="1"/>
                                     <field name="fee" readonly="1"/>
@@ -123,6 +124,8 @@
                                             <field name="payout_id" readonly="1"/>
                                             <field name="order_id" readonly="1"/>
                                             <field name="source_order_id" readonly="1"/>
+                                            <field name="source_id" readonly="1"/>
+                                            <field name="source_order_transaction_id" readonly="1"/>
                                         </group>
                                         <group>
                                             <field name="net_amount" readonly="1"/>

@@ -44,7 +44,8 @@ class ShopifyOrderDataQueueEpt(models.Model):
 
     order_queue_line_cancel_record = fields.Integer(string='Cancel Records',
                                                     compute='_compute_order_queue_line_record')
-    created_by = fields.Selection([("import", "By Manually Import Process"), ("webhook", "By Webhook"),
+    created_by = fields.Selection([("import", "By Manually Import Process"),
+                                   ("manual_update", "By Manual Update"), ("webhook", "By Webhook"),
                                    ("scheduled_action", "By Scheduled Action")],
                                   help="Identify the process that generated a queue.", default="import")
     is_process_queue = fields.Boolean('Is Processing Queue', default=False)
@@ -325,44 +326,42 @@ class ShopifyOrderDataQueueEpt(models.Model):
         :param instance: Browsable object of shopify instance.
         :param order_ids: It contain the comma separated ids of shopify orders and its type is String.
         """
-        order_data_queue_line_obj = self.env["shopify.order.data.queue.line.ept"]
-        order_queue_obj = self.env["shopify.order.data.queue.ept"]
         queue_type = 'unshipped'
-        if order_ids:
-            instance.connect_in_shopify()
-            # Below one line is used to find only character values from order ids.
-            re.findall("[a-zA-Z]+", order_ids)
-            if len(order_ids.split(',')) <= 50:
-                # order_ids_list is a list of all order ids which response did not given by shopify.
-                order_ids_list = list(set(re.findall(re.compile(r"(\d+)"), order_ids)))
-                results = shopify.Order().find(ids=','.join(order_ids_list), status='any')
-                if results:
-                    _logger.info('%s Shopify order(s) imported from instance : %s', len(results), instance.name)
-                    order_ids_list = [order_id.strip() for order_id in order_ids_list]
-                    # Below process to identify which id response did not give by Shopify.
-                    [order_ids_list.remove(str(result.id)) for result in results if str(result.id) in order_ids_list]
-            else:
-                raise UserError(_('Please enter the Order ids 50 or less'))
+        if not order_ids:
+            raise UserError(_("Please enter at least one Shopify Order ID."))
+        instance.connect_in_shopify()
+        results = []
+        if len(order_ids.split(',')) <= 50:
+            # order_ids_list is a list of all order ids which response did not given by shopify.
+            order_ids_list = list(set(re.findall(re.compile(r"(\d+)"), order_ids)))
+            if not order_ids_list:
+                raise UserError(_("Please enter at least one valid Shopify Order ID."))
+            results = shopify.Order().find(ids=','.join(order_ids_list), status='any')
             if results:
-                if order_ids_list:
-                    _logger.warning("Orders are not found for ids :%s", str(order_ids_list))
-                if instance.create_shopify_orders_webhook:
-                    order_queues = self.create_webhook_order_queue_ept(results, instance, queue_type,
-                                                                       created_by="import")
-                else:
-                    order_queues = order_data_queue_line_obj.create_order_data_queue_line(results,
-                                                                                          instance,
-                                                                                          queue_type,
-                                                                                          created_by="import")
-                if order_queues:
-                    order_queue_cron = self.env.ref("shopify_ept.process_shopify_order_queue")
-                    if not order_queue_cron.active:
-                        _logger.info("Active the Order data process queue cron job")
-                        order_queue_cron.write(
-                            {'active': True, 'nextcall': datetime.now() + timedelta(seconds=120)})
-                return order_queues
-                # order_queue_obj.browse(order_queues).order_data_queue_line_ids.process_import_order_queue_data()
-        return True
+                _logger.info('%s Shopify order(s) imported from instance : %s', len(results), instance.name)
+                order_ids_list = [order_id.strip() for order_id in order_ids_list]
+                # Below process to identify which id response did not give by Shopify.
+                [order_ids_list.remove(str(result.id)) for result in results if str(result.id) in order_ids_list]
+        else:
+            raise UserError(_('Please enter the Order ids 50 or less'))
+        if results:
+            if order_ids_list:
+                _logger.warning("Orders are not found for ids :%s", str(order_ids_list))
+            # Existing orders must use the update path even when automatic
+            # order webhooks are disabled. New orders retain the import path.
+            order_queues = self.create_webhook_order_queue_ept(
+                results, instance, queue_type, created_by="manual_update"
+            )
+            if order_queues:
+                order_queue_cron = self.env.ref("shopify_ept.process_shopify_order_queue")
+                nextcall = datetime.now() + timedelta(seconds=120)
+                cron_vals = {'active': True}
+                if not order_queue_cron.active or not order_queue_cron.nextcall or \
+                        order_queue_cron.nextcall > nextcall:
+                    cron_vals['nextcall'] = nextcall
+                order_queue_cron.write(cron_vals)
+            return order_queues
+        raise UserError(_("No Shopify orders were found for the supplied IDs."))
 
     def create_webhook_order_queue_ept(self, results, instance, queue_type, created_by="import"):
         """
@@ -382,7 +381,10 @@ class ShopifyOrderDataQueueEpt(models.Model):
                 order_create_result.append(result)
         if webhook_result:
             for webhook_response in webhook_result:
-                sale_order_obj.sudo().process_shopify_order_via_webhook(webhook_response.to_dict(), instance, True)
+                update_queues = sale_order_obj.sudo().process_shopify_order_via_webhook(
+                    webhook_response.to_dict(), instance, True, created_by=created_by
+                )
+                order_queues += update_queues
 
         if order_create_result:
             order_queues += order_data_queue_line_obj.create_order_data_queue_line(order_create_result,

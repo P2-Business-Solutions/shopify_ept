@@ -22,6 +22,7 @@ from . import sale_auto_workflow_configuration
 from . import delivery_carrier
 from . import stock_picking
 from . import account_move
+from . import account_payment
 from . import stock_move
 from . import shopify_res_partner_ept
 from . import product
