@@ -274,29 +274,37 @@ class SaleOrder(models.Model):
                 location_vals.update({"warehouse_id": warehouses.id})
 
         self.write(location_vals)
-        self.apply_shopify_warehouse_workflow(order_response, instance)
+        self.apply_shopify_location_workflow(order_response, instance)
         return location_vals
 
-    def get_shopify_warehouse_workflow(self, order_response=None, instance=None):
-        """Return the safest import workflow configured across assigned warehouses."""
+    def get_shopify_location_workflow(self, order_response=None, instance=None):
+        """Return the safest import workflow configured across assigned locations."""
         self.ensure_one()
-        warehouses = self.warehouse_id
-        warehouses |= self.order_line.filtered(
-            lambda line: line.warehouse_id_ept).mapped("warehouse_id_ept")
+        shopify_locations = self.shopify_location_id
 
         location_ids = get_order_location_ids(order_response)
         if location_ids and instance:
-            shopify_locations = self.env["shopify.location.ept"].search([
+            shopify_locations |= self.env["shopify.location.ept"].search([
                 ("shopify_location_id", "in", list(location_ids)),
                 ("instance_id", "=", instance.id),
             ])
-            warehouses |= shopify_locations.mapped("warehouse_for_order")
 
-        workflows = warehouses.mapped("shopify_auto_workflow_id")
+        if not shopify_locations and instance:
+            warehouses = self.warehouse_id
+            warehouses |= self.order_line.filtered(
+                lambda line: line.warehouse_id_ept).mapped("warehouse_id_ept")
+            if warehouses:
+                shopify_locations = self.env["shopify.location.ept"].search([
+                    ("warehouse_for_order", "in", warehouses.ids),
+                    ("instance_id", "=", instance.id),
+                    ("auto_workflow_id", "!=", False),
+                ])
+
+        workflows = shopify_locations.mapped("auto_workflow_id")
         return select_least_automated_workflow(workflows)
 
-    def apply_shopify_warehouse_workflow(self, order_response=None, instance=None):
-        """Apply a warehouse workflow until Shopify reports order fulfillment."""
+    def apply_shopify_location_workflow(self, order_response=None, instance=None):
+        """Apply a Shopify location workflow until fulfillment is reported."""
         self.ensure_one()
         fulfillment_status = (
             (order_response or {}).get("fulfillment_status")
@@ -305,7 +313,7 @@ class SaleOrder(models.Model):
         if fulfillment_status in ("fulfilled", "partial"):
             return False
 
-        workflow = self.get_shopify_warehouse_workflow(order_response, instance)
+        workflow = self.get_shopify_location_workflow(order_response, instance)
         if workflow:
             self.auto_workflow_process_id = workflow
         return workflow
@@ -2924,7 +2932,7 @@ class SaleOrder(models.Model):
                                                                                   order_data,
                                                                                   gateway)
         if order_data.get("fulfillment_status") not in ("fulfilled", "partial"):
-            workflow = order.get_shopify_warehouse_workflow(
+            workflow = order.get_shopify_location_workflow(
                 order_data, instance) or workflow
         if workflow:
             order.auto_workflow_process_id = workflow

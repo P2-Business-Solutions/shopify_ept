@@ -29,6 +29,16 @@ class ShopifyLocationEpt(models.Model):
     warehouse_for_order = fields.Many2one('stock.warehouse', "Warehouse in Order",
                                           help="The warehouse to set while importing order, if this"
                                                " Shopify location is found.")
+    auto_workflow_id = fields.Many2one(
+        "sale.workflow.process.ept",
+        string="Order Import Workflow",
+        help=(
+            "Overrides the payment gateway and financial-status workflow while an "
+            "unfulfilled order assigned to this Shopify location is imported or "
+            "updated. Once Shopify reports fulfillment, the normal financial-status "
+            "workflow resumes so invoices and payments can be processed."
+        ),
+    )
     active = fields.Boolean(default=True)
 
     @api.constrains('export_stock_warehouse_ids')

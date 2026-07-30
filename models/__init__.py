@@ -17,7 +17,6 @@ from . import res_partner
 from . import payment_gateway
 from . import sale_order
 from . import location_ept
-from . import stock_warehouse
 from . import order_risk
 from . import sale_auto_workflow_configuration
 from . import delivery_carrier

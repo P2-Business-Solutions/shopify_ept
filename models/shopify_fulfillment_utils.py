@@ -60,7 +60,7 @@ def get_single_order_location_id(order_response):
 
 
 def select_least_automated_workflow(workflows):
-    """Choose the safest workflow when an order spans configured warehouses."""
+    """Choose the safest workflow when an order spans configured locations."""
     workflows = list(workflows or [])
     if not workflows:
         return False

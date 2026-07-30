@@ -112,13 +112,13 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
         order_queue_list = []
         is_new_order = bool(self._context.get('is_new_order'))
         queue_type_is_buy_with_prime = False
-        warehouse_workflow_configured = self.env["shopify.location.ept"].search_count([
+        location_workflow_configured = self.env["shopify.location.ept"].search_count([
             ("instance_id", "=", instance.id),
-            ("warehouse_for_order.shopify_auto_workflow_id", "!=", False),
+            ("auto_workflow_id", "!=", False),
         ])
         needs_fulfillment_data = (
             queue_type != 'shipped'
-            and (instance.is_delivery_multi_warehouse or warehouse_workflow_configured)
+            and (instance.is_delivery_multi_warehouse or location_workflow_configured)
         )
         if needs_fulfillment_data:
             instance.connect_in_shopify()

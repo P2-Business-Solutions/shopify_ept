@@ -14,6 +14,8 @@
                 <field name="shopify_location_id"/>
                 <field name="is_primary_location"/>
                 <field name="legacy"/>
+                <field name="warehouse_for_order" optional="show"/>
+                <field name="auto_workflow_id" optional="show"/>
             </list>
         </field>
     </record>
@@ -33,6 +35,8 @@
                             <field name="warehouse_for_order"
                                    options="{'no_create': True, 'no_create_edit':True}"
                                    domain="[('company_id', '=', shopify_instance_company_id)]"/>
+                            <field name="auto_workflow_id"
+                                   options="{'no_create': True, 'no_create_edit': True}"/>
                         </group>
                         <group>
                             <field name="shopify_location_id" readonly="1"/>

@@ -114,7 +114,7 @@ class TestShopifyFulfillmentUtils(unittest.TestCase):
             {"201", "202", "203", "301"},
         )
 
-    def test_draft_workflow_wins_when_order_spans_warehouses(self):
+    def test_draft_workflow_wins_when_order_spans_locations(self):
         automatic_workflow = Workflow(
             10, validate_order=True, create_invoice=True,
             register_payment=True)
