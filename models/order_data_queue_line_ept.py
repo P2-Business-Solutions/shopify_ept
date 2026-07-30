@@ -112,11 +112,19 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
         order_queue_list = []
         is_new_order = bool(self._context.get('is_new_order'))
         queue_type_is_buy_with_prime = False
-        if queue_type != 'shipped' and instance.is_delivery_multi_warehouse:
+        warehouse_workflow_configured = self.env["shopify.location.ept"].search_count([
+            ("instance_id", "=", instance.id),
+            ("warehouse_for_order.shopify_auto_workflow_id", "!=", False),
+        ])
+        needs_fulfillment_data = (
+            queue_type != 'shipped'
+            and (instance.is_delivery_multi_warehouse or warehouse_workflow_configured)
+        )
+        if needs_fulfillment_data:
             instance.connect_in_shopify()
         for order in orders_data:
             fulfillment_data = []
-            if queue_type != 'shipped' and instance.is_delivery_multi_warehouse:
+            if needs_fulfillment_data:
                 order_id = order.get('id') if isinstance(order, dict) else order.id
                 fulfillment_data = self.env["sale.order"].get_shopify_fulfillment_orders(order_id)
             if created_by == "webhook" and not is_new_order:

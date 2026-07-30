@@ -20,8 +20,10 @@ import re
 import urllib.parse
 from odoo.tools.float_utils import float_is_zero, float_compare
 from .shopify_fulfillment_utils import (
+    get_order_location_ids,
     get_single_order_location_id,
     normalize_fulfillment_orders,
+    select_least_automated_workflow,
 )
 from .shopify_order_utils import (
     filter_importable_order_lines,
@@ -272,7 +274,41 @@ class SaleOrder(models.Model):
                 location_vals.update({"warehouse_id": warehouses.id})
 
         self.write(location_vals)
+        self.apply_shopify_warehouse_workflow(order_response, instance)
         return location_vals
+
+    def get_shopify_warehouse_workflow(self, order_response=None, instance=None):
+        """Return the safest import workflow configured across assigned warehouses."""
+        self.ensure_one()
+        warehouses = self.warehouse_id
+        warehouses |= self.order_line.filtered(
+            lambda line: line.warehouse_id_ept).mapped("warehouse_id_ept")
+
+        location_ids = get_order_location_ids(order_response)
+        if location_ids and instance:
+            shopify_locations = self.env["shopify.location.ept"].search([
+                ("shopify_location_id", "in", list(location_ids)),
+                ("instance_id", "=", instance.id),
+            ])
+            warehouses |= shopify_locations.mapped("warehouse_for_order")
+
+        workflows = warehouses.mapped("shopify_auto_workflow_id")
+        return select_least_automated_workflow(workflows)
+
+    def apply_shopify_warehouse_workflow(self, order_response=None, instance=None):
+        """Apply a warehouse workflow until Shopify reports order fulfillment."""
+        self.ensure_one()
+        fulfillment_status = (
+            (order_response or {}).get("fulfillment_status")
+            or self.shopify_order_status
+        )
+        if fulfillment_status in ("fulfilled", "partial"):
+            return False
+
+        workflow = self.get_shopify_warehouse_workflow(order_response, instance)
+        if workflow:
+            self.auto_workflow_process_id = workflow
+        return workflow
 
     def create_shopify_order_lines(self, lines, order_response, instance):
         """
@@ -2627,16 +2663,16 @@ class SaleOrder(models.Model):
                     order_with_transactions.update_shopify_shipping_lines_ept(instance, order_data)
                     order_with_transactions.update_shopify_tax_line_ept(instance, order_data)
 
-                if shopify_status == 'paid':
-                    self.webhook_paid_workflow_process_ept(
-                        order_with_transactions, instance, queue_line, order_data, shopify_status
-                    )
-                    need_to_done_queue = True
-
                 if order_data.get('fulfillment_status') in (
                         'fulfilled', 'partial') and instance.ship_order_webhook and order_data.get('fulfillments'):
                     need_to_done_queue = False
                     self.process_order_fulfillment_ept(order, shopify_instance, order_data, queue_line)
+
+                if shopify_status == 'paid' and queue_line.state != "failed":
+                    self.webhook_paid_workflow_process_ept(
+                        order_with_transactions, instance, queue_line, order_data, shopify_status
+                    )
+                    need_to_done_queue = True
 
                 if shopify_status in ["refunded", "partially_refunded"] and order_data.get(
                         "refunds") and (instance.refund_order_webhook or is_manual_update):
@@ -2887,6 +2923,9 @@ class SaleOrder(models.Model):
             "shopify.payment.gateway.ept"].shopify_search_create_gateway_workflow(instance, queue_line,
                                                                                   order_data,
                                                                                   gateway)
+        if order_data.get("fulfillment_status") not in ("fulfilled", "partial"):
+            workflow = order.get_shopify_warehouse_workflow(
+                order_data, instance) or workflow
         if workflow:
             order.auto_workflow_process_id = workflow
             if order.state not in ["sale", "done", "cancel"] and workflow.validate_order:
