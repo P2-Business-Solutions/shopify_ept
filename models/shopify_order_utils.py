@@ -44,3 +44,36 @@ def find_matching_shopify_tag(tags, configured_tags):
         ),
         False,
     )
+
+
+def get_shopify_discount_codes(order_response, stored_codes=None):
+    """Return Shopify discount codes in stable order without duplicates.
+
+    Shopify normally exposes codes in ``discount_codes``. The discount
+    applications and value stored on the sale order are fallbacks for webhook
+    payloads that omit that collection.
+    """
+    codes = []
+    response = order_response or {}
+
+    for discount in response.get("discount_codes") or []:
+        code = discount.get("code") if isinstance(discount, dict) else discount
+        if code:
+            codes.append(str(code).strip())
+
+    for application in response.get("discount_applications") or []:
+        code = application.get("code") if isinstance(application, dict) else False
+        if code:
+            codes.append(str(code).strip())
+
+    if stored_codes:
+        codes.extend(code.strip() for code in str(stored_codes).split(","))
+
+    unique_codes = []
+    seen = set()
+    for code in filter(None, codes):
+        normalized_code = code.casefold()
+        if normalized_code not in seen:
+            unique_codes.append(code)
+            seen.add(normalized_code)
+    return unique_codes

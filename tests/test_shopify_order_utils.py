@@ -70,6 +70,27 @@ class TestShopifyOrderUtils(unittest.TestCase):
             UTILS.find_matching_shopify_tag(None, ["Wholesale"])
         )
 
+    def test_discount_codes_preserve_shopify_order_and_remove_duplicates(self):
+        order_response = {
+            "discount_codes": [{"code": "EMPLOYEE20"}],
+            "discount_applications": [
+                {"code": "employee20"},
+                {"code": "VIP50"},
+            ],
+        }
+
+        self.assertEqual(
+            UTILS.get_shopify_discount_codes(
+                order_response, "VIP50,LEGACY10"),
+            ["EMPLOYEE20", "VIP50", "LEGACY10"],
+        )
+
+    def test_discount_codes_fall_back_to_stored_order_value(self):
+        self.assertEqual(
+            UTILS.get_shopify_discount_codes({}, "EMPLOYEE20, VIP50"),
+            ["EMPLOYEE20", "VIP50"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

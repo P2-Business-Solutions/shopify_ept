@@ -16,8 +16,8 @@ class ShopifyDiscountCodeConfig(models.Model):
                                      "If multiple prefixes match, the longest (most specific) match wins.")
     analytic_account_id = fields.Many2one("account.analytic.account",
                                           string="Analytic Account", required=True,
-                                          help="Analytic account for discount lines and free-product COGS entries "
-                                               "matching this discount code prefix.")
+                                          help="Analytic account for all sale order lines and free-product COGS "
+                                               "entries matching this discount code prefix.")
 
     _sql_constraints = [
         ('unique_code_per_instance', 'unique(instance_id, discount_code)',

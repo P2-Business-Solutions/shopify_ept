@@ -28,6 +28,7 @@ from .shopify_fulfillment_utils import (
 from .shopify_order_utils import (
     filter_importable_order_lines,
     find_matching_shopify_tag,
+    get_shopify_discount_codes,
 )
 from .shopify_transaction_utils import find_transaction_id
 
@@ -395,10 +396,9 @@ class SaleOrder(models.Model):
             "product_uom_qty": order_qty,
             "is_gift_card_payment_line": True,
         }
-        if instance.shopify_analytic_account_id:
-            analytic_distribution_dict = {}
-            analytic_distribution_dict.update({instance.shopify_analytic_account_id.id: 100})
-            line_vals.update({'analytic_distribution': analytic_distribution_dict})
+        analytic_distribution = self._get_shopify_analytic_distribution(instance)
+        if analytic_distribution:
+            line_vals.update({'analytic_distribution': analytic_distribution})
         return line_vals
 
     def get_price_based_on_customer_visible_currency(self, price_set, order_response, price):
@@ -618,6 +618,7 @@ class SaleOrder(models.Model):
                 changed = True
 
         if changed:
+            self._apply_discount_code_analytic_account(instance, order_response)
             self.message_post(body=_("Shipping method and charges updated from Shopify."))
         return changed
 
@@ -1081,6 +1082,11 @@ class SaleOrder(models.Model):
         # Gift-card redemption: add DR → Sales transfer lines
         order._create_gift_card_deferred_revenue_lines(instance)
 
+        # Discount-code mappings are order-level analytic assignments. Apply
+        # the mapping after every line type has been created so product,
+        # shipping, duties, tax, gift-card, and discount lines all receive it.
+        order._apply_discount_code_analytic_account(instance, order_response)
+
         return order
 
     def check_sale_order_validation(self, instance, order_response, order_vals, order_data_queue_line):
@@ -1418,6 +1424,44 @@ class SaleOrder(models.Model):
                 best_len = len(prefix)
         return best_match
 
+    def _get_order_discount_code_config(self, instance, order_response=None):
+        """Return the first configured discount-code mapping for the order."""
+        self.ensure_one()
+        discount_codes = get_shopify_discount_codes(
+            order_response, self.shopify_discount_codes)
+        for discount_code in discount_codes:
+            config = self._get_discount_code_config(instance, discount_code)
+            if config:
+                return config
+        return False
+
+    def _get_shopify_analytic_distribution(self, instance, order_response=None):
+        """Resolve the order-level mapped analytic, then the instance default."""
+        self.ensure_one()
+        discount_config = self._get_order_discount_code_config(
+            instance, order_response)
+        analytic_account = (
+            discount_config.analytic_account_id
+            if discount_config else instance.shopify_analytic_account_id
+        )
+        if not analytic_account:
+            return False
+        return {str(analytic_account.id): 100}
+
+    def _apply_discount_code_analytic_account(self, instance, order_response=None):
+        """Apply a mapped discount code's analytic account to every order line."""
+        self.ensure_one()
+        discount_config = self._get_order_discount_code_config(
+            instance, order_response)
+        if not discount_config or not discount_config.analytic_account_id:
+            return False
+        self.order_line.write({
+            'analytic_distribution': {
+                str(discount_config.analytic_account_id.id): 100,
+            },
+        })
+        return discount_config
+
     def _is_gift_card_redemption_order(self, instance):
         """Check whether this order should treat discounts as gift card payments.
         Returns True when any of the order's tags match the instance's
@@ -1484,9 +1528,9 @@ class SaleOrder(models.Model):
             "product_uom": uom_id,
             "product_uom_qty": 1,
         }
-        if instance.shopify_analytic_account_id:
-            base_vals['analytic_distribution'] = {
-                str(instance.shopify_analytic_account_id.id): 100}
+        analytic_distribution = self._get_shopify_analytic_distribution(instance)
+        if analytic_distribution:
+            base_vals['analytic_distribution'] = analytic_distribution
 
         # 1. Negative line → Deferred Revenue (debit)
         payment_vals = dict(base_vals)
@@ -1526,9 +1570,13 @@ class SaleOrder(models.Model):
         discount_line_vals = {}
         if line_discount_code:
             discount_line_vals['shopify_discount_code'] = line_discount_code
-        if discount_config and discount_config.analytic_account_id:
+        order_discount_config = (
+            self._get_order_discount_code_config(instance, order_response)
+            or discount_config
+        )
+        if order_discount_config and order_discount_config.analytic_account_id:
             discount_line_vals['analytic_distribution'] = {
-                str(discount_config.analytic_account_id.id): 100}
+                str(order_discount_config.analytic_account_id.id): 100}
         if discount_line_vals:
             discount_line.write(discount_line_vals)
         return discount_line
@@ -1852,10 +1900,9 @@ class SaleOrder(models.Model):
             "product_uom_qty": quantity
             # "order_qty": quantity,
         }
-        if instance.shopify_analytic_account_id:
-            analytic_distribution_dict = {}
-            analytic_distribution_dict.update({instance.shopify_analytic_account_id.id: 100})
-            line_vals.update({'analytic_distribution': analytic_distribution_dict})
+        analytic_distribution = self._get_shopify_analytic_distribution(instance)
+        if analytic_distribution:
+            line_vals.update({'analytic_distribution': analytic_distribution})
         return line_vals
 
     def shopify_set_tax_in_sale_order_line(self, instance, line, order_response, is_shipping, is_discount,
@@ -3039,6 +3086,8 @@ class SaleOrder(models.Model):
                     _logger.info("Created discount line for Odoo order(%s) and Shopify order is (%s)", self.name,
                                  order_number)
 
+        self._apply_discount_code_analytic_account(instance, order_response)
+
     def shopify_change_customer_in_order_webhook(self, instance, queue_line, order_data):
         """
         This method is use to update the customer in the order based on the condition it will update.
@@ -3236,6 +3285,8 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                     previous_line=original_product_line_record)
                 is_updated = True
             # If the discount decreased/removed, the update is skipped.
+        if is_updated:
+            self._apply_discount_code_analytic_account(instance, order_response)
         return is_updated
 
     def prepare_response_data_of_order_qty(self, order_data):
