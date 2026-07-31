@@ -215,6 +215,11 @@ class ShopifyInstanceEpt(models.Model):
                                  default functional behaviour i.e. based on Odoo's Tax and Fiscal Position configurations. \n
                     2) Create New Tax If Not Found - System will search the tax data received 
                     from Shopify in Odoo, will create a new one if it fails in finding it.""")
+    shopify_fiscal_position_id = fields.Many2one(
+        "account.fiscal.position", string="Default Fiscal Position",
+        domain="[('company_id', '=', shopify_company_id)]",
+        help="Optional fiscal position applied to newly imported Shopify orders. "
+             "Leave blank to keep Odoo's normal partner-based fiscal position behavior.")
     invoice_tax_account_id = fields.Many2one('account.account', string='Invoice Tax Account')
     credit_tax_account_id = fields.Many2one('account.account', string='Credit Tax Account')
     notify_customer = fields.Boolean("Notify Customer about Update Order Status?",

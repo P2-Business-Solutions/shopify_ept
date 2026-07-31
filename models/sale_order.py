@@ -28,7 +28,11 @@ from .shopify_fulfillment_utils import (
 from .shopify_order_utils import (
     filter_importable_order_lines,
     find_matching_shopify_tag,
+    get_shopify_discount_allocations_by_line_id,
+    get_shopify_discount_applications,
     get_shopify_discount_codes,
+    get_shopify_line_discount_allocations,
+    get_shopify_order_fiscal_position_vals,
 )
 from .shopify_transaction_utils import find_transaction_id
 
@@ -121,6 +125,13 @@ class SaleOrder(models.Model):
     is_buy_with_prime_order = fields.Boolean("Buy with Prime Order", default=False, copy=False)
     shopify_discount_codes = fields.Char("Shopify Discount Codes", copy=False,
                                          help="Comma-separated discount codes from the Shopify order")
+    shopify_discount_applications = fields.Json(
+        "Shopify Discount Applications", copy=False, default=list,
+        help="Ordered raw Shopify discount applications. Line allocations reference "
+             "these records by discount_application_index.")
+    shopify_discount_data_updated_at = fields.Datetime(
+        "Shopify Discount Data Updated At", copy=False, readonly=True,
+        help="Last time source discount applications or line allocations were retained from Shopify.")
 
     _sql_constraints = [('unique_shopify_order',
                          'unique(shopify_instance_id,shopify_order_id,shopify_order_number)',
@@ -670,6 +681,7 @@ class SaleOrder(models.Model):
             sale_order = self.search_existing_shopify_order(order_response, instance, order_number)
 
             if sale_order:
+                sale_order._sync_shopify_discount_data(order_response)
                 if instance.is_delivery_multi_warehouse and sale_order.state in ("draft", "sent"):
                     sale_order.apply_shopify_location_and_warehouse(
                         order_response, instance, pos_order)
@@ -1087,6 +1099,10 @@ class SaleOrder(models.Model):
         # shipping, duties, tax, gift-card, and discount lines all receive it.
         order._apply_discount_code_analytic_account(instance, order_response)
 
+        # Keep the authoritative source data even though Odoo also displays
+        # allocations as separate negative discount lines.
+        order._sync_shopify_discount_data(order_response)
+
         return order
 
     def check_sale_order_validation(self, instance, order_response, order_vals, order_data_queue_line):
@@ -1401,6 +1417,37 @@ class SaleOrder(models.Model):
                     return app["code"]
         return False
 
+    def _sync_shopify_discount_data(self, order_response):
+        """Retain Shopify's authoritative discount source data.
+
+        Odoo represents imported discounts as separate negative sale lines, but
+        those lines cannot explain how an order-level or stacked discount was
+        allocated. Keep the ordered applications on the order and the raw
+        allocations on their source product/shipping lines. Missing collections
+        do not erase previously retained data because some webhook payloads can
+        be partial; an explicitly supplied empty collection does clear it.
+        """
+        self.ensure_one()
+        response = order_response or {}
+        retained_source_data = False
+
+        if "discount_applications" in response:
+            self.shopify_discount_applications = \
+                get_shopify_discount_applications(response)
+            retained_source_data = True
+
+        allocations_by_line_id = \
+            get_shopify_discount_allocations_by_line_id(response)
+        for order_line in self.order_line.filtered(
+                lambda record: record.shopify_line_id in allocations_by_line_id):
+            order_line.shopify_discount_allocations = \
+                allocations_by_line_id[order_line.shopify_line_id]
+            retained_source_data = True
+
+        if retained_source_data:
+            self.shopify_discount_data_updated_at = fields.Datetime.now()
+        return retained_source_data
+
     def _get_discount_code_config(self, instance, discount_code):
         """Look up the analytic config for a discount code using prefix matching.
         Checks all configured prefixes for this instance and returns the longest
@@ -1631,6 +1678,16 @@ class SaleOrder(models.Model):
             "campaign_id": utm_campaign and utm_campaign.id or False,
             "is_buy_with_prime_order": order_response.get("buy_with_prime") or False,
         }
+        order_vals.update(get_shopify_order_fiscal_position_vals(
+            instance.shopify_fiscal_position_id.id
+            if instance.shopify_fiscal_position_id else False
+        ))
+        if "discount_applications" in order_response:
+            order_vals.update({
+                "shopify_discount_applications":
+                    get_shopify_discount_applications(order_response),
+                "shopify_discount_data_updated_at": fields.Datetime.now(),
+            })
         # Capture discount codes from the Shopify order response
         shopify_discount_codes = order_response.get("discount_codes", [])
         if shopify_discount_codes:
@@ -1880,6 +1937,9 @@ class SaleOrder(models.Model):
             "is_delivery": is_shipping,
             # "analytic_tag_ids": [(6, 0, shopify_analytic_tag_ids)],
         })
+        if "discount_allocations" in line:
+            order_line_vals["shopify_discount_allocations"] = \
+                get_shopify_line_discount_allocations(line)
         order_line = sale_order_line_obj.create(order_line_vals)
         order_line.with_context(round=False)._compute_amount()
         return order_line
@@ -2692,6 +2752,7 @@ class SaleOrder(models.Model):
                 order_with_transactions = order.with_context(
                     shopify_order_transactions=order_data.get("transaction", [])
                 )
+                order._sync_shopify_discount_data(order_data)
                 if instance.is_delivery_multi_warehouse and order.state in ("draft", "sent"):
                     pos_order = order_data.get("source_name", "") == "pos"
                     order.apply_shopify_location_and_warehouse(
@@ -4145,6 +4206,10 @@ class SaleOrderLine(models.Model):
     shopify_discount_code = fields.Char("Discount Code", copy=False,
                                         help="The Shopify discount code that applies to this discount line "
                                              "or made this product free")
+    shopify_discount_allocations = fields.Json(
+        "Shopify Discount Allocations", copy=False, default=list,
+        help="Raw Shopify allocations for this source line, including stacked "
+             "amounts, currency money sets, and discount_application_index links.")
 
     def unlink(self):
         """

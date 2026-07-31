@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # See LICENSE file for full copyright and licensing details.
 
+from copy import deepcopy
+
 
 def is_removed_order_line(line):
     """Return whether Shopify reports an order line as fully removed."""
@@ -77,3 +79,55 @@ def get_shopify_discount_codes(order_response, stored_codes=None):
             unique_codes.append(code)
             seen.add(normalized_code)
     return unique_codes
+
+
+def get_shopify_discount_applications(order_response):
+    """Return an independent copy of Shopify's ordered applications.
+
+    REST discount allocations reference this collection by
+    ``discount_application_index``. The order and every application attribute
+    must therefore be retained exactly as Shopify supplied them.
+    """
+    response = order_response or {}
+    return deepcopy(response.get("discount_applications") or [])
+
+
+def get_shopify_line_discount_allocations(line):
+    """Return an independent copy of a Shopify line's raw allocations.
+
+    Keep the complete payload instead of selecting known keys so new Shopify
+    attributes, stacked discounts, and both shop/presentment currency amounts
+    remain available to downstream tax integrations.
+    """
+    return deepcopy((line or {}).get("discount_allocations") or [])
+
+
+def get_shopify_discount_allocations_by_line_id(order_response):
+    """Map Shopify product/shipping line IDs to supplied allocation arrays.
+
+    Lines that omit ``discount_allocations`` are intentionally excluded so a
+    partial webhook cannot erase a complete snapshot retained earlier. An
+    explicitly supplied empty array is included and therefore clears stale
+    allocations after an order edit.
+    """
+    response = order_response or {}
+    source_lines = (
+        (response.get("line_items") or [])
+        + (response.get("shipping_lines") or [])
+    )
+    return {
+        str(line.get("id")): get_shopify_line_discount_allocations(line)
+        for line in source_lines
+        if line.get("id") is not None and "discount_allocations" in line
+    }
+
+
+def get_shopify_order_fiscal_position_vals(fiscal_position_id):
+    """Return an explicit order override only when one is configured.
+
+    Omitting the key when no Shopify default exists preserves Odoo's normal
+    partner-based fiscal-position computation.
+    """
+    if not fiscal_position_id:
+        return {}
+    return {"fiscal_position_id": fiscal_position_id}

@@ -311,6 +311,11 @@ class ResConfigSettings(models.TransientModel):
                     behaviour i.e. based on Odoo's Tax and Fiscal Position configurations. \n
                     2) Create New Tax If Not Found - System will search the tax data received 
                     from Shopify in Odoo, will create a new one if it fails in finding it.""")
+    shopify_fiscal_position_id = fields.Many2one(
+        "account.fiscal.position", string="Default Fiscal Position",
+        domain="[('company_id', '=', shopify_company_id)]",
+        help="Optional fiscal position applied to newly imported Shopify orders. "
+             "Leave blank to keep Odoo's normal partner-based fiscal position behavior.")
     shopify_invoice_tax_account_id = fields.Many2one("account.account", string="Invoice Tax Account For Shopify Tax",
                                                      help="Set the invoice tax account base on this account we will "
                                                           "set this account in the newly created tax when import orders"
@@ -489,6 +494,7 @@ class ResConfigSettings(models.TransientModel):
             self.shopify_order_prefix = instance.shopify_order_prefix
             self.shopify_is_use_default_sequence = instance.is_use_default_sequence
             self.shopify_apply_tax_in_order = instance.apply_tax_in_order
+            self.shopify_fiscal_position_id = instance.shopify_fiscal_position_id.id or False
             self.shopify_invoice_tax_account_id = instance.invoice_tax_account_id and \
                                                   instance.invoice_tax_account_id.id or False
             self.shopify_credit_tax_account_id = instance.credit_tax_account_id and \
@@ -566,6 +572,7 @@ class ResConfigSettings(models.TransientModel):
             values["shopify_order_prefix"] = self.shopify_order_prefix
             values["is_use_default_sequence"] = self.shopify_is_use_default_sequence
             values["apply_tax_in_order"] = self.shopify_apply_tax_in_order
+            values["shopify_fiscal_position_id"] = self.shopify_fiscal_position_id.id or False
             values["invoice_tax_account_id"] = self.shopify_invoice_tax_account_id and \
                                                self.shopify_invoice_tax_account_id.id or False
             values["credit_tax_account_id"] = self.shopify_credit_tax_account_id and \
@@ -796,6 +803,7 @@ class ResConfigSettings(models.TransientModel):
                 'shopify_order_prefix': self.shopify_order_prefix or False,
                 'shopify_default_pos_customer_id': self.shopify_default_pos_customer_id.id,
                 'apply_tax_in_order': self.shopify_apply_tax_in_order,
+                'shopify_fiscal_position_id': self.shopify_fiscal_position_id.id or False,
                 'invoice_tax_account_id': self.shopify_invoice_tax_account_id and
                                           self.shopify_invoice_tax_account_id.id or False,
                 'credit_tax_account_id': self.shopify_credit_tax_account_id and

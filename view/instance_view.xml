@@ -314,6 +314,8 @@
                         <page string="Tax Configuration" name="tax_configuration">
                             <group>
                                 <group>
+                                    <field name="shopify_fiscal_position_id"
+                                           options="{'no_create':True,'no_create_edit':True}"/>
                                     <field name="shopify_tax_grid_id" string="Tax Grid"
                                            options="{'no_quick_create':True,'no_create_edit':True,'no_open': True,}"/>
                                 </group>

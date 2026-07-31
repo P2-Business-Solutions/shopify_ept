@@ -91,6 +91,107 @@ class TestShopifyOrderUtils(unittest.TestCase):
             ["EMPLOYEE20", "VIP50"],
         )
 
+    def test_discount_applications_preserve_order_and_all_attributes(self):
+        applications = [
+            {
+                "type": "automatic",
+                "allocation_method": "across",
+                "target_type": "line_item",
+                "title": "BOGO",
+            },
+            {
+                "type": "discount_code",
+                "code": "VIP50",
+                "value": "50.0",
+                "value_type": "percentage",
+            },
+        ]
+
+        retained = UTILS.get_shopify_discount_applications(
+            {"discount_applications": applications}
+        )
+
+        self.assertEqual(retained, applications)
+        self.assertIsNot(retained, applications)
+        self.assertIsNot(retained[0], applications[0])
+
+    def test_line_discount_allocations_preserve_stacking_and_money_sets(self):
+        allocations = [
+            {
+                "amount": "10.00",
+                "amount_set": {
+                    "shop_money": {"amount": "10.00", "currency_code": "USD"},
+                    "presentment_money": {
+                        "amount": "13.50",
+                        "currency_code": "CAD",
+                    },
+                },
+                "discount_application_index": 0,
+            },
+            {
+                "amount": "5.00",
+                "amount_set": {
+                    "shop_money": {"amount": "5.00", "currency_code": "USD"},
+                    "presentment_money": {
+                        "amount": "6.75",
+                        "currency_code": "CAD",
+                    },
+                },
+                "discount_application_index": 1,
+                "future_shopify_attribute": "preserve-me",
+            },
+        ]
+
+        retained = UTILS.get_shopify_line_discount_allocations(
+            {"discount_allocations": allocations}
+        )
+
+        self.assertEqual(retained, allocations)
+        self.assertIsNot(retained, allocations)
+        self.assertIsNot(retained[0]["amount_set"], allocations[0]["amount_set"])
+
+    def test_missing_discount_source_data_is_normalized_to_empty_lists(self):
+        self.assertEqual(UTILS.get_shopify_discount_applications({}), [])
+        self.assertEqual(UTILS.get_shopify_line_discount_allocations({}), [])
+
+    def test_allocations_are_mapped_for_product_and_shipping_lines(self):
+        order_response = {
+            "line_items": [
+                {
+                    "id": 101,
+                    "discount_allocations": [
+                        {"amount": "20.00", "discount_application_index": 0}
+                    ],
+                },
+                {"id": 102},
+            ],
+            "shipping_lines": [
+                {"id": 201, "discount_allocations": []},
+            ],
+        }
+
+        self.assertEqual(
+            UTILS.get_shopify_discount_allocations_by_line_id(order_response),
+            {
+                "101": [
+                    {"amount": "20.00", "discount_application_index": 0}
+                ],
+                "201": [],
+            },
+        )
+
+    def test_configured_shopify_fiscal_position_overrides_order_default(self):
+        self.assertEqual(
+            UTILS.get_shopify_order_fiscal_position_vals(42),
+            {"fiscal_position_id": 42},
+        )
+
+    def test_missing_shopify_fiscal_position_preserves_odoo_behavior(self):
+        self.assertEqual(
+            UTILS.get_shopify_order_fiscal_position_vals(False),
+            {},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
