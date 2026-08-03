@@ -70,6 +70,21 @@ class TestShopifyOrderUtils(unittest.TestCase):
             UTILS.find_matching_shopify_tag(None, ["Wholesale"])
         )
 
+    def test_warehouse_hold_uses_delivery_hold_field_names(self):
+        self.assertEqual(
+            UTILS.get_shopify_warehouse_hold_vals(42, "Awaiting release"),
+            {
+                "hold_reason_id": 42,
+                "hold_note": "Awaiting release",
+            },
+        )
+
+    def test_unconfigured_warehouse_does_not_change_order_hold(self):
+        self.assertEqual(
+            UTILS.get_shopify_warehouse_hold_vals(False, "Ignored"),
+            {},
+        )
+
     def test_discount_codes_preserve_shopify_order_and_remove_duplicates(self):
         order_response = {
             "discount_codes": [{"code": "EMPLOYEE20"}],

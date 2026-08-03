@@ -33,6 +33,7 @@ from .shopify_order_utils import (
     get_shopify_discount_codes,
     get_shopify_line_discount_allocations,
     get_shopify_order_fiscal_position_vals,
+    get_shopify_warehouse_hold_vals,
 )
 from .shopify_transaction_utils import find_transaction_id
 
@@ -286,8 +287,37 @@ class SaleOrder(models.Model):
                 location_vals.update({"warehouse_id": warehouses.id})
 
         self.write(location_vals)
+        self.apply_shopify_warehouse_delivery_hold()
         self.apply_shopify_location_workflow(order_response, instance)
         return location_vals
+
+    def apply_shopify_warehouse_delivery_hold(self):
+        """Apply the configured warehouse hold before order confirmation.
+
+        ``so_delivery_hold`` propagates the hold to outbound pickings created by
+        ``action_confirm`` and prevents those pickings from being assigned or
+        validated. Invoice creation and payment registration remain unaffected.
+        """
+        self.ensure_one()
+        warehouse = self.warehouse_id
+        hold_reason = warehouse.shopify_order_hold_reason_id
+        hold_vals = get_shopify_warehouse_hold_vals(
+            hold_reason.id,
+            warehouse.shopify_order_hold_note,
+        )
+        if not hold_vals:
+            return False
+
+        if (
+            self.is_on_hold
+            and self.hold_reason_id == hold_reason
+            and self.hold_note == hold_vals["hold_note"]
+        ):
+            return hold_reason
+
+        self.write(hold_vals)
+        self.action_place_on_hold()
+        return hold_reason
 
     def get_shopify_location_workflow(self, order_response=None, instance=None):
         """Return the safest import workflow configured across assigned locations."""

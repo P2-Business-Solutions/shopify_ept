@@ -131,3 +131,18 @@ def get_shopify_order_fiscal_position_vals(fiscal_position_id):
     if not fiscal_position_id:
         return {}
     return {"fiscal_position_id": fiscal_position_id}
+
+
+def get_shopify_warehouse_hold_vals(hold_reason_id, hold_note=None):
+    """Prepare the sales-order fields used by ``so_delivery_hold``.
+
+    Keeping these technical field names in one helper makes the optional
+    warehouse configuration explicit and prevents unconfigured warehouses from
+    changing an order's existing hold state.
+    """
+    if not hold_reason_id:
+        return {}
+    return {
+        "hold_reason_id": hold_reason_id,
+        "hold_note": hold_note or False,
+    }

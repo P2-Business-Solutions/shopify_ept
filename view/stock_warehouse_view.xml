@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="stock_warehouse_view_form_inherit_shopify_order_hold" model="ir.ui.view">
+        <field name="name">stock.warehouse.form.shopify.order.hold</field>
+        <field name="model">stock.warehouse</field>
+        <field name="inherit_id" ref="stock.view_warehouse"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='code']" position="after">
+                <field name="shopify_order_hold_reason_id"
+                       options="{'no_create': True, 'no_create_edit': True}"/>
+                <field name="shopify_order_hold_note"
+                       invisible="not shopify_order_hold_reason_id"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>
