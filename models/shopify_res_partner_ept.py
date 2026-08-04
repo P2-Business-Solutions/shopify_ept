@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # See LICENSE file for full copyright and licensing details.
-from odoo import models, fields, api
+from odoo import models, fields, api, tools
 
 
 class ShopifyResPartnerEpt(models.Model):
@@ -10,6 +10,33 @@ class ShopifyResPartnerEpt(models.Model):
     partner_id = fields.Many2one("res.partner", ondelete="cascade")
     shopify_instance_id = fields.Many2one("shopify.instance.ept", "Instances")
     shopify_customer_id = fields.Char()
+
+    @api.model
+    @tools.ormcache()
+    def _get_ecom_customer_type_id(self):
+        """Resolve the Studio customer type used for Shopify customers."""
+        partner_obj = self.env["res.partner"]
+        customer_type_field = partner_obj._fields.get("x_studio_customer_type")
+        if not customer_type_field or customer_type_field.type != "many2one":
+            return False
+
+        customer_type_obj = self.env[customer_type_field.comodel_name]
+        customer_type_name_field = customer_type_obj._rec_name
+        domain = [(customer_type_name_field, "=ilike", "Ecom")]
+        if "x_active" in customer_type_obj._fields:
+            domain.append(("x_active", "=", True))
+
+        return customer_type_obj.sudo().search(domain, limit=1).id
+
+    @api.model
+    def _get_ecom_customer_type_vals(self):
+        customer_type_id = self._get_ecom_customer_type_id()
+        return {"x_studio_customer_type": customer_type_id} if customer_type_id else {}
+
+    def _set_ecom_customer_type(self, partner):
+        customer_type_vals = self._get_ecom_customer_type_vals()
+        if partner and customer_type_vals:
+            (partner | partner.commercial_partner_id).write(customer_type_vals)
 
     def shopify_create_contact_partner(self, vals, instance, queue_line):
         """
@@ -25,6 +52,7 @@ class ShopifyResPartnerEpt(models.Model):
         first_name = vals.get("first_name", "")
         last_name = vals.get("last_name", "")
         email = vals.get("email", "")
+        customer_type_vals = self._get_ecom_customer_type_vals()
         
         if not first_name and not last_name and not email:
             message = ("System tried to create a customer but did not receive essential details like First Name, Last Name, or Email in the response.\n"
@@ -61,6 +89,7 @@ class ShopifyResPartnerEpt(models.Model):
             if not partner.parent_id:
                 partner = self.update_partner_with_company(instance, vals.get("default_address", {}), False, partner)
             partner.write({"category_id": [(6, 0, tag_ids)]})
+            self._set_ecom_customer_type(partner)
             return partner
 
         shopify_partner_values = {"shopify_customer_id": shopify_customer_id,
@@ -70,6 +99,7 @@ class ShopifyResPartnerEpt(models.Model):
 
             if partner:
                 partner.write({"is_shopify_customer": True, "category_id": [(6, 0, tag_ids)]})
+                self._set_ecom_customer_type(partner)
                 shopify_partner_values.update({"partner_id": partner.id})
                 self.create(shopify_partner_values)
                 return partner
@@ -84,6 +114,7 @@ class ShopifyResPartnerEpt(models.Model):
             "category_id": [(6, 0, tag_ids)],
             "phone": vals.get("phone", "") if not partner_vals.get("phone") else partner_vals.get("phone")
         })
+        partner_vals.update(customer_type_vals)
         partner = partner_obj.create(partner_vals)
 
         shopify_partner_values.update({"partner_id": partner.id})
@@ -227,7 +258,10 @@ class ShopifyResPartnerEpt(models.Model):
                 # 'parent_id': partner.parent_id if partner and partner.parent_id else partner
                 'parent_id': partner_id
             }
+            partner_vals.update(self._get_ecom_customer_type_vals())
             company = partner_obj.create(partner_vals)
+        else:
+            self._set_ecom_customer_type(company)
         return company
 
     def update_partner_with_company(self, instance, address_details, parent_partner, partner):
