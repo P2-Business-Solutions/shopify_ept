@@ -106,17 +106,28 @@ class AccountMove(models.Model):
                 # Primary trigger: discount code on the product sale line itself.
                 discount_code = sale_line.shopify_discount_code
 
+                related_discount_lines = self.env["sale.order.line"]
+                if sale_line.shopify_line_id:
+                    related_discount_lines = order.order_line.filtered(
+                        lambda line: line.shopify_related_line_id == "discount_%s" % sale_line.shopify_line_id
+                    )
+
                 # Fallback trigger: discount code exists on the related discount line
                 # (common when the product line itself isn't flagged).
-                if not discount_code and sale_line.shopify_line_id:
-                    related_discount_line = order.order_line.filtered(
-                        lambda line: line.shopify_related_line_id == "discount_%s" % sale_line.shopify_line_id and
-                        line.shopify_discount_code
-                    )[:1]
-                    if related_discount_line:
-                        discount_code = related_discount_line.shopify_discount_code
+                if not discount_code:
+                    discount_code = related_discount_lines.filtered(
+                        lambda line: line.shopify_discount_code)[:1].shopify_discount_code
 
                 if not discount_code:
+                    continue
+
+                # Only reroute COGS for free products: the related discount must
+                # cover the full line price. Partially discounted lines keep the
+                # normal COGS account.
+                total_discount = sum(
+                    abs(line.price_unit) * line.product_uom_qty for line in related_discount_lines)
+                line_total = sale_line.price_unit * sale_line.product_uom_qty
+                if line_total <= 0 or round(total_discount - line_total, 2) < 0:
                     continue
 
                 # Only override COGS account when the discount code matches
