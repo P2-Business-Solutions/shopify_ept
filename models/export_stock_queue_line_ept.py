@@ -131,8 +131,6 @@ class ShopifyExportStockQueueLineEpt(models.Model):
             self._cr.commit()
             for queue_line in self:
                 log_line = False
-                shopify_product = queue_line.shopify_product_id
-                odoo_product = shopify_product.product_id
                 try:
                     shopify.InventoryLevel.set(queue_line.location_id, queue_line.inventory_item_id,
                                                queue_line.quantity)
@@ -152,11 +150,7 @@ class ShopifyExportStockQueueLineEpt(models.Model):
                             queue_line.write({'state': 'done'})
                         continue
                     if hasattr(error, "response"):
-                        message = ("System tried to export stock but received an error from the Shopify store with Product ID: %s and name: %s for the %s instance.\n"
-									"Action Items:\n"
-									"- Verify the product's existence on the Shopify store using the given name and Product ID.\n"
-									"- If it has been deleted, archive the product from the Shopify product layer "
-								   "in Odoo.") %(odoo_product.id, odoo_product.name, instance.name)
+                        message = self.prepare_export_stock_error_message(instance, queue_line, error)
                         log_line = common_log_line_obj.create_common_log_line_ept(shopify_instance_id=instance.id,module="shopify_ept",
                                                                                   message=message,
                                                                                   model_name=model,
@@ -164,11 +158,7 @@ class ShopifyExportStockQueueLineEpt(models.Model):
                         queue_line.write({"state": "failed"})
                         continue
                 except Exception as error:
-                    message = ("System tried to export stock but received an error from the Shopify store with Product ID: %s and name: %s for the %s instance.\n"
-								"Action Items:\n"
-								"- Verify the product's existence on the Shopify store using the given name and Product ID.\n"
-								"- If it has been deleted, archive the product from the Shopify product layer "
-								"in Odoo.") % (odoo_product.id, odoo_product.name, instance.name)
+                    message = self.prepare_export_stock_error_message(instance, queue_line, error)
                     log_line = common_log_line_obj.create_common_log_line_ept(shopify_instance_id=instance.id,module="shopify_ept",
                                                                               message=message,
                                                                               model_name=model,
@@ -181,3 +171,31 @@ class ShopifyExportStockQueueLineEpt(models.Model):
                     queue_line.write({"state": "failed"})
             self._cr.commit()
         return True
+
+    def prepare_export_stock_error_message(self, instance, queue_line, error):
+        """
+        Prepare a log message for a failed export stock queue line, including the variant's
+        identifiers and the actual error returned by Shopify.
+        """
+        shopify_product = queue_line.shopify_product_id
+        odoo_product = shopify_product.product_id
+        error_detail = str(error)
+        if hasattr(error, "response") and error.response is not None:
+            error_detail = "%s %s" % (error.response.code, error.response.msg)
+            body = getattr(error.response, "body", False)
+            if body:
+                try:
+                    error_detail += " - %s" % json.loads(body.decode()).get("errors")
+                except (ValueError, AttributeError):
+                    error_detail += " - %s" % body
+        message = ("System tried to export stock but received an error from the Shopify store for the %s instance.\n"
+                   "Product: %s (SKU: %s, Odoo Variant ID: %s)\n"
+                   "Shopify Variant ID: %s, Inventory Item ID: %s, Location ID: %s, Quantity: %s\n"
+                   "Shopify Error: %s\n"
+                   "Action Items:\n"
+                   "- Verify the variant's existence on the Shopify store using the Shopify Variant ID.\n"
+                   "- If it has been deleted, archive the product from the Shopify product layer "
+                   "in Odoo.") % (instance.name, odoo_product.display_name, shopify_product.default_code,
+                                  odoo_product.id, shopify_product.variant_id, queue_line.inventory_item_id,
+                                  queue_line.location_id, queue_line.quantity, error_detail)
+        return message
