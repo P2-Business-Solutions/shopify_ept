@@ -22,7 +22,7 @@ class ResPartner(models.Model):
         address = {}
         shopify_partner_obj = self.env["shopify.res.partner.ept"]
         partner_obj = self.env["res.partner"]
-        customer_type_vals = shopify_partner_obj._get_ecom_customer_type_vals()
+        customer_channel_vals = shopify_partner_obj._get_ecom_customer_channel_vals()
         customer_data = partner_obj.remove_special_chars_from_partner_vals(order_response.get("customer"))
 
         if customer_data.get("default_address"):
@@ -41,7 +41,7 @@ class ResPartner(models.Model):
         partner_vals = shopify_partner_obj.shopify_prepare_partner_vals(address, instance)
         partner_vals = self.update_name_in_partner_vals(partner_vals, first_name, last_name, email, phone)
         if shopify_partner:
-            shopify_partner_obj._set_ecom_customer_type(shopify_partner.partner_id)
+            shopify_partner_obj._set_ecom_customer_channel(shopify_partner.partner_id)
             parent_id = shopify_partner.partner_id.id
             partner_vals.update(parent_id=parent_id)
             key_list = list(partner_vals.keys())
@@ -61,7 +61,7 @@ class ResPartner(models.Model):
         res_partner = self.search_partner_by_email_phone(res_partner, email, phone)
 
         if res_partner:
-            shopify_partner_obj._set_ecom_customer_type(res_partner)
+            shopify_partner_obj._set_ecom_customer_channel(res_partner)
             partner_vals.update({"is_shopify_customer": True, "type": "invoice", "parent_id": res_partner.id})
             res_partner = self.create(partner_vals)
         else:
@@ -69,10 +69,10 @@ class ResPartner(models.Model):
             res_partner = self._find_partner_ept(partner_vals, key_list, [])
             if res_partner:
                 res_partner.write({"is_shopify_customer": True})
-                shopify_partner_obj._set_ecom_customer_type(res_partner)
+                shopify_partner_obj._set_ecom_customer_channel(res_partner)
             else:
                 partner_vals.update({"is_shopify_customer": True, "type": "contact"})
-                partner_vals.update(customer_type_vals)
+                partner_vals.update(customer_channel_vals)
                 res_partner = self.create(partner_vals)
 
         shopify_partner_obj.create({"shopify_instance_id": instance.id,
