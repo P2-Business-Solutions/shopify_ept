@@ -140,6 +140,14 @@ class ShopifyInstanceEpt(models.Model):
         return order_after_date
 
     @api.model
+    def _default_shopify_order_type(self):
+        """Use Regular as the initial default for imported Shopify orders."""
+        return self.env.ref(
+            "sale_order_type.sale_order_type_regular",
+            raise_if_not_found=False,
+        ) or self.env["sale.order.type"]._get_default_order_type()
+
+    @api.model
     def _default_UOM_category(self):
         product_weight_in_lbs_param = self.env['ir.config_parameter'].sudo().get_param('product.weight_in_lbs')
         if product_weight_in_lbs_param and product_weight_in_lbs_param == '1':
@@ -323,6 +331,15 @@ class ShopifyInstanceEpt(models.Model):
     discount_code_config_ids = fields.One2many(
         "shopify.discount.code.config.ept", "instance_id",
         string="Discount Code Configurations")
+    shopify_default_order_type_id = fields.Many2one(
+        "sale.order.type",
+        string="Default Order Type",
+        required=True,
+        default=_default_shopify_order_type,
+        check_company=True,
+        domain="['|', ('company_id', '=', False), ('company_id', '=', shopify_company_id)]",
+        help="Order type assigned when an imported order has no matching Shopify tag.",
+    )
     shopify_order_type_mapping_ids = fields.One2many(
         "shopify.order.type.mapping.ept",
         "instance_id",

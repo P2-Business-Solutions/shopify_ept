@@ -269,10 +269,15 @@
                         </page>
                         <page string="Order Type Mapping" name="order_type_mapping">
                             <div class="alert alert-info" role="alert">
-                                Imported orders default to the Regular order type. If an order
-                                contains more than one mapped Shopify tag, the mapping with the
-                                lowest sequence is used.
+                                Imported orders use the selected default order type when no tag
+                                mapping matches. If an order contains more than one mapped Shopify
+                                tag, the mapping with the lowest sequence is used.
                             </div>
+                            <group>
+                                <field name="shopify_company_id" invisible="True"/>
+                                <field name="shopify_default_order_type_id" required="1"
+                                       options="{'no_create': True, 'no_create_edit': True}"/>
+                            </group>
                             <field name="shopify_order_type_mapping_ids" nolabel="1">
                                 <list editable="bottom">
                                     <field name="sequence" widget="handle"/>

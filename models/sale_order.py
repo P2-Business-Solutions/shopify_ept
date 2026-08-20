@@ -1729,7 +1729,7 @@ class SaleOrder(models.Model):
         return order_vals
 
     def _get_shopify_order_type(self, order_response, instance):
-        """Resolve an imported order's type from its tags, defaulting to Regular."""
+        """Resolve an imported order's type from its tags and instance default."""
         mappings = instance.shopify_order_type_mapping_ids.sorted(
             key=lambda mapping: (mapping.sequence, mapping.id)
         )
@@ -1746,14 +1746,7 @@ class SaleOrder(models.Model):
             if mapping:
                 return mapping.order_type_id
 
-        regular_order_type = self.env.ref(
-            "sale_order_type.sale_order_type_regular", False
-        )
-        if regular_order_type:
-            return regular_order_type
-        return self.env["sale.order.type"].with_company(
-            instance.shopify_company_id
-        )._get_default_order_type()
+        return instance.shopify_default_order_type_id
 
     def create_and_done_stock_move_ept(self, order_line, customers_location, bom_line=False, vendor_location=False):
         """
