@@ -160,6 +160,7 @@
                                     <field name="name"/>
                                     <field name="shopify_product_id"/>
                                     <field name="inventory_item_id"/>
+                                    <field name="location_id"/>
                                     <field name="quantity"/>
                                     <field name="write_date" string="Last Updated On"/>
                                     <field name="state"/>
