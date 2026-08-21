@@ -2,10 +2,16 @@ import time
 import json
 import logging
 import pytz
+import uuid
 from odoo import models, fields
 
-from ..shopify.pyactiveresource.connection import ClientError
 from .. import shopify
+from .shopify_inventory_utils import (
+    INVENTORY_SET_QUANTITIES_MUTATION,
+    chunked,
+    inventory_user_error_indexes,
+    prepare_inventory_set_input,
+)
 
 utc = pytz.utc
 
@@ -18,17 +24,19 @@ class ShopifyExportStockQueueLineEpt(models.Model):
     _description = "Shopify Export Stock Queue Line"
 
     name = fields.Char()
-    shopify_instance_id = fields.Many2one("shopify.instance.ept", string="Instance")
+    shopify_instance_id = fields.Many2one(
+        "shopify.instance.ept", string="Instance", index=True)
     last_process_date = fields.Datetime()
-    inventory_item_id = fields.Char()
-    location_id = fields.Char()
+    inventory_item_id = fields.Char(index=True)
+    location_id = fields.Char(index=True)
     quantity = fields.Integer()
-    shopify_product_id = fields.Many2one('shopify.product.product.ept', string="Product")
+    shopify_product_id = fields.Many2one(
+        'shopify.product.product.ept', string="Product", index=True)
     state = fields.Selection([("draft", "Draft"), ("failed", "Failed"), ("done", "Done"),
                               ("cancel", "Cancelled")],
-                             default="draft")
+                             default="draft", index=True)
     export_stock_queue_id = fields.Many2one("shopify.export.stock.queue.ept", required=True,
-                                            ondelete="cascade", copy=False)
+                                            ondelete="cascade", copy=False, index=True)
     common_log_lines_ids = fields.One2many("common.log.lines.ept",
                                            "shopify_export_stock_queue_line_id",
                                            help="Log lines created against which line.")
@@ -111,66 +119,160 @@ class ShopifyExportStockQueueLineEpt(models.Model):
 
     def process_export_stock_queue_data(self):
         """
-        This method is used to processes export stock queue lines.
+        Process absolute inventory updates in GraphQL batches of up to 250 rows.
         @author: Nilam Kubavat @Emipro Technologies Pvt.Ltd on date 31-Aug-2022.
         Task Id : 199065
         """
-        common_log_line_obj = self.env['common.log.lines.ept']
-        model = "shopify.export.stock.queue.ept"
-        queue_id = self.export_stock_queue_id if len(self.export_stock_queue_id) == 1 else False
-        if queue_id:
-            instance = queue_id.shopify_instance_id
+        draft_lines = self.filtered(lambda line: line.state == "draft")
+        for queue in draft_lines.mapped("export_stock_queue_id"):
+            queue_lines = draft_lines.filtered(
+                lambda line: line.export_stock_queue_id == queue)
+            instance = queue.shopify_instance_id
             instance.connect_in_shopify()
-            query = """
-                UPDATE shopify_export_stock_queue_ept
-                SET is_process_queue = %s
-                WHERE is_process_queue = %s
-            """
-            params = (False, True)
-            self.env.cr.execute(query, params)
+            queue.is_process_queue = True
             self._cr.commit()
-            for queue_line in self:
-                log_line = False
+            for line_batch in chunked(queue_lines):
+                batch_lines = self.browse([line.id for line in line_batch])
                 try:
-                    shopify.InventoryLevel.set(queue_line.location_id, queue_line.inventory_item_id,
-                                               queue_line.quantity)
-                except ClientError as error:
-                    if hasattr(error,
-                               "response") and error.response.code == 429 and error.response.msg == "Too Many Requests":
-                        time.sleep(int(float(error.response.headers.get('Retry-After', 5))))
-                        shopify.InventoryLevel.set(queue_line.location_id,
-                                                   queue_line.inventory_item_id,
-                                                   queue_line.quantity)
-                        queue_line.write({"state": "done"})
-                        continue
-                    if hasattr(error, "response") and error.response.code == 422 and error.response.msg == "Unprocessable Entity":
-                        if json.loads(error.response.body.decode()).get("errors")[
-                            0] == 'Inventory item does not have inventory tracking enabled':
-                            queue_line.shopify_product_id.write({'inventory_management': "Dont track Inventory"})
-                            queue_line.write({'state': 'done'})
-                        continue
-                    if hasattr(error, "response"):
-                        message = self.prepare_export_stock_error_message(instance, queue_line, error)
-                        log_line = common_log_line_obj.create_common_log_line_ept(shopify_instance_id=instance.id,module="shopify_ept",
-                                                                                  message=message,
-                                                                                  model_name=model,
-                                                                                  shopify_export_stock_queue_line_id=queue_line.id if queue_line else False)
-                        queue_line.write({"state": "failed"})
-                        continue
+                    self._process_inventory_batch(instance, queue, batch_lines)
                 except Exception as error:
-                    message = self.prepare_export_stock_error_message(instance, queue_line, error)
-                    log_line = common_log_line_obj.create_common_log_line_ept(shopify_instance_id=instance.id,module="shopify_ept",
-                                                                              message=message,
-                                                                              model_name=model,
-                                                                              shopify_export_stock_queue_line_id=queue_line.id if queue_line else False)
-
-                if not log_line:
-                    queue_id.is_process_queue = True
-                    queue_line.write({"state": "done"})
-                else:
-                    queue_line.write({"state": "failed"})
+                    self._fail_inventory_lines(instance, batch_lines, str(error))
+            queue.is_process_queue = False
             self._cr.commit()
         return True
+
+    def _process_inventory_batch(self, instance, queue, batch_lines):
+        changes = [{
+            "inventory_item_id": line.inventory_item_id,
+            "location_id": line.location_id,
+            "quantity": line.quantity,
+        } for line in batch_lines]
+        mutation_input = prepare_inventory_set_input(
+            changes,
+            "odoo://shopify/inventory-export/%s" % queue.id,
+        )
+        response = self._execute_inventory_mutation(
+            mutation_input, str(uuid.uuid4()))
+        if response.get("errors"):
+            raise RuntimeError(json.dumps(response["errors"]))
+
+        mutation_result = response.get("data", {}).get("inventorySetQuantities")
+        if mutation_result is None:
+            raise RuntimeError("Shopify returned no inventorySetQuantities result")
+        failed_indexes, batch_errors = inventory_user_error_indexes(
+            mutation_result.get("userErrors"))
+        if batch_errors:
+            detail = "; ".join(error.get("message", str(error)) for error in batch_errors)
+            self._fail_inventory_lines(instance, batch_lines, detail)
+            return
+
+        successful_lines = self.browse()
+        tracking_disabled_lines = self.browse()
+        for index, line in enumerate(batch_lines):
+            errors = failed_indexes.get(index)
+            if not errors:
+                successful_lines |= line
+                continue
+            detail = "; ".join(error.get("message", str(error)) for error in errors)
+            if "inventory tracking enabled" in detail.lower():
+                tracking_disabled_lines |= line
+            else:
+                self._fail_inventory_lines(instance, line, detail)
+
+        if successful_lines:
+            successful_lines.write({
+                "state": "done",
+                "last_process_date": fields.Datetime.now(),
+            })
+            successful_lines._record_successful_inventory_exports()
+        if tracking_disabled_lines:
+            tracking_disabled_lines.shopify_product_id.write({
+                "inventory_management": "Dont track Inventory",
+            })
+            tracking_disabled_lines.write({
+                "state": "done",
+                "last_process_date": fields.Datetime.now(),
+            })
+
+    def _execute_inventory_mutation(self, mutation_input, idempotency_key):
+        for attempt in range(3):
+            try:
+                raw_response = shopify.GraphQL().execute(
+                    INVENTORY_SET_QUANTITIES_MUTATION,
+                    variables={
+                        "input": mutation_input,
+                        "idempotencyKey": idempotency_key,
+                    },
+                    operation_name="InventorySet",
+                )
+            except Exception as error:
+                if getattr(error, "code", None) == 429 and attempt < 2:
+                    retry_after = getattr(error, "headers", {}).get("Retry-After", 2 ** attempt)
+                    time.sleep(float(retry_after))
+                    continue
+                raise
+
+            response = json.loads(raw_response)
+            errors = response.get("errors") or []
+            throttled = errors and all(
+                error.get("extensions", {}).get("code") == "THROTTLED"
+                for error in errors
+            )
+            if throttled and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            return response
+
+        raise RuntimeError("Shopify inventory mutation remained throttled after retries")
+
+    def _record_successful_inventory_exports(self):
+        state_model = self.env["shopify.inventory.export.state.ept"].sudo()
+        states = state_model.search([
+            ("shopify_instance_id", "in", self.shopify_instance_id.ids),
+            ("shopify_product_id", "in", self.shopify_product_id.ids),
+            ("location_id", "in", list(set(self.mapped("location_id")))),
+        ])
+        states_by_key = {
+            (state.shopify_instance_id.id, state.shopify_product_id.id, state.location_id): state
+            for state in states
+        }
+        exported_at = fields.Datetime.now()
+        values_to_create = []
+        for line in self:
+            key = (line.shopify_instance_id.id, line.shopify_product_id.id, line.location_id)
+            values = {
+                "inventory_item_id": line.inventory_item_id,
+                "quantity": line.quantity,
+                "last_exported_at": exported_at,
+            }
+            state = states_by_key.get(key)
+            if state:
+                state.write(values)
+            else:
+                values.update({
+                    "shopify_instance_id": line.shopify_instance_id.id,
+                    "shopify_product_id": line.shopify_product_id.id,
+                    "location_id": line.location_id,
+                })
+                values_to_create.append(values)
+        if values_to_create:
+            state_model.create(values_to_create)
+
+    def _fail_inventory_lines(self, instance, lines, error_detail):
+        common_log_line_obj = self.env["common.log.lines.ept"]
+        for line in lines:
+            message = self.prepare_export_stock_error_message(instance, line, error_detail)
+            common_log_line_obj.create_common_log_line_ept(
+                shopify_instance_id=instance.id,
+                module="shopify_ept",
+                message=message,
+                model_name="shopify.export.stock.queue.ept",
+                shopify_export_stock_queue_line_id=line.id,
+            )
+        lines.write({
+            "state": "failed",
+            "last_process_date": fields.Datetime.now(),
+        })
 
     def prepare_export_stock_error_message(self, instance, queue_line, error):
         """

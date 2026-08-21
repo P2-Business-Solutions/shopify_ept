@@ -541,18 +541,23 @@ class ShopifyProcessImportExport(models.TransientModel):
             last_update_date = instance.shopify_last_date_update_stock or datetime.now() - timedelta(30)
             _logger.info("Exporting Stock by Cron for instance - %s", instance.name)
 
-        products = product_obj.get_products_based_on_movement_date_ept(last_update_date,
-                                                                       instance.shopify_company_id)
+        export_cutoff = fields.Datetime.now()
+        products = product_obj.get_products_based_on_movement_date_ept(
+            last_update_date,
+            instance.shopify_company_id,
+        )
 
         # find shopify product which has Fixed Stock Export boolean is true
         fixed_stock_products = self.search_product_for_fixed_stock_export(instance)
         products = products + fixed_stock_products
         if products:
-            export_stock_queue = shopify_product_obj.export_stock_queue(instance, products)
+            export_stock_queue = shopify_product_obj.with_context(
+                stock_export_cutoff=export_cutoff,
+            ).export_stock_queue(instance, products)
             if export_stock_queue:
                 return export_stock_queue
         else:
-            instance.shopify_last_date_update_stock = datetime.now()
+            instance.shopify_last_date_update_stock = export_cutoff
             _logger.info("No products found to export stock from %s.....", last_update_date)
 
         return False

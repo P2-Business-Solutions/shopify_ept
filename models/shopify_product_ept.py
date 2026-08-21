@@ -679,7 +679,7 @@ class ShopifyProductProductEpt(models.Model):
         Find Shopify location for the particular instance
         Check export_stock_warehouse_ids is configured in location or not
         Get the total stock of the product with configured warehouses and update that stock in shopify location
-        here we use InventoryLevel shopify API for export stock
+        Queue absolute inventory quantities for batched Shopify GraphQL export.
         @author: Maulik Barad on Date 15-Sep-2020.
         """
         product_obj = self.env["product.product"]
@@ -827,25 +827,15 @@ class ShopifyProductProductEpt(models.Model):
         export_stock_obj = self.env['shopify.export.stock.queue.ept']
         model = "shopify.product.product.ept"
         all_products = self.search_shopify_product_for_export_stock(instance, product_ids)
-
-        if self._context.get('is_process_from_selected_product'):
-            shopify_products = all_products
-        else:
-            if instance.shopify_last_date_update_stock:
-                shopify_products = all_products.filtered(lambda x: not x.last_stock_update_date or
-                                                                   x.last_stock_update_date <= instance.shopify_last_date_update_stock)
-            else:
-                shopify_products = all_products.filtered(lambda x: not x.last_stock_update_date)
-
-        if not shopify_products:
+        export_cutoff = self.env.context.get("stock_export_cutoff") or fields.Datetime.now()
+        if not all_products:
+            if not self._context.get("is_process_from_selected_product"):
+                instance.shopify_last_date_update_stock = export_cutoff
             return False
+
+        # The stock-movement query is already the delta selector. Per-product export
+        # dates can be newer after a manual export and must not hide later movements.
         shopify_products = all_products
-        last_export_date = all_products[0].last_stock_update_date or datetime.now()
-
-        if not shopify_products:
-            return True
-
-        instance.connect_in_shopify()
         location_ids = self.env["shopify.location.ept"].search(
             [("instance_id", "=", instance.id), ('legacy', '=', False)])
         if not location_ids:
@@ -854,6 +844,7 @@ class ShopifyProductProductEpt(models.Model):
 						"- Verify the Shopify location under: Shopify → Configuration → Shopify Locations.\n"
 						"- If the locations are not available in Odoo, import them using the operation wizard.") % instance.name
             self.shopify_create_log(instance, message, model)
+            return False
 
         # if not self._context.get('is_process_from_selected_product'):
         #     shopify_templates = self.check_available_products_in_shopify(instance)
@@ -863,7 +854,13 @@ class ShopifyProductProductEpt(models.Model):
 
         shopify_products = shopify_products.filtered(
             lambda l: l.product_id.id in product_ids and l.inventory_management == 'shopify')
+        if not shopify_products:
+            if not self._context.get("is_process_from_selected_product"):
+                instance.shopify_last_date_update_stock = export_cutoff
+            return False
+
         export_stock_data = []
+        configuration_complete = True
         for location_id in location_ids:
             shopify_location_warehouse = location_id.export_stock_warehouse_ids or False
             if not shopify_location_warehouse:
@@ -872,17 +869,13 @@ class ShopifyProductProductEpt(models.Model):
 							"- Verify the Shopify location under: Shopify → Configuration → Shopify Locations.\n"
 							"- Set the appropriate export stock warehouse mapping.") % location_id.name
                 self.shopify_create_log(instance, message, model)
+                configuration_complete = False
                 continue
 
             odoo_product_ids = shopify_products.product_id.ids
             product_stock = self.check_stock(instance, odoo_product_ids, product_obj,
                                              location_id.export_stock_warehouse_ids)
-            commit_count = 0
             for shopify_product in shopify_products:
-                if commit_count == 50:
-                    self._cr.commit()
-                    commit_count = 0
-                commit_count += 1
                 odoo_product = shopify_product.product_id
                 if odoo_product.type == "consu":
                     if not shopify_product.inventory_item_id:
@@ -904,21 +897,19 @@ class ShopifyProductProductEpt(models.Model):
 
                     # if not self._context.get('is_process_from_selected_product'):
 
-        export_stock_queue = export_stock_obj.create_export_stock_queue(instance, export_stock_data)
+        export_stock_queue = export_stock_obj.with_context(
+            force_inventory_export=self._context.get("is_process_from_selected_product", False),
+        ).create_export_stock_queue(instance, export_stock_data)
+        if configuration_complete and not self._context.get("is_process_from_selected_product"):
+            shopify_products.write({'last_stock_update_date': export_cutoff})
+            instance.write({'shopify_last_date_update_stock': export_cutoff})
+
         if export_stock_queue:
-            shopify_products.write({
-                'last_stock_update_date': datetime.now() - timedelta(hours=0.5)})
-            instance.write({
-                'shopify_last_date_update_stock': datetime.now() - timedelta(hours=0.5)})
             queue_cron = self.env.ref("shopify_ept.process_shopify_export_stock_queue")
             if not queue_cron.active:
                 _logger.info("Active the Export stock data process queue cron job")
                 queue_cron.write(
                     {'active': True, 'nextcall': datetime.now() + timedelta(seconds=120)})
-        if not export_stock_queue.export_stock_queue_line_ids:
-            export_stock_queue.unlink()
-            self._cr.commit()
-            return False
         return export_stock_queue
 
     def compute_qty_for_export_stock(self, product_stock, shopify_product, odoo_product):

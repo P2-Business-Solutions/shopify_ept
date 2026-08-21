@@ -98,23 +98,84 @@ class ShopifyExportStockQueueEpt(models.Model):
         @author: Nilam Kubavat @Emipro Technologies Pvt.Ltd on date 31-Aug-2022.
         Task Id : 199065
         """
-        export_stock_queue = self
-        count = 50
-        for data in export_stock_data:
-            if count == 50:
-                count = 0
-                export_stock_queue = self.shopify_create_export_stock_queue(instance)
-                message = "Export Stock Queue Created %s" % ', '.join(export_stock_queue.mapped('name'))
-                if self.env.context.get('queue_created_by'):
-                    self.env["bus.bus"]._sendone(self.env.user.partner_id, 'simple_notification',
-                                                 {"title": "Shopify Connector",
-                                                  "message": message, "sticky": False, "warning": True})
-                self._cr.commit()
-                _logger.info(message)
-            self.shopify_create_export_stock_queue_line(data, instance, export_stock_queue)
-            count += 1
+        if not export_stock_data:
+            return self
 
-        return export_stock_queue
+        # Keep only the newest value for each product/location pair in this run.
+        changes_by_key = {}
+        for data in export_stock_data:
+            key = (data["shopify_product_id"].id, str(data["location_id"]))
+            changes_by_key[key] = data
+
+        product_ids = list({key[0] for key in changes_by_key})
+        location_ids = list({key[1] for key in changes_by_key})
+        state_records = self.env["shopify.inventory.export.state.ept"].sudo().search([
+            ("shopify_instance_id", "=", instance.id),
+            ("shopify_product_id", "in", product_ids),
+            ("location_id", "in", location_ids),
+        ])
+        states_by_key = {
+            (state.shopify_product_id.id, state.location_id): state
+            for state in state_records
+        }
+        pending_lines = self.env["shopify.export.stock.queue.line.ept"].search([
+            ("shopify_instance_id", "=", instance.id),
+            ("shopify_product_id", "in", product_ids),
+            ("location_id", "in", location_ids),
+            ("state", "=", "draft"),
+            ("export_stock_queue_id.is_process_queue", "=", False),
+        ])
+        pending_by_key = {
+            (line.shopify_product_id.id, line.location_id): line
+            for line in pending_lines
+        }
+
+        affected_queues = self.browse()
+        values_to_create = []
+        for key, data in changes_by_key.items():
+            quantity = int(data["quantity"])
+            inventory_item_id = str(data["inventory_item_id"])
+            pending_line = pending_by_key.get(key)
+            if pending_line:
+                pending_line.write({
+                    "inventory_item_id": inventory_item_id,
+                    "quantity": quantity,
+                })
+                affected_queues |= pending_line.export_stock_queue_id
+                continue
+
+            previous_state = states_by_key.get(key)
+            if (not self.env.context.get("force_inventory_export")
+                    and previous_state and previous_state.quantity == quantity
+                    and previous_state.inventory_item_id == inventory_item_id):
+                continue
+
+            values_to_create.append({
+                "shopify_instance_id": instance.id,
+                "name": data["shopify_product_id"].default_code,
+                "inventory_item_id": inventory_item_id,
+                "shopify_product_id": data["shopify_product_id"].id,
+                "location_id": str(data["location_id"]),
+                "quantity": quantity,
+            })
+
+        if values_to_create:
+            new_queue = self.shopify_create_export_stock_queue(instance)
+            for values in values_to_create:
+                values["export_stock_queue_id"] = new_queue.id
+            self.env["shopify.export.stock.queue.line.ept"].create(values_to_create)
+            affected_queues |= new_queue
+            message = "Export Stock Queue Created %s" % new_queue.name
+            if self.env.context.get('queue_created_by'):
+                self.env["bus.bus"]._sendone(
+                    self.env.user.partner_id,
+                    'simple_notification',
+                    {"title": "Shopify Connector", "message": message,
+                     "sticky": False, "warning": True},
+                )
+            _logger.info(message)
+
+        return affected_queues
 
     def shopify_create_export_stock_queue(self, instance):
         """
