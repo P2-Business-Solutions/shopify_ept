@@ -9,6 +9,9 @@
                 <header>
                     <button name="%(shopify_ept.action_wizard_shopify_product_for_update)d" type="action" string="Update Existing Product"/>
                     <button name="%(shopify_ept.action_wizard_shopify_update_stock)d" type="action" string="Export Stock"/>
+                    <button name="action_check_for_updates_from_shopify" type="object"
+                            string="Check for Updates from Shopify"
+                            confirm="The selected products will be fetched from Shopify and updated in Odoo, and their variants re-linked to the Odoo products matching their current SKU/Barcode. Continue?"/>
                 </header>
                 <field name="name"/>
                 <field name="shopify_instance_id"/>
@@ -70,6 +73,10 @@
                             <field name="name" class="oe_inline"/>
                         </h1>
                     </div>
+                    <button name="action_check_for_updates_from_shopify" class="pull-right"
+                            type="object" string="Check for Updates from Shopify"
+                            invisible="not exported_in_shopify"
+                            confirm="This product will be fetched from Shopify and updated in Odoo, and its variants re-linked to the Odoo products matching their current SKU/Barcode. Continue?"/>
                     <button name="shopify_publish_unpublish_product" class="pull-right"
                             type="object" string="Unpublish Product" context="{'publish': 'shopify_unpublish'}"
                             invisible="not exported_in_shopify or website_published == 'unpublished'"/>

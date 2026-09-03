@@ -57,3 +57,35 @@ class TestShopifyProductUtils(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRelinkSearchDomains(unittest.TestCase):
+
+    def test_keeps_link_when_barcode_still_matches(self):
+        self.assertEqual(
+            UTILS.get_relink_search_domains("barcode", "SKU-A", "111", "SKU-B", "111"), [])
+
+    def test_barcode_changed_searches_by_new_barcode_only(self):
+        self.assertEqual(
+            UTILS.get_relink_search_domains("barcode", "SKU-A", "222", "SKU-A", "111"),
+            [[("barcode", "=", "222")]])
+
+    def test_sku_changed_searches_by_new_sku(self):
+        self.assertEqual(
+            UTILS.get_relink_search_domains("sku", "SKU-NEW", "111", "SKU-OLD", "111"),
+            [[("default_code", "=", "SKU-NEW")]])
+
+    def test_sku_or_barcode_keeps_link_when_either_matches(self):
+        self.assertEqual(
+            UTILS.get_relink_search_domains("sku_or_barcode", "SKU-NEW", "111", "SKU-OLD", "111"), [])
+        self.assertEqual(
+            UTILS.get_relink_search_domains("sku_or_barcode", "SKU-A", "999", "SKU-A", "111"), [])
+
+    def test_sku_or_barcode_tries_sku_then_barcode(self):
+        self.assertEqual(
+            UTILS.get_relink_search_domains("sku_or_barcode", "SKU-NEW", "222", "SKU-OLD", "111"),
+            [[("default_code", "=", "SKU-NEW")], [("barcode", "=", "222")]])
+
+    def test_missing_identifier_keeps_link(self):
+        self.assertEqual(UTILS.get_relink_search_domains("barcode", "SKU-A", "", "SKU-A", "111"), [])
+        self.assertEqual(UTILS.get_relink_search_domains("sku", None, "111", "SKU-A", "111"), [])

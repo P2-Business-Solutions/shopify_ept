@@ -862,6 +862,13 @@ class ShopifyProcessImportExport(models.TransientModel):
             [("shopify_instance_id", "=", instance.id),
              ("product_id", "=", int(record["PRODUCT_ID"])),
              ("shopify_template_id", "=", shopify_template_id)])
+        if not shopify_variant and record["shopify_product_default_code"]:
+            # The Shopify variant is already in the layer but mapped to another Odoo product; re-map it instead
+            # of creating a duplicate that has no variant id and would never be used by order import.
+            shopify_variant = shopify_product_obj.search(
+                [("shopify_instance_id", "=", instance.id),
+                 ("default_code", "=", record["shopify_product_default_code"]),
+                 ("shopify_template_id", "=", shopify_template_id)], limit=1)
         shopify_variant_vals = {"shopify_instance_id": instance.id,
                                 "product_id": int(record["PRODUCT_ID"]),
                                 "shopify_template_id": shopify_template_id,

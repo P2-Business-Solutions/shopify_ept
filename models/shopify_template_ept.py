@@ -12,10 +12,11 @@ import requests
 from dateutil import parser
 import pytz
 
-from odoo import models, fields, api
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError
 from .. import shopify
 from ..shopify.pyactiveresource.connection import ClientError
-from .shopify_product_utils import find_duplicate_match_field
+from .shopify_product_utils import find_duplicate_match_field, get_relink_search_domains
 
 utc = pytz.utc
 _logger = logging.getLogger("Shopify Template")
@@ -269,6 +270,46 @@ class ShopifyProductTemplateEpt(models.Model):
 
         return True
 
+    def action_check_for_updates_from_shopify(self):
+        """
+        Fetches the selected products again from Shopify and syncs them into the Shopify layer, so changes made in
+        Shopify (SKU, Barcode, title, variants, ...) are reflected in Odoo and each variant is re-linked to the Odoo
+        product matching its current SKU/Barcode as per the matching configuration in Settings.
+        Called from the Shopify Products list (on the selected records) and from the form view.
+        @return: Action showing the product queue(s) created for the check, with their log lines.
+        """
+        product_data_queue_obj = self.env["shopify.product.data.queue.ept"]
+        templates = self.filtered(lambda t: t.exported_in_shopify and t.shopify_tmpl_id and t.shopify_instance_id)
+        if not templates:
+            raise UserError(_("Select at least one product that exists in Shopify."))
+
+        queue_ids = []
+        for instance in templates.shopify_instance_id:
+            shopify_tmpl_ids = templates.filtered(lambda t: t.shopify_instance_id == instance).mapped(
+                "shopify_tmpl_id")
+            # Shopify accepts at most 100 ids per request.
+            for start in range(0, len(shopify_tmpl_ids), 100):
+                queue_ids += product_data_queue_obj.with_context(
+                    queue_created_by="manual").shopify_create_product_data_queue(
+                    instance, template_ids=",".join(shopify_tmpl_ids[start:start + 100])) or []
+
+        if not queue_ids:
+            raise UserError(_("Shopify did not return any of the selected products. "
+                              "They may have been deleted in Shopify."))
+
+        queues = product_data_queue_obj.browse(queue_ids)
+        for queue in queues:
+            queue.product_data_queue_lines.process_product_queue_line_data()
+
+        action = self.env.ref("shopify_ept.action_shopify_product_data_queue").sudo().read()[0]
+        if len(queues) == 1:
+            form_view = self.sudo().env.ref("shopify_ept.product_synced_data_form_view_ept")
+            action.update({"view_id": (form_view.id, form_view.name), "res_id": queues.id,
+                           "views": [(form_view.id, "form")]})
+        else:
+            action["domain"] = [("id", "in", queues.ids)]
+        return action
+
     def get_product_category(self, product_type):
         """
         Search for product category and create if not found.
@@ -452,6 +493,11 @@ class ShopifyProductTemplateEpt(models.Model):
             # Here we are not passing SKU and Barcode while searching shopify product, Because We
             # are updating same existing product so.
             shopify_product, odoo_product = self.shopify_search_odoo_product_variant(instance, variant_id, False, False)
+            message = self.relink_shopify_variant_to_matching_product(instance, shopify_product, sku, barcode, name)
+            if message:
+                self.create_log_line_for_queue_line(instance, message, model_name, product_data_line_id,
+                                                    order_data_line_id, sku)
+                continue
             variant_vals = self.prepare_variant_vals(instance, variant)
             base_domain = [
                 ("variant_id", "=", False),
@@ -606,6 +652,11 @@ class ShopifyProductTemplateEpt(models.Model):
             variant_vals = self.prepare_variant_vals(instance, variant)
 
             shopify_product, odoo_product = self.shopify_search_odoo_product_variant(instance, variant_id, sku, barcode)
+            message = self.relink_shopify_variant_to_matching_product(instance, shopify_product, sku, barcode, name)
+            if message:
+                self.create_log_line_for_queue_line(instance, message, model_name, product_data_line_id,
+                                                    order_data_line_id, sku)
+                continue
 
             message = self.is_product_importable(template_data, instance, odoo_product, shopify_product)
             if message:
@@ -694,6 +745,58 @@ class ShopifyProductTemplateEpt(models.Model):
                                                                             variant.get("compare_at_price"))
 
         return shopify_template
+
+    def relink_shopify_variant_to_matching_product(self, instance, shopify_product, sku, barcode, name):
+        """
+        Re-links an already imported Shopify variant to the Odoo product that matches its current SKU/Barcode
+        when the linked Odoo product no longer matches, as per the matching configuration in Settings.
+        Needed because Shopify variants are looked up by variant id once imported, so a SKU/Barcode change in
+        Shopify would otherwise never change the linked Odoo product.
+        @param shopify_product: Existing shopify.product.product.ept record (may be empty).
+        @return: Message when the identifier changed but no Odoo product matches it, else False.
+        """
+        if not shopify_product or not shopify_product.product_id:
+            return False
+
+        match_by = instance.shopify_sync_product_with
+        linked_product = shopify_product.product_id
+        domains = get_relink_search_domains(match_by, sku, barcode, linked_product.default_code,
+                                            linked_product.barcode)
+        if not domains:
+            return False
+
+        odoo_product = self.env["product.product"]
+        for domain in domains:
+            odoo_product = odoo_product.search(domain, limit=1)
+            if odoo_product:
+                break
+
+        if not odoo_product:
+            if match_by == "sku":
+                identifier = "SKU: %s" % sku
+                linked_identifier = "SKU: %s" % linked_product.default_code
+            elif match_by == "barcode":
+                identifier = "Barcode: %s" % barcode
+                linked_identifier = "Barcode: %s" % linked_product.barcode
+            else:
+                identifier = "SKU: %s, Barcode: %s" % (sku, barcode)
+                linked_identifier = "SKU: %s, Barcode: %s" % (linked_product.default_code, linked_product.barcode)
+            return ("Shopify variant [%s] of product %s now has %s, but it is mapped to Odoo product [%s] with %s "
+                    "and no Odoo product matches the new value.\n"
+                    "Action Items:\n"
+                    "- Create or update the Odoo product with the mentioned %s, or manually map the variant in "
+                    "Odoo under Shopify → Products.\n"
+                    "- Reprocess the queue.") % (shopify_product.variant_id, name, identifier,
+                                                 linked_product.display_name, linked_identifier,
+                                                 "SKU" if match_by == "sku" else "Barcode" if match_by == "barcode"
+                                                 else "SKU/Barcode")
+
+        if odoo_product != linked_product:
+            _logger.info("Re-linking Shopify variant %s of %s from Odoo product %s to %s as per %s.",
+                         shopify_product.variant_id, name, linked_product.display_name, odoo_product.display_name,
+                         match_by)
+            shopify_product.write({"product_id": odoo_product.id, "name": odoo_product.name})
+        return False
 
     def check_sku_barcode(self, sku, barcode, name, variant_id, match_by):
         """
