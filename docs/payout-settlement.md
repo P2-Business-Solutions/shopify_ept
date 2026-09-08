@@ -7,7 +7,7 @@ receiving bank journal. The settlement entry does not book sales, refunds or fee
 
 ## Setup
 
-Upgrade `shopify_ept` to version `18.0.3.16`. On the Shopify instance's **Payout
+Upgrade `shopify_ept` to version `18.0.3.17`. On the Shopify instance's **Payout
 Configurations** tab, configure:
 
 1. **Payout Report Journal:** the separate Shopify settlement bank journal.
@@ -77,7 +77,12 @@ do not modify invoice amounts or write off a difference just to balance a payout
 The payout shows its settlement entry, receiving bank, matched bank transactions and
 bank status. It distinguishes awaiting, partial and completed bank matches. Undoing
 reconciliation removes the match status. A non-bank write-off, reversal, canceled entry
-or unreconciled source statement is reported as **Needs Review**.
+or unreconciled source statement is reported as **Needs Review**. Statements marked
+for review must be checked before settlement. The default Remaining Reports filter
+includes these exceptions, even when the transit item has already been reconciled;
+**Settlement Needs Review** shows them separately.
+Settlement status is stored and indexed, and payout links are indexed for statement
+lookups and bulk processing.
 
 Payout locks and database uniqueness constraints prevent a second linked settlement
 entry, including across duplicate reports for the same Shopify instance and payout
@@ -90,6 +95,10 @@ Validation and transfer creation use one transaction for each processed payout. 
 scheduler isolates configuration/validation failures, records the reason on the payout,
 and skips it until it is corrected and processed manually. Bulk manual creation is atomic:
 an invalid selection raises an error rather than leaving some new transfers posted.
+Processing also locks the payout and rolls back failed statement operations individually.
+Database conflicts propagate to Odoo's retry handling instead of being recorded as a
+payment mismatch. Zero-value transactions do not create statement lines; generation
+completion uses the payout currency's rounding precision.
 
 ## Validation
 
@@ -102,3 +111,9 @@ payments on different payouts with and without Shopify transaction IDs.
 
 Run integration tests in an Odoo 18 test database with the connector's dependencies and
 Enterprise accounting installed. The local repository alone has no Odoo runtime.
+
+Before enabling automatic transfers in production, test a normal payout, a next-day
+refund, a negative payout, repeated bulk actions, and partial/full bank matching with
+undo and review. Confirm that the Shopify clearing balance is cleared by the transfer,
+and that the transit balance clears only when the actual bank entry is matched. For
+foreign currency, also check the exchange difference and company-currency balances.

@@ -1,6 +1,7 @@
 """Posting and reconciliation tests, run inside an Odoo accounting database."""
 
 from datetime import timedelta
+from unittest.mock import patch
 
 try:
     from .test_shopify_payout_generation import PayoutTestCase, ODOO_AVAILABLE
@@ -37,6 +38,7 @@ class TestShopifyPayoutSettlement(PayoutTestCase):
             'shopify_payout_transfer_journal_id': cls.transfer_journal.id,
         })
         cls.counterpart = cls.instance.transaction_line_ids.account_id
+        (cls.journal | cls.bank).autocheck_on_post = True
 
     def _book_activity(self, payout):
         """Book payout activity to non-suspense accounts without a live Shopify API."""
@@ -102,6 +104,73 @@ class TestShopifyPayoutSettlement(PayoutTestCase):
         with self.assertRaises(UserError):
             duplicate.action_create_settlement_transfer()
         self.assertFalse(duplicate.settlement_move_id)
+
+    def test_unchecked_source_blocks_transfer_and_updates_existing_status(self):
+        payout = self._payout('source-review')
+        self._book_activity(payout)
+        statement = self._statement_lines(payout)[:1]
+        statement.move_id.checked = False
+        with self.assertRaises(UserError):
+            payout.action_create_settlement_transfer()
+        self.assertFalse(payout.settlement_move_id)
+        statement.move_id.checked = True
+        payout.action_create_settlement_transfer()
+        self.assertEqual(payout.settlement_status, 'pending')
+        statement.move_id.checked = False
+        self.assertEqual(payout.settlement_status, 'review')
+        statement.move_id.checked = True
+        self.assertEqual(payout.settlement_status, 'pending')
+
+    def test_unchecked_bank_receipt_requires_review(self):
+        payout = self._payout('bank-review')
+        self._book_activity(payout)
+        payout.action_create_settlement_transfer()
+        bank_line = self._bank_match(payout)
+        self.assertEqual(payout.settlement_status, 'matched')
+        bank_line.move_id.checked = False
+        self.assertEqual(payout.settlement_status, 'review')
+        bank_line.move_id.checked = True
+        self.assertEqual(payout.settlement_status, 'matched')
+
+    def test_review_filter_tracks_checked_changes(self):
+        payout = self._payout('review-search')
+        self._book_activity(payout)
+        payout.action_create_settlement_transfer()
+        bank_line = self._bank_match(payout)
+        domain = [('id', '=', payout.id), ('settlement_status', '=', 'review')]
+        self.assertFalse(payout.search(domain))
+        bank_line.move_id.checked = False
+        self.assertEqual(payout.search(domain), payout)
+        bank_line.move_id.checked = True
+        self.assertFalse(payout.search(domain))
+
+    def test_bulk_statement_review_reopens_each_linked_payout(self):
+        payouts = self._payout('bulk-review-1') | self._payout('bulk-review-2')
+        for payout in payouts:
+            self._book_activity(payout)
+            payout.validate_statement()
+        self._statement_lines(payouts).write({'checked': False})
+        self.assertEqual(payouts.mapped('state'), ['partially_processed', 'partially_processed'])
+
+    def test_failed_adjustment_processing_rolls_back_line_changes(self):
+        payout = self._payout('adjustment-rollback')
+        payout.payout_transaction_ids.unlink()
+        payout.write({'amount': -3, 'payout_transaction_ids': [Command.create({
+            'transaction_type': 'adjustment', 'transaction_id': 'adjustment', 'amount': -3,
+        })]})
+        payout.generate_bank_statement()
+        statement = self._statement_lines(payout)
+        original_ref = statement.payment_ref
+
+        def fail_after_edit(_payout, line, *_args):
+            line.payment_ref = 'partial edit that must roll back'
+            raise UserError('Adjustment could not be reconciled')
+
+        with patch.object(type(payout), 'reconcile_other_transactions', fail_after_edit):
+            payout.with_context(cron_process=True).process_bank_statement()
+        self.assertEqual(statement.payment_ref, original_ref)
+        self.assertFalse(statement.is_reconciled)
+        self.assertEqual(payout.state, 'partially_processed')
 
     def test_nonbank_writeoff_is_not_reported_as_bank_matched(self):
         payout = self._payout('writeoff')

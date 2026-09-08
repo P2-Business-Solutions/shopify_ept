@@ -94,6 +94,25 @@ class PayoutTestCase(TransactionCase):
 
 
 class TestShopifyPayoutGeneration(PayoutTestCase):
+    def test_zero_transactions_do_not_create_statement_lines(self):
+        payout = self._payout('zero-line')
+        payout.payout_transaction_ids = [Command.create({
+            'transaction_id': 'zero-charge', 'transaction_type': 'charge',
+            'source_order_id': 'missing-order', 'amount': 0,
+        })]
+        payout.generate_bank_statement()
+        self.assertEqual(len(self._statement_lines(payout)), 2)
+        self.assertFalse(payout.payout_transaction_ids.filtered(
+            lambda row: row.transaction_id == 'zero-charge').is_remaining_statement)
+
+    def test_wrong_company_journal_cannot_generate_statements(self):
+        payout = self._payout('wrong-company')
+        other_company = self.env['res.company'].create({'name': 'Payout Other Company'})
+        self.instance.shopify_company_id = other_company
+        with self.assertRaises(UserError):
+            payout.generate_bank_statement()
+        self.assertFalse(self._statement_lines(payout))
+
     def test_bulk_action_generates_multiple_payouts_and_is_repeatable(self):
         payouts = self._payout('bulk-1') | self._payout('bulk-2')
         action = self.env.ref('shopify_ept.action_generate_shopify_payout_statements')

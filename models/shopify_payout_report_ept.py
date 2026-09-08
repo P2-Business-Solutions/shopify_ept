@@ -2,6 +2,7 @@
 # See LICENSE file for full copyright and licensing details.
 import logging
 import time
+from psycopg2 import OperationalError
 
 from datetime import datetime, timedelta
 from odoo import models, fields,api, _
@@ -294,7 +295,8 @@ class ShopifyPaymentReportEpt(models.Model):
         Task ID : 164126
         """
         all_statement_processed = True
-        if self.payout_transaction_ids and any(line.is_remaining_statement for line in self.payout_transaction_ids.filtered(lambda l:not float_is_zero(l.amount, precision_digits=2))):
+        if self.payout_transaction_ids and any(line.is_remaining_statement for line in self.payout_transaction_ids.filtered(
+                lambda line: not self.currency_id.is_zero(line.amount))):
             all_statement_processed = False
         return all_statement_processed
 
@@ -363,6 +365,9 @@ class ShopifyPaymentReportEpt(models.Model):
             'is_remaining_statement': True,
         })
         for transaction in transaction_ids:
+            if self.currency_id.is_zero(transaction.amount):
+                transaction.is_remaining_statement = False
+                continue
             order_id = transaction.order_id
             if transaction.transaction_type in ['charge', 'refund', 'payment_refund'] and not order_id:
                 source_order_id = transaction.source_order_id
@@ -584,7 +589,9 @@ class ShopifyPaymentReportEpt(models.Model):
                 return False
             raise UserError(_(message_body))
 
-        currency_id = journal.currency_id.id or self.instance_id.shopify_company_id.currency_id.id or False
+        if journal.company_id != self.instance_id.shopify_company_id or journal.type != 'bank':
+            raise UserError(_('The Payout Report Journal must be a bank journal belonging to the Shopify company.'))
+        currency_id = (journal.currency_id or journal.company_id.currency_id).id
         if currency_id != self.currency_id.id:
             message_body = ("System tried to import the payout report but found a mismatch between the payout report "
 							"currency and the currency in the journal configured in the instance.\n"
@@ -710,6 +717,9 @@ class ShopifyPaymentReportEpt(models.Model):
                 if move_line_ids:
                     with self.env.cr.savepoint():
                         self.shopify_reconcile_bank_statement_line_ept(statement_line.id, move_line_ids)
+            except OperationalError:
+                # Odoo must retry serialization/deadlock failures as a whole request.
+                raise
             except Exception as error:
                 message = ("System tried to automatically reconcile but encountered an error while processing the statement line: %s \n"
 							"Action Items:\n"
@@ -790,6 +800,8 @@ class ShopifyPaymentReportEpt(models.Model):
         @author: Maulik Barad on Date 07-Dec-2020.
         """
         statement_line_obj = self.env['account.bank.statement.line']
+        self.ensure_one()
+        self._lock_settlement_payouts()
         log_lines = []
         _logger.info("Processing Bank Statement line of payout : %s.", self.name)
         statement_lines = statement_line_obj.search([('payout_id', '=', self.id)])
@@ -799,43 +811,46 @@ class ShopifyPaymentReportEpt(models.Model):
             currency_ids = []
             paid_move_lines = []
             try:
-                if statement_line.shopify_transaction_type in ["charge", "refund", "payment_refund"]:
-                    payout_transaction = statement_line.payout_line_id
-                    exact_payment = self.find_payment_for_payout_transaction(payout_transaction)
-                    if exact_payment and exact_payment.move_id:
-                        move_line_total_amount, currency_ids, paid_move_lines = \
-                            self.get_payment_move_line_amount(statement_line, exact_payment)
-                    elif exact_payment:
-                        # Odoo 18 payments without outstanding accounts may have
-                        # no journal entry. Reconcile their open invoice instead.
-                        move_type = 'out_refund' if statement_line.amount < 0 else 'out_invoice'
-                        invoices = exact_payment.invoice_ids.filtered(
-                            lambda move: move.state == 'posted' and move.move_type == move_type)
-                        move_line_total_amount, currency_ids, move_line_data = self.get_unpaid_move_line_data(
-                            statement_line, invoices)
-                    else:
-                        invoices = self.get_invoices_for_reconcile(statement_line)
-                        if not invoices:
-                            continue
-
-                        paid_invoices = invoices.filtered(lambda x: x.reconciled_payment_ids)
-                        unpaid_invoices = invoices.filtered(
-                            lambda x: not x.reconciled_payment_ids.filtered('move_id') and x.amount_residual)
-
-                        if paid_invoices:
-                            move_line_total_amount, currency_ids, paid_move_lines = self.get_paid_move_line_amount(
-                                statement_line, paid_invoices)
-
-                        if unpaid_invoices and not paid_move_lines:
+                with self.env.cr.savepoint():
+                    if statement_line.shopify_transaction_type in ["charge", "refund", "payment_refund"]:
+                        payout_transaction = statement_line.payout_line_id
+                        exact_payment = self.find_payment_for_payout_transaction(payout_transaction)
+                        if exact_payment and exact_payment.move_id:
+                            move_line_total_amount, currency_ids, paid_move_lines = \
+                                self.get_payment_move_line_amount(statement_line, exact_payment)
+                        elif exact_payment:
+                            # Odoo 18 payments without outstanding accounts may have
+                            # no journal entry. Reconcile their open invoice instead.
+                            move_type = 'out_refund' if statement_line.amount < 0 else 'out_invoice'
+                            invoices = exact_payment.invoice_ids.filtered(
+                                lambda move: move.state == 'posted' and move.move_type == move_type)
                             move_line_total_amount, currency_ids, move_line_data = self.get_unpaid_move_line_data(
-                                statement_line, unpaid_invoices)
+                                statement_line, invoices)
+                        else:
+                            invoices = self.get_invoices_for_reconcile(statement_line)
+                            if not invoices:
+                                continue
 
-                    log_line = self.reconcile_invoice_refund(statement_line, move_line_total_amount, currency_ids,
-                                                             move_line_data, paid_move_lines, log_lines)
-                else:
-                    log_line = self.reconcile_other_transactions(statement_line, move_line_data, log_lines)
-                # if log_line:
-                #     log_lines.append(log_line)
+                            paid_invoices = invoices.filtered(lambda x: x.reconciled_payment_ids)
+                            unpaid_invoices = invoices.filtered(
+                                lambda x: not x.reconciled_payment_ids.filtered('move_id') and x.amount_residual)
+
+                            if paid_invoices:
+                                move_line_total_amount, currency_ids, paid_move_lines = self.get_paid_move_line_amount(
+                                    statement_line, paid_invoices)
+
+                            if unpaid_invoices and not paid_move_lines:
+                                move_line_total_amount, currency_ids, move_line_data = self.get_unpaid_move_line_data(
+                                    statement_line, unpaid_invoices)
+
+                        log_line = self.reconcile_invoice_refund(statement_line, move_line_total_amount, currency_ids,
+                                                                 move_line_data, paid_move_lines, log_lines)
+                    else:
+                        log_line = self.reconcile_other_transactions(statement_line, move_line_data, log_lines)
+                    # if log_line:
+                    #     log_lines.append(log_line)
+            except OperationalError:
+                raise
             except Exception as error:
                 if self._context.get("cron_process"):
                     message = ("System tried to automatically reconcile but encountered an error while processing the statement line: %s \n"

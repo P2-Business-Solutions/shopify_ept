@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # See LICENSE file for full copyright and licensing details.
 
-from odoo import models, fields, api
+from odoo import models, fields
 
 
 class AccountBankStatementLine(models.Model):
@@ -30,16 +30,13 @@ class AccountBankStatementLine(models.Model):
                                                  ],
                                                 help="The type of the balance transaction",
                                                 string="Balance Transaction Type")
-    payout_id = fields.Many2one('shopify.payout.report.ept', string="Payout ID", ondelete="cascade")
-    payout_line_id = fields.Many2one('shopify.payout.report.line.ept', string="Payout line ID", ondelete="cascade")
+    payout_id = fields.Many2one('shopify.payout.report.ept', string="Payout ID", ondelete="cascade", index=True)
+    payout_line_id = fields.Many2one('shopify.payout.report.line.ept', string="Payout line ID", ondelete="cascade", index=True)
 
     def write(self, vals):
-        # OVERRIDE
-        if self.shopify_instance_id:
-            if 'to_check' in vals and not vals.get('to_check'):
-                payout_transaction = self.env['shopify.payout.report.line.ept'].search(
-                    [('transaction_id', '=', self.shopify_transaction_id)], limit=1)
-                if payout_transaction and payout_transaction.payout_id.state == "validated":
-                    payout_transaction.payout_id.state = "partially_processed"
         res = super(AccountBankStatementLine, self).write(vals)
+        if 'checked' in vals and not vals['checked']:
+            self.payout_id.filtered(lambda payout: payout.state == 'validated').write({
+                'state': 'partially_processed',
+            })
         return res

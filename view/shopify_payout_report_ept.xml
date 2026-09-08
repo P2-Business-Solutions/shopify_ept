@@ -13,9 +13,11 @@
                 <field name="statement_id"/>
                 <field name="payout_transaction_ids" string="Shopify Order ID" filter_domain="[('payout_transaction_ids.source_order_id', '=', self)]"/>
                 <filter name="remaining_reports" string="Remaining Reports"
-                        domain="['|', ('state', '!=', 'validated'), ('settlement_line_id.reconciled', '=', False)]"/>
+                        domain="['|', ('state', '!=', 'validated'), ('settlement_status', '!=', 'matched')]"/>
                 <filter name="awaiting_bank" string="Awaiting Bank Match"
-                        domain="[('settlement_move_id', '!=', False), ('settlement_line_id.reconciled', '=', False)]"/>
+                        domain="[('settlement_status', 'in', ['pending', 'partial'])]"/>
+                <filter name="settlement_review" string="Settlement Needs Review"
+                        domain="[('settlement_status', '=', 'review')]"/>
                 <filter name="missing_settlement" string="No Settlement Transfer"
                         domain="[('state', '=', 'validated'), ('settlement_move_id', '=', False)]"/>
                 <group expand="0" string="Group By...">

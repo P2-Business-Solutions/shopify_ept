@@ -8,7 +8,7 @@ class ShopifyPayoutReportLineEpt(models.Model):
     _description = "Shopify Payout Report Line"
     _rec_name = "transaction_id"
 
-    payout_id = fields.Many2one('shopify.payout.report.ept', string="Payout ID", ondelete="cascade")
+    payout_id = fields.Many2one('shopify.payout.report.ept', string="Payout ID", ondelete="cascade", index=True)
     transaction_id = fields.Char(string="Transaction ID", help="The unique identifier of the transaction.", index=True)
     source_id = fields.Char(
         string="Source ID",

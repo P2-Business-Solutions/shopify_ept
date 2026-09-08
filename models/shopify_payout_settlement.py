@@ -9,20 +9,20 @@ class ShopifyPayoutSettlement(models.Model):
 
     settlement_move_id = fields.Many2one(
         'account.move', string='Settlement Entry', readonly=True,
-        copy=False, ondelete='restrict')
+        copy=False, ondelete='restrict', index=True)
     settlement_line_id = fields.Many2one(
         'account.move.line', string='Settlement Journal Item', readonly=True,
-        copy=False, ondelete='restrict')
+        copy=False, ondelete='restrict', index=True)
     settlement_bank_journal_id = fields.Many2one(
         'account.journal', string='Receiving Bank', readonly=True, copy=False)
     settlement_status = fields.Selection([
         ('not_created', 'Not Created'), ('pending', 'Awaiting Bank Match'),
         ('partial', 'Partially Matched'), ('matched', 'Bank Matched'),
         ('review', 'Needs Review'),
-    ], compute='_compute_settlement_status', string='Bank Settlement')
+    ], compute='_compute_settlement_status', string='Bank Settlement', store=True, index=True)
     settlement_bank_line_ids = fields.Many2many(
         'account.bank.statement.line', compute='_compute_settlement_status',
-        string='Matched Bank Transactions')
+        string='Matched Bank Transactions', store=True)
     payout_statement_line_ids = fields.One2many(
         'account.bank.statement.line', 'payout_id', readonly=True)
 
@@ -35,7 +35,16 @@ class ShopifyPayoutSettlement(models.Model):
         'settlement_line_id.matched_credit_ids.credit_move_id.move_id.state',
         'settlement_line_id.matched_debit_ids.debit_move_id.move_id.statement_line_id.is_reconciled',
         'settlement_line_id.matched_credit_ids.credit_move_id.move_id.statement_line_id.is_reconciled',
-        'payout_statement_line_ids.is_reconciled', 'payout_statement_line_ids.to_check',
+        'settlement_line_id.matched_debit_ids.debit_move_id.move_id.checked',
+        'settlement_line_id.matched_credit_ids.credit_move_id.move_id.checked',
+        'settlement_line_id.matched_debit_ids.credit_amount_currency',
+        'settlement_line_id.matched_credit_ids.debit_amount_currency',
+        'settlement_line_id.matched_debit_ids.debit_move_id.move_id.journal_id',
+        'settlement_line_id.matched_credit_ids.credit_move_id.move_id.journal_id',
+        'settlement_line_id.matched_debit_ids.debit_move_id.move_id.statement_line_id.payout_id',
+        'settlement_line_id.matched_credit_ids.credit_move_id.move_id.statement_line_id.payout_id',
+        'settlement_line_id.currency_id.rounding',
+        'payout_statement_line_ids.is_reconciled', 'payout_statement_line_ids.move_id.checked',
         'payout_statement_line_ids.move_id.state',
     )
     def _compute_settlement_status(self):
@@ -49,7 +58,7 @@ class ShopifyPayoutSettlement(models.Model):
                 bank_line = other.move_id.statement_line_id
                 if (bank_line and bank_line.journal_id == payout.settlement_bank_journal_id
                         and bank_line.move_id.state == 'posted'
-                        and bank_line.payout_id != payout):
+                        and not bank_line.payout_id):
                     bank_lines |= bank_line
                     bank_amount += (partial.debit_amount_currency if is_debit
                                     else partial.credit_amount_currency)
@@ -60,8 +69,9 @@ class ShopifyPayoutSettlement(models.Model):
             elif (move.state != 'posted' or not line
                   or not payout.payout_statement_line_ids
                   or payout.payout_statement_line_ids.filtered(
-                      lambda statement: not statement.is_reconciled or statement.to_check
+                      lambda statement: not statement.is_reconciled or not statement.move_id.checked
                       or statement.move_id.state != 'posted')
+                  or bank_lines.filtered(lambda statement: not statement.move_id.checked)
                   or move.reversal_move_ids.filtered(lambda reverse: reverse.state == 'posted')):
                 payout.settlement_status = 'review'
             elif (line.reconciled and bank_lines
@@ -115,7 +125,8 @@ class ShopifyPayoutSettlement(models.Model):
                 raise UserError(_('A payout transaction has an inconsistent type or currency.'))
         if statements.filtered(lambda row: row.payout_line_id not in self.payout_transaction_ids):
             raise UserError(_('The payout contains statement lines without a matching payout transaction.'))
-        if statements.filtered(lambda row: not row.is_reconciled or row.move_id.state != 'posted' or row.to_check):
+        if statements.filtered(
+                lambda row: not row.is_reconciled or row.move_id.state != 'posted' or not row.move_id.checked):
             raise UserError(_('Reconcile and review every payout statement line before creating a settlement transfer.'))
         source = self.check_journal_and_currency()
         if not source or statements.filtered(lambda row: row.journal_id != source):
