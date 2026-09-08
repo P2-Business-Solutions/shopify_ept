@@ -31,6 +31,7 @@ from . import shopify_product_image_ept
 from . import webhook_ept
 from . import shopify_payout_report_line_ept
 from . import shopify_payout_report_ept
+from . import shopify_payout_settlement
 from . import shopify_payout_account_config
 from . import account_bank_statement
 from . import account_bank_statement_line

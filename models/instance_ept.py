@@ -276,6 +276,19 @@ class ShopifyInstanceEpt(models.Model):
                                            string="Transaction Line")
     shopify_settlement_report_journal_id = fields.Many2one('account.journal',
                                                            string='Payout Report Journal')
+    shopify_payout_bank_journal_id = fields.Many2one(
+        'account.journal', string='Receiving Bank Journal',
+        domain="[('type', '=', 'bank'), ('company_id', '=', shopify_company_id)]")
+    shopify_payout_transfer_journal_id = fields.Many2one(
+        'account.journal', string='Settlement Transfer Journal',
+        domain="[('type', '=', 'general'), ('company_id', '=', shopify_company_id)]")
+    shopify_payout_transit_account_id = fields.Many2one(
+        'account.account', string='Payouts in Transit Account',
+        domain="[('account_type', '=', 'asset_current'), ('reconcile', '=', True), ('deprecated', '=', False), ('company_ids', 'in', [shopify_company_id])]",
+        help='A dedicated reconcilable current asset account, also configured as an outstanding receipts/payments account on the receiving bank journal. Match the real bank deposit against its open settlement entry.')
+    shopify_auto_settlement_transfer = fields.Boolean(
+        string='Automatically Create Settlement Transfers',
+        help='Post one net transfer after all payout transactions reconcile and agree to the Shopify payout amount.')
     payout_last_import_date = fields.Date(string="Last Date of Payout Import")
     last_shipped_order_import_date = fields.Datetime(string="Last Date Of Shipped Order Import",
                                                      help="Last date of sync orders from Shopify to Odoo")

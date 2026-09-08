@@ -210,6 +210,17 @@
                             </field>
                         </page>
                         <page string="Payout Configurations" name="payout_configurations">
+                            <group string="Net Settlement Transfers">
+                                <field name="shopify_settlement_report_journal_id"/>
+                                <field name="shopify_payout_bank_journal_id"/>
+                                <field name="shopify_payout_transfer_journal_id"/>
+                                <field name="shopify_payout_transit_account_id"/>
+                                <field name="shopify_auto_settlement_transfer"/>
+                            </group>
+                            <p>After reconciling the payout transactions, create one net settlement entry.
+                                In the receiving bank journal, match the deposit to that existing entry using
+                                its Shopify payout reference. Use the same transit account for any imported
+                                transaction of type Payout.</p>
                             <div class="alert alert-warning" role="alert">
                                 <div style="padding:5px;">
                                     <h5 style="color:#7d5a29;">

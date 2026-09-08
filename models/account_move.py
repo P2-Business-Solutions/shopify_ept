@@ -14,6 +14,20 @@ class AccountMove(models.Model):
                                           help="True: Refunded credit note amount in shopify store.\n False: "
                                                "Remaining to refund in Shopify Store")
     shopify_instance_id = fields.Many2one("shopify.instance.ept", "Instances")
+    shopify_settlement_payout_id = fields.Many2one(
+        'shopify.payout.report.ept', string='Shopify Settlement Payout',
+        copy=False, readonly=True, index=True, ondelete='restrict')
+    shopify_settlement_instance_id = fields.Many2one(
+        'shopify.instance.ept', copy=False, readonly=True, ondelete='restrict')
+    shopify_settlement_reference = fields.Char(copy=False, readonly=True)
+
+    _sql_constraints = [
+        ('shopify_settlement_payout_unique', 'unique(shopify_settlement_payout_id)',
+         'Only one settlement entry can be linked to a Shopify payout.'),
+        ('shopify_settlement_reference_unique',
+         'unique(shopify_settlement_instance_id, shopify_settlement_reference)',
+         'This Shopify payout reference already has a settlement entry for this instance.'),
+    ]
     shopify_refund_id = fields.Char(help="Id of shopify refund.", copy=False)
     is_shopify_multi_payment = fields.Boolean("Multi Payments?", default=False, copy=False,
                                               help="It is used to identify that order has multi-payment gateway or not")

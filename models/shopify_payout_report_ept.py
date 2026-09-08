@@ -73,7 +73,7 @@ class ShopifyPaymentReportEpt(models.Model):
             _logger.info(message)
             return False
 
-        payouts = self.create_payout_reports(payout_reports, instance)
+        payouts = self.create_payout_reports(self.shopify_list_all_transactions(payout_reports), instance)
         payouts = payouts.sorted(key=lambda x: x.id, reverse=True)
 
         self._cr.commit()
@@ -122,23 +122,22 @@ class ShopifyPaymentReportEpt(models.Model):
         shopify_payout_report_line_obj = self.env['shopify.payout.report.line.ept']
 
         transaction_all = shopify.Transactions().find(payout_id=self.payout_reference_id, limit=250)
-        if len(transaction_all) == 250:
-            transaction_all = self.shopify_list_all_transactions(transaction_all)
+        transaction_all = self.shopify_list_all_transactions(transaction_all)
         for transaction in transaction_all:
             transaction_data = transaction.to_dict()
             transaction_vals = self.prepare_transaction_vals(transaction_data, self.instance_id)
             shopify_payout_report_line_obj.create(transaction_vals)
 
-        # Create fees line
-        fees_amount = float(payout_data.get('summary').get('charges_fee_amount', 0.0)) + float(
-            payout_data.get('summary').get('refunds_fee_amount', 0.0)) + float(
-            payout_data.get('summary').get('adjustments_fee_amount', 0.0))
+        # Use the fees on the canonical balance transactions, including reserve
+        # and retried-payout fees that are absent from the old summary subset.
+        fees_amount = sum(self.payout_transaction_ids.mapped('fee'))
         shopify_payout_report_line_obj.create({
             'payout_id': self.id or False,
             'transaction_type': 'fees',
             'amount': -fees_amount,
             'fee': 0.0,
-            'net_amount': fees_amount,
+            'net_amount': -fees_amount,
+            'currency_id': self.currency_id.id,
             'is_remaining_statement': True
         })
         _logger.info("Transaction lines are added for %s.", self.payout_reference_id)
@@ -150,8 +149,7 @@ class ShopifyPaymentReportEpt(models.Model):
         transactions = shopify.Transactions().find(
             payout_id=self.payout_reference_id, limit=250
         )
-        if len(transactions) == 250:
-            transactions = self.shopify_list_all_transactions(transactions)
+        transactions = self.shopify_list_all_transactions(transactions)
         existing_lines = {
             line.transaction_id: line
             for line in self.payout_transaction_ids.filtered("transaction_id")
@@ -182,36 +180,18 @@ class ShopifyPaymentReportEpt(models.Model):
         return True
 
     def shopify_list_all_transactions(self, result):
-        """
-           This method used to call the page wise data import for payout report transactions from Shopify to Odoo.
-           @param : self, result
-           @author: Meera Sidapara @Emipro Technologies Pvt. Ltd on date 15/02/2022.
-       """
-        transactions_list = []
-        catch = ""
-        while result:
-            link = shopify.ShopifyResource.connection.response.headers.get(
-                "Link") if shopify.ShopifyResource.connection.response.headers.get(
-                "Link") else shopify.ShopifyResource.connection.response.headers.get("link")
-            if not link or not isinstance(link, str):
-                return transactions_list
-            page_info = ""
-            transactions_list += result
-            for page_link in link.split(","):
-                if page_link.find("next") > 0:
-                    page_info = page_link.split(";")[0].strip("<>").split("page_info=")[1]
-                    try:
-                        result = shopify.Transactions().find(page_info=page_info, limit=250)
-                    except ClientError as error:
-                        if hasattr(error, "response"):
-                            if error.response.code == 429 and error.response.msg == "Too Many Requests":
-                                time.sleep(int(float(error.response.headers.get('Retry-After', 5))))
-                                result = shopify.Transactions().find(page_info=page_info, limit=250)
-                    except Exception as error:
-                        raise UserError(error)
-            if catch == page_info:
-                break
-        return transactions_list
+        """Follow collection-owned links and retain the first and final pages."""
+        rows = list(result)
+        while hasattr(result, 'has_next_page') and result.has_next_page():
+            try:
+                result = result.next_page(no_cache=True)
+            except ClientError as error:
+                if not hasattr(error, 'response') or error.response.code != 429:
+                    raise
+                time.sleep(int(float(error.response.headers.get('Retry-After', 5))))
+                result = result.next_page(no_cache=True)
+            rows.extend(result)
+        return rows
 
     def prepare_transaction_vals(self, data, instance):
         """
@@ -434,6 +414,9 @@ class ShopifyPaymentReportEpt(models.Model):
                 )[:1]
             else:
                 domain, invoice, log_line = self.check_for_invoice_refund(transaction, log_lines)
+                # An ambiguous invoice is not suitable for statement metadata.
+                if len(invoice) != 1:
+                    invoice = self.env['account.move']
                 if domain:
                     payment_reference = account_payment_obj.search(domain, limit=1)
                     reference = payment_reference.name if payment_reference else invoice.name or ''
@@ -488,40 +471,42 @@ class ShopifyPaymentReportEpt(models.Model):
         return True
 
     def find_payment_for_payout_transaction(self, transaction):
-        """Find the one Odoo payment identified by Shopify's order transaction."""
+        """Match a charge or refund independently, including across payout dates."""
+        payment_obj = self.env['account.payment']
+        if not transaction or transaction.transaction_type not in ('charge', 'refund', 'payment_refund'):
+            return payment_obj
         transaction_id = transaction.source_order_transaction_id
-        if not transaction_id:
-            return self.env["account.payment"]
-        payment_obj = self.env["account.payment"]
-        payment = payment_obj.search([
-            ('shopify_instance_id', '=', self.instance_id.id),
-            ('shopify_order_transaction_id', '=', transaction_id),
-            ('state', 'not in', ('draft', 'canceled')),
-        ], limit=1)
+        payment_type = 'inbound' if transaction.transaction_type == 'charge' else 'outbound'
+        payment = payment_obj
+        if transaction_id:
+            payment = payment_obj.search([
+                ('shopify_instance_id', '=', self.instance_id.id),
+                ('shopify_order_transaction_id', '=', transaction_id),
+                ('company_id', '=', self.instance_id.shopify_company_id.id),
+                ('payment_type', '=', payment_type),
+                ('state', 'not in', ('draft', 'canceled', 'rejected')),
+            ], limit=1)
         if payment or not transaction.order_id:
             return payment
-
-        move_type = "out_invoice" if transaction.transaction_type == "charge" else "out_refund"
-        payment_type = "inbound" if transaction.transaction_type == "charge" else "outbound"
+        move_type = 'out_invoice' if payment_type == 'inbound' else 'out_refund'
         invoices = transaction.order_id.invoice_ids.filtered(
-            lambda move: move.state == "posted" and move.move_type == move_type
-        )
-        references = invoices.mapped("payment_reference")
-        if not references:
-            return payment
-        candidates = payment_obj.search([
-            ('shopify_order_transaction_id', '=', False),
-            ('company_id', '=', self.instance_id.shopify_company_id.id),
-            ('amount', '=', abs(transaction.amount)),
-            ('payment_type', '=', payment_type),
-            ('memo', 'in', references),
-            ('state', 'not in', ('draft', 'canceled')),
-        ])
+            lambda move: move.state == 'posted' and move.move_type == move_type)
+        # Invoice payment_state may become "reversed" after a later refund.
+        # The original incoming payment still belongs to its original payout.
+        candidates = invoices.reconciled_payment_ids.filtered(
+            lambda item: item.payment_type == payment_type
+            and item.state not in ('draft', 'canceled', 'rejected')
+            and item.company_id == self.instance_id.shopify_company_id
+            and item.currency_id == self.currency_id
+            and (not item.shopify_instance_id or item.shopify_instance_id == self.instance_id)
+            and (not transaction_id or not item.shopify_order_transaction_id)
+            and self.currency_id.compare_amounts(item.amount, abs(transaction.amount)) == 0)
         if len(candidates) == 1:
-            candidates.write({
-                'shopify_instance_id': self.instance_id.id,
-                'shopify_order_transaction_id': transaction_id,
-            })
+            if transaction_id:
+                candidates.write({
+                    'shopify_instance_id': self.instance_id.id,
+                    'shopify_order_transaction_id': transaction_id,
+                })
             return candidates
         return payment
 
@@ -648,167 +633,83 @@ class ShopifyPaymentReportEpt(models.Model):
         return currency, amount_currency
 
     def get_invoices_for_reconcile(self, statement_line):
-        """
-        This method gets invoices for reconciling the bank statement.
-        @param statement_line: Record of bank statement line.
-        @author: Maulik Barad on Date 07-Dec-2020.
-        """
-        log_line = []
-        shopify_payout_report_line_obj = self.env['shopify.payout.report.line.ept']
-        sale_order_obj = self.env['sale.order']
-        shopify_payout_report_line_id = shopify_payout_report_line_obj.search(
-            [('transaction_id', '=', statement_line.shopify_transaction_id)])
-        if not shopify_payout_report_line_id.order_id:
-            sale_order_id = sale_order_obj.search(
-                ['|', ('shopify_order_id', '=', shopify_payout_report_line_id.source_order_id),
-                 ('name', '=', statement_line.payment_ref), ('shopify_instance_id', '=', self.instance_id.id)], limit=1)
-            shopify_payout_report_line_id.write({'order_id': sale_order_id.id})
-            statement_line.write({'sale_order_id': sale_order_id.id})
-        sale_order_id = shopify_payout_report_line_id.order_id
-        if sale_order_id:
-            domain, invoice, log_line = self.check_for_invoice_refund(shopify_payout_report_line_id, log_line)
-            if invoice and invoice.move_type == "out_refund":
-                statement_line.update({"refund_invoice_id": invoice.id})
-        order = statement_line.sale_order_id
-        if order and not shopify_payout_report_line_id:
-            shopify_payout_report_line_id = shopify_payout_report_line_obj.search(
-                [('transaction_id', '=', statement_line.shopify_transaction_id)])
-        if shopify_payout_report_line_id and shopify_payout_report_line_id.transaction_type == 'refund' \
-                and not statement_line.refund_invoice_id:
-            invoices = self.env['account.move'].search(
-                [('shopify_instance_id', '=', self.instance_id.id), ('invoice_origin', '=', order.name),
-                 ('move_type', '=', 'out_refund'), ('amount_total', '=', abs(statement_line.amount))])
-            return invoices
-        if statement_line.refund_invoice_id:
-            invoices = statement_line.refund_invoice_id
-        else:
-            invoices = order.invoice_ids.filtered(lambda x: x.move_type == 'out_invoice' and x.state in ['posted'])
+        """Resolve only this payout's order and the correct invoice direction."""
+        transaction = statement_line.payout_line_id
+        if not transaction:
+            return self.env['account.move']
+        order = transaction.order_id
+        if not order and transaction.source_order_id:
+            order = self.env['sale.order'].search([
+                ('shopify_order_id', '=', transaction.source_order_id),
+                ('shopify_instance_id', '=', self.instance_id.id),
+            ], limit=1)
+            transaction.order_id = order
+        if not order:
+            return self.env['account.move']
+        statement_line.sale_order_id = order
+        is_refund = transaction.transaction_type in ('refund', 'payment_refund')
+        move_type = 'out_refund' if is_refund else 'out_invoice'
+        invoices = order.invoice_ids.filtered(lambda move: move.state == 'posted' and move.move_type == move_type)
+        if is_refund and not invoices:
+            self.check_for_invoice_refund(transaction, [])
+            invoices = order.invoice_ids.filtered(lambda move: move.state == 'posted' and move.move_type == move_type)
+        if is_refund and len(invoices) == 1:
+            statement_line.refund_invoice_id = invoices
         return invoices
 
     def get_paid_move_line_amount(self, statement_line, paid_invoices):
-        """
-        This method is used to get the total paid amount of the Order for given statement line.
-        @param statement_line: Record of the statement line.
-        @param paid_invoices: Recordset of Paid Invoices.
-        @author: Maulik Barad on Date 09-Dec-2020.
-        """
-        move_line_total_amount = 0.0
-        currency_ids = []
-        if statement_line.refund_invoice_id:
-            payment_id = paid_invoices.line_ids.matched_debit_ids.debit_move_id.payment_id
-            paid_move_lines = payment_id.move_id.line_ids.filtered(lambda x: not float_is_zero(x.credit, precision_digits=2))
-            if not paid_move_lines:
-                paid_move_lines = payment_id.invoice_ids.line_ids.filtered(
-                    lambda x: not float_is_zero(x.credit, precision_digits=2) and x.account_type == 'asset_receivable')
-        else:
-            payment_id = paid_invoices.line_ids.matched_credit_ids.credit_move_id.payment_id
-            paid_move_lines = payment_id.move_id.line_ids.filtered(lambda x: not float_is_zero(x.debit, precision_digits=2))
-            if not paid_move_lines:
-                paid_move_lines = payment_id.invoice_ids.line_ids.filtered(
-                    lambda x: not float_is_zero(x.debit, precision_digits=2) and x.account_type == 'asset_receivable')
+        """Never net an order's incoming payment against its later refund."""
+        payment_type = 'outbound' if statement_line.amount < 0 else 'inbound'
+        candidates = []
+        for payment in paid_invoices.reconciled_payment_ids.filtered(
+                lambda payment: payment.payment_type == payment_type
+                and payment.company_id == self.instance_id.shopify_company_id
+                and (not payment.shopify_instance_id or payment.shopify_instance_id == self.instance_id)
+                and (not statement_line.shopify_order_transaction_id
+                     or not payment.shopify_order_transaction_id
+                     or payment.shopify_order_transaction_id == statement_line.shopify_order_transaction_id)):
+            data = self.get_payment_move_line_amount(statement_line, payment)
+            if data[2] and self.currency_id.compare_amounts(data[0], statement_line.amount) == 0:
+                candidates.append(data)
+        return candidates[0] if len(candidates) == 1 else (0.0, [], self.env['account.move.line'])
 
-        for moveline in paid_move_lines:
-            amount = moveline.debit - moveline.credit
-            amount_currency = 0.0
-            if moveline.amount_currency:
-                currency, amount_currency = self.convert_move_amount_currency(statement_line, moveline, amount,
-                                                                              statement_line.date)
-                if currency:
-                    currency_ids.append(currency)
-
-            if amount_currency:
-                amount = amount_currency
-
-            move_line_total_amount += amount
-        return move_line_total_amount, currency_ids, paid_move_lines
+    def _payout_move_line_residual(self, statement_line, line):
+        currency = statement_line.currency_id or self.currency_id
+        if line.currency_id == currency:
+            return line.amount_residual_currency
+        return line.company_currency_id._convert(
+            line.amount_residual, currency, line.company_id, statement_line.date)
 
     def get_payment_move_line_amount(self, statement_line, payment):
-        """Get only the liquidity/outstanding line for one exact Shopify payment."""
-        if statement_line.amount < 0:
-            payment_lines = payment.move_id.line_ids.filtered(
-                lambda line: not float_is_zero(line.credit, precision_digits=2)
-                and line.account_type not in ('asset_receivable', 'liability_payable')
-            )
-            if not payment_lines:
-                payment_lines = payment.move_id.line_ids.filtered(
-                    lambda line: not float_is_zero(line.credit, precision_digits=2)
-                )
-        else:
-            payment_lines = payment.move_id.line_ids.filtered(
-                lambda line: not float_is_zero(line.debit, precision_digits=2)
-                and line.account_type not in ('asset_receivable', 'liability_payable')
-            )
-            if not payment_lines:
-                payment_lines = payment.move_id.line_ids.filtered(
-                    lambda line: not float_is_zero(line.debit, precision_digits=2)
-                )
-
-        total_amount = 0.0
-        currency_ids = []
-        for move_line in payment_lines:
-            amount = move_line.debit - move_line.credit
-            if move_line.amount_currency:
-                currency, amount_currency = self.convert_move_amount_currency(
-                    statement_line, move_line, amount, statement_line.date
-                )
-                if currency:
-                    currency_ids.append(currency)
-                if amount_currency:
-                    amount = amount_currency
-            total_amount += amount
-        return total_amount, currency_ids, payment_lines
+        """Use only the open liquidity/outstanding items of this payment."""
+        liquidity, _counterpart, _writeoffs = payment._seek_for_lines()
+        lines = liquidity.filtered(lambda line: line.move_id.state == 'posted'
+                                   and line.account_id.reconcile and not line.reconciled
+                                   and line.balance * statement_line.amount > 0)
+        total = sum(self._payout_move_line_residual(statement_line, line) for line in lines)
+        return total, [self.currency_id.id] if lines else [], lines
 
     def get_unpaid_move_line_data(self, statement_line, unpaid_invoices):
-        """
-        This method is used to gather the data of move lines that are remain to register payment.
-        @param statement_line: Record of the statement line.
-        @param unpaid_invoices: Recordset of Unpaid Invoices.
-        @author: Maulik Barad on Date 09-Dec-2020.
-        """
-        move_line_data = []
-        move_line_total_amount = 0.0
-        currency_ids = []
-        move_lines = unpaid_invoices.line_ids.filtered(
-            lambda l: l.account_id.account_type == 'asset_receivable' and not l.reconciled)
-        for moveline in move_lines:
-            amount = moveline.debit - moveline.credit
-            amount_currency = 0.0
-            if moveline.amount_currency:
-                currency, amount_currency = self.convert_move_amount_currency(statement_line, moveline, amount,
-                                                                              statement_line.date)
-                if currency:
-                    currency_ids.append(currency)
-
-            if amount_currency:
-                amount = amount_currency
-            move_line_data.append({
-                'name': moveline.move_id.name,
-                'id': moveline.id,
-                'balance': -amount,
-                'currency_id': moveline.currency_id.id,
-            })
-            move_line_total_amount += amount
-        return move_line_total_amount, currency_ids, move_line_data
+        lines = unpaid_invoices.line_ids.filtered(
+            lambda line: line.account_type == 'asset_receivable' and not line.reconciled
+            and line.balance * statement_line.amount > 0)
+        data = []
+        total = 0.0
+        for line in lines:
+            amount = self._payout_move_line_residual(statement_line, line)
+            data.append({'id': line.id, 'balance': -amount, 'currency_id': line.currency_id.id})
+            total += amount
+        return total, [self.currency_id.id] if lines else [], data
 
     def reconcile_invoice_refund(self, statement_line, move_line_total_amount, currency_ids, move_line_data,
                                  paid_move_lines, log_lines):
-        if round(statement_line.amount, 10) == round(move_line_total_amount, 10) and (
-                not statement_line.currency_id or statement_line.currency_id.id == self.currency_id.id):
-            if currency_ids:
-                currency_ids = list(set(currency_ids))
-                if len(currency_ids) == 1:
-                    statement_currency = statement_line.journal_id.currency_id if \
-                        statement_line.journal_id.currency_id else statement_line.company_id.currency_id
-                    if not currency_ids[0] == statement_currency.id:
-                        vals = {'currency_id': currency_ids[0]}
-                        statement_line.write(vals)
+        if self.currency_id.compare_amounts(statement_line.amount, move_line_total_amount) == 0:
             try:
-                if move_line_data:
-                    data = move_line_data[0]
-                    move_line_id = data.get('id', False)
-                    self.shopify_reconcile_bank_statement_line_ept(statement_line.id, move_line_id)
-                for payment_line in paid_move_lines:
-                    self.shopify_reconcile_bank_statement_line_ept(statement_line.id, payment_line.id)
+                move_line_ids = [data['id'] for data in move_line_data]
+                move_line_ids.extend(line.id for line in paid_move_lines)
+                if move_line_ids:
+                    with self.env.cr.savepoint():
+                        self.shopify_reconcile_bank_statement_line_ept(statement_line.id, move_line_ids)
             except Exception as error:
                 message = ("System tried to automatically reconcile but encountered an error while processing the statement line: %s \n"
 							"Action Items:\n"
@@ -821,6 +722,15 @@ class ShopifyPaymentReportEpt(models.Model):
                 log_lines.append({"message": message,
                                   "shopify_payout_report_line_id": transaction_line.id})
                 #statement_line.button_undo_reconciliation()
+        else:
+            log_lines.append({
+                'message': _('Payout transaction %(transaction)s is %(amount)s, but its available payment/refund '
+                             'balance is %(available)s. Match the original charge and any later refund separately; '
+                             'review missing or already reconciled payments.',
+                             transaction=statement_line.shopify_transaction_id,
+                             amount=statement_line.amount, available=move_line_total_amount),
+                'shopify_payout_report_line_id': statement_line.payout_line_id.id,
+            })
         return log_lines
 
     def shopify_reconcile_bank_statement_line_ept(self, statement_line_id, move_line_id):
@@ -881,11 +791,9 @@ class ShopifyPaymentReportEpt(models.Model):
         """
         statement_line_obj = self.env['account.bank.statement.line']
         log_lines = []
-        commit_count = 0
         _logger.info("Processing Bank Statement line of payout : %s.", self.name)
         statement_lines = statement_line_obj.search([('payout_id', '=', self.id)])
         for statement_line in statement_lines.filtered(lambda x: not x.is_reconciled):
-            commit_count += 1
             move_line_data = []
             move_line_total_amount = 0.0
             currency_ids = []
@@ -894,22 +802,31 @@ class ShopifyPaymentReportEpt(models.Model):
                 if statement_line.shopify_transaction_type in ["charge", "refund", "payment_refund"]:
                     payout_transaction = statement_line.payout_line_id
                     exact_payment = self.find_payment_for_payout_transaction(payout_transaction)
-                    if exact_payment:
+                    if exact_payment and exact_payment.move_id:
                         move_line_total_amount, currency_ids, paid_move_lines = \
                             self.get_payment_move_line_amount(statement_line, exact_payment)
+                    elif exact_payment:
+                        # Odoo 18 payments without outstanding accounts may have
+                        # no journal entry. Reconcile their open invoice instead.
+                        move_type = 'out_refund' if statement_line.amount < 0 else 'out_invoice'
+                        invoices = exact_payment.invoice_ids.filtered(
+                            lambda move: move.state == 'posted' and move.move_type == move_type)
+                        move_line_total_amount, currency_ids, move_line_data = self.get_unpaid_move_line_data(
+                            statement_line, invoices)
                     else:
                         invoices = self.get_invoices_for_reconcile(statement_line)
                         if not invoices:
                             continue
 
-                        paid_invoices = invoices.filtered(lambda x: x.payment_state in ['paid', 'in_payment'])
-                        unpaid_invoices = invoices.filtered(lambda x: x.payment_state == 'not_paid')
+                        paid_invoices = invoices.filtered(lambda x: x.reconciled_payment_ids)
+                        unpaid_invoices = invoices.filtered(
+                            lambda x: not x.reconciled_payment_ids.filtered('move_id') and x.amount_residual)
 
                         if paid_invoices:
                             move_line_total_amount, currency_ids, paid_move_lines = self.get_paid_move_line_amount(
                                 statement_line, paid_invoices)
 
-                        if unpaid_invoices:
+                        if unpaid_invoices and not paid_move_lines:
                             move_line_total_amount, currency_ids, move_line_data = self.get_unpaid_move_line_data(
                                 statement_line, unpaid_invoices)
 
@@ -933,9 +850,6 @@ class ShopifyPaymentReportEpt(models.Model):
                                       "shopify_payout_report_line_id": transaction_line.id})
                 else:
                     raise UserError(error)
-            if commit_count >= 20:
-                self._cr.commit()
-                commit_count = 0
         if log_lines:
             self.set_payout_log_line(log_lines)
             note = ""
@@ -1032,7 +946,12 @@ class ShopifyPaymentReportEpt(models.Model):
                                                  ("is_skip_from_cron", "=", False)], order="payout_date asc")
                 for generated_report in generated_reports:
                     _logger.info("===== Auto Process Bank Statement:%s =====", generated_report.name)
-                    generated_report.with_context(cron_process=True).process_bank_statement()
+                    try:
+                        with self.env.cr.savepoint():
+                            generated_report.with_context(cron_process=True).process_bank_statement()
+                    except UserError as error:
+                        generated_report.message_post(body=str(error))
+                        generated_report.is_skip_from_cron = True
                     self._cr.commit()
         return True
 

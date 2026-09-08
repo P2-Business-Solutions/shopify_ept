@@ -18,7 +18,7 @@ else:
 
 @tagged('post_install', '-at_install')
 @unittest.skipUnless(ODOO_AVAILABLE, 'Odoo test runtime is not available')
-class TestShopifyPayoutGeneration(TransactionCase):
+class PayoutTestCase(TransactionCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -69,12 +69,14 @@ class TestShopifyPayoutGeneration(TransactionCase):
             'payout_date': fields.Date.today(),
             'currency_id': self.env.company.currency_id.id,
             'amount': 97,
+            'payout_status': 'paid',
             'payout_transaction_ids': [
                 Command.create({
                     'transaction_id': reference + '-charge',
                     'transaction_type': 'charge',
                     'source_order_id': reference + '-missing-order',
                     'amount': 100,
+                    'fee': 3,
                     'is_remaining_statement': True,
                 }),
                 Command.create({
@@ -90,6 +92,8 @@ class TestShopifyPayoutGeneration(TransactionCase):
             ('payout_id', 'in', payouts.ids),
         ])
 
+
+class TestShopifyPayoutGeneration(PayoutTestCase):
     def test_bulk_action_generates_multiple_payouts_and_is_repeatable(self):
         payouts = self._payout('bulk-1') | self._payout('bulk-2')
         action = self.env.ref('shopify_ept.action_generate_shopify_payout_statements')
