@@ -186,6 +186,20 @@
         </field>
     </record>
 
+    <record id="action_generate_shopify_payout_statements" model="ir.actions.server">
+        <field name="name">Generate Bank Statement</field>
+        <field name="model_id" ref="model_shopify_payout_report_ept"/>
+        <field name="binding_model_id" ref="model_shopify_payout_report_ept"/>
+        <field name="binding_view_types">list</field>
+        <field name="groups_id" eval="[(4, ref('account.group_account_user'))]"/>
+        <field name="state">code</field>
+        <field name="code">
+if records:
+    records.generate_bank_statement()
+    action = {'type': 'ir.actions.client', 'tag': 'reload'}
+        </field>
+    </record>
+
     <menuitem id="menu_shopify_payout_report" name="Payout Reports"
               parent="shopify_ept.shopify_menu_item_sales"
               groups="account.group_account_user" action="action_shopify_payout_report_ept"

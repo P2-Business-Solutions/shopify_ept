@@ -78,8 +78,7 @@ class ShopifyPaymentReportEpt(models.Model):
 
         self._cr.commit()
         _logger.info("Payout Reports are Created. Generating Bank statement lines...")
-        for payout in payouts:
-            payout.generate_bank_statement()
+        payouts.generate_bank_statement()
 
         instance.write({'payout_last_import_date': end_date})
         _logger.info("Payout Reports are Imported.")
@@ -320,39 +319,69 @@ class ShopifyPaymentReportEpt(models.Model):
         return all_statement_processed
 
     def generate_bank_statement(self):
-        """
-        Use : Using this method user can able to create bank statement.
-        Added by : Deval Jagad
-        Added on : 05/06/2020
-        Task ID : 164126
-        :return: True
-        """
-        journal = self.check_journal_and_currency()
-        if not journal:
-            return False
-        self.create_bank_statement_lines_for_payout_report()
+        """Generate missing statement lines for selected, eligible payouts."""
+        if not self:
+            return True
+        self.check_access('write')
+        self.flush_recordset(['state'])
+        # Serialize generation with imports, scheduled jobs and other users.
+        # Updating the payout below also makes a concurrent stale PostgreSQL
+        # snapshot fail with a serialization error, so Odoo can retry it.
+        self.env.cr.execute(
+            "SELECT id FROM shopify_payout_report_ept "
+            "WHERE id IN %s ORDER BY id FOR UPDATE",
+            [tuple(self.ids)],
+        )
+        self.invalidate_recordset(['state', 'payout_transaction_ids'])
+        success = True
+        for payout in self.sorted('id'):
+            if payout.state not in ('draft', 'partially_generated'):
+                continue
+            journal = payout.check_journal_and_currency()
+            if not journal:
+                success = False
+                continue
+            payout._create_bank_statement_lines_for_payout_report()
 
-        if self.check_process_statement():
-            state = 'generated'
-        else:
-            state = 'partially_generated'
+            if payout.check_process_statement():
+                state = 'generated'
+            else:
+                state = 'partially_generated'
 
-        self.write({'state': state, "is_skip_from_cron": False})
+            payout.write({'state': state, "is_skip_from_cron": False})
 
-        return True
+        return success
 
     def create_bank_statement_lines_for_payout_report(self):
+        """Keep legacy callers on the same locked, idempotent generation path."""
+        return self.generate_bank_statement()
+
+    def _create_bank_statement_lines_for_payout_report(self):
         """
         This method creates bank statement lines from the transaction lines of Payout report.
         @author: Maulik Barad on Date 02-Dec-2020.
         """
+        self.ensure_one()
         partner_obj = self.env['res.partner']
         bank_statement_line_obj = self.env['account.bank.statement.line']
         log_lines = []
         account_payment_obj = self.env['account.payment']
         sale_order_obj = self.env["sale.order"]
 
-        transaction_ids = self.payout_transaction_ids.filtered(lambda line: line.is_remaining_statement)
+        # The relation is authoritative: flags can be stale after an interrupted
+        # import or a manually removed statement line. The caller holds the
+        # payout lock throughout this lookup and all statement-line creation.
+        transactions = self.payout_transaction_ids
+        existing_transactions = bank_statement_line_obj.search([
+            ('payout_line_id', 'in', transactions.ids),
+        ]).mapped('payout_line_id')
+        existing_transactions.filtered('is_remaining_statement').write({
+            'is_remaining_statement': False,
+        })
+        transaction_ids = transactions - existing_transactions
+        transaction_ids.filtered(lambda line: not line.is_remaining_statement).write({
+            'is_remaining_statement': True,
+        })
         for transaction in transaction_ids:
             order_id = transaction.order_id
             if transaction.transaction_type in ['charge', 'refund', 'payment_refund'] and not order_id:
