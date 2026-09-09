@@ -430,30 +430,31 @@
                         <div class="col-12 col-lg-6 o_setting_box" invisible="not refund_order_webhook">
                             <div class="o_setting_left_pane">
                                 <field name="credit_note_register_payment"
-                                       style="margin-left: -0.5em"/>
+                                       invisible="1"/>
                             </div>
                             <div class="o_setting_right_pane">
-                                <label for="credit_note_register_payment"
-                                       string="Would you like to register payment for credit note?"/>
+                                <span class="o_form_label">Shopify Refund Payments</span>
                                 <div class="text-muted">
-                                    If this feature is enabled, the system will automatically register payment for
-                                    credit note.
+                                    Successful Shopify refunds are recorded separately when the order workflow has
+                                    Register Payment enabled. Credit notes are created only when the invoice still
+                                    includes the refunded items. No new refund is sent to Shopify.
                                 </div>
                             </div>
                         </div>
                         <!-- Credit Note Register Payment configuration -->
                         <!-- Payment Journal configuration -->
-                        <div class="col-xs-12 col-md-6 o_setting_box" invisible="not credit_note_register_payment">
+                        <div class="col-xs-12 col-md-6 o_setting_box" invisible="not refund_order_webhook">
                             <div class="o_setting_right_pane">
-                                <label for="credit_note_payment_journal" string="Payment Journal for Credit note"/>
+                                <label for="credit_note_payment_journal" string="Refund Payment Journal"/>
                                 <div class="text-muted">
-                                    Selected Journal will be set in Credit note Payment journal.
+                                    Optional refund journal. Otherwise the charge gateway's payment journal is used.
+                                    Configure a Manual outgoing method with a reconcilable outstanding account.
                                 </div>
                                 <div class="content-group">
                                     <div class="mt16">
                                         <field name="credit_note_payment_journal" class="o_light_label"
                                                widget="selection"
-                                               domain="[('type','in',['cash','bank']),('company_id','=',shopify_company_id)]"
+                                               domain="[('type','=','bank'),('company_id','=',shopify_company_id)]"
                                                options="{'no_create':True,'no_open':True}"/>
                                     </div>
                                 </div>

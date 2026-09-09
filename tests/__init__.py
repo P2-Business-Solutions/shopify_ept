@@ -12,3 +12,5 @@ from . import test_shopify_payout_import
 from . import test_shopify_payout_matching
 from . import test_shopify_product_utils
 from . import test_shopify_transaction_utils
+from . import test_shopify_payment_plan
+from . import test_shopify_cash_sync

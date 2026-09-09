@@ -83,6 +83,15 @@ class TestShopifyPayoutSettlement(PayoutTestCase):
         self.assertEqual(self.env['account.move'].search_count([
             ('shopify_settlement_payout_id', '=', payout.id)]), 1)
 
+    def test_locked_settlement_date_does_not_silently_shift_period(self):
+        payout = self._payout('locked-settlement')
+        self._book_activity(payout)
+        with patch.object(type(self.env.company), '_get_violated_lock_dates',
+                          return_value=[(payout.payout_date, 'Test lock')]):
+            with self.assertRaises(UserError):
+                payout.action_create_settlement_transfer()
+        self.assertFalse(payout.settlement_move_id)
+
     def test_actual_bank_match_partial_match_and_unmatch_update_status(self):
         payout = self._payout('bank-match')
         self._book_activity(payout)
@@ -357,11 +366,12 @@ class TestShopifyPayoutSettlement(PayoutTestCase):
         self.assertTrue(all(payment._seek_for_lines()[0].reconciled for payment in payments))
 
     def test_foreign_currency_transfer_uses_booked_liquidity_balance(self):
-        foreign = self.env['res.currency'].search([
+        foreign = self.env['res.currency'].with_context(active_test=False).search([
             ('id', '!=', self.env.company.currency_id.id),
         ], limit=1)
         if not foreign:
             self.skipTest('A second currency is required')
+        foreign.active = True
         self.env['res.currency.rate'].create({
             'currency_id': foreign.id, 'company_id': self.env.company.id,
             'name': fields.Date.today(), 'rate': 0.8,

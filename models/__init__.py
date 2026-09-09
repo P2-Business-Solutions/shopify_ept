@@ -46,3 +46,5 @@ from . import onboarding_onboarding
 from . import onboarding_onboarding_step
 from . import shopify_discount_code_config
 from . import shopify_order_type_mapping
+from . import shopify_payment_audit
+from . import sale_order_payment_sync

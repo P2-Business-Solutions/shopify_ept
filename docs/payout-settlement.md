@@ -7,7 +7,7 @@ receiving bank journal. The settlement entry does not book sales, refunds or fee
 
 ## Setup
 
-Upgrade `shopify_ept` to version `18.0.3.17`. On the Shopify instance's **Payout
+Upgrade `shopify_ept` to version `18.0.3.18`. On the Shopify instance's **Payout
 Configurations** tab, configure:
 
 1. **Payout Report Journal:** the separate Shopify settlement bank journal.
@@ -117,3 +117,9 @@ refund, a negative payout, repeated bulk actions, and partial/full bank matching
 undo and review. Confirm that the Shopify clearing balance is cleared by the transfer,
 and that the transit balance clears only when the actual bank entry is matched. For
 foreign currency, also check the exchange difference and company-currency balances.
+
+## Payments created from net invoices
+
+For invoices that already exclude refunded items, use the transaction payment flow
+and the Preview / Repair Payments action described in [Shopify payment repair](shopify-payment-repair.md).
+Reimporting payout reports alone does not correct invoice-sized legacy payments.

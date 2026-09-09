@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # See LICENSE file for full copyright and licensing details.
 
-from odoo import models, fields
+from odoo import models, fields, _
+from odoo.exceptions import UserError
 
 
 class AccountBankStatementLine(models.Model):
@@ -34,6 +35,9 @@ class AccountBankStatementLine(models.Model):
     payout_line_id = fields.Many2one('shopify.payout.report.line.ept', string="Payout line ID", ondelete="cascade", index=True)
 
     def write(self, vals):
+        for name in ('payout_id', 'payout_line_id'):
+            if name in vals and any(line[name] and line[name].id != vals[name] for line in self):
+                raise UserError(_('A Shopify statement line must retain its originating payout and transaction.'))
         res = super(AccountBankStatementLine, self).write(vals)
         if 'checked' in vals and not vals['checked']:
             self.payout_id.filtered(lambda payout: payout.state == 'validated').write({

@@ -493,6 +493,18 @@ class ShopifyPaymentReportEpt(models.Model):
             ], limit=1)
         if payment or not transaction.order_id:
             return payment
+        # A refund against an already-net invoice has no credit note. Its cash
+        # payment is linked to the order independently of invoice allocation.
+        cash_payments = payment_obj.search([
+            ('shopify_cash_order_id', '=', transaction.order_id.id),
+            ('shopify_instance_id', '=', self.instance_id.id),
+            ('company_id', '=', self.instance_id.shopify_company_id.id),
+            ('currency_id', '=', self.currency_id.id), ('payment_type', '=', payment_type),
+            ('state', 'in', ('in_process', 'paid')),
+        ]).filtered(lambda item: (not transaction_id or item.shopify_order_transaction_id == transaction_id)
+                    and self.currency_id.compare_amounts(item.amount, abs(transaction.amount)) == 0)
+        if len(cash_payments) == 1:
+            return cash_payments
         move_type = 'out_invoice' if payment_type == 'inbound' else 'out_refund'
         invoices = transaction.order_id.invoice_ids.filtered(
             lambda move: move.state == 'posted' and move.move_type == move_type)
@@ -507,6 +519,14 @@ class ShopifyPaymentReportEpt(models.Model):
             and (not transaction_id or not item.shopify_order_transaction_id)
             and self.currency_id.compare_amounts(item.amount, abs(transaction.amount)) == 0)
         if len(candidates) == 1:
+            peers = self.env['shopify.payout.report.line.ept'].search([
+                ('payout_id.instance_id', '=', self.instance_id.id),
+                ('order_id', '=', transaction.order_id.id),
+                ('transaction_type', 'in', ['charge'] if payment_type == 'inbound' else ['refund', 'payment_refund']),
+            ]).filtered(lambda row: row != transaction
+                        and self.currency_id.compare_amounts(row.amount, transaction.amount) == 0)
+            if peers:
+                raise UserError(_('Several payout transactions could match this legacy payment. Verify and link its Shopify transaction ID before reconciling.'))
             if transaction_id:
                 candidates.write({
                     'shopify_instance_id': self.instance_id.id,
@@ -828,20 +848,24 @@ class ShopifyPaymentReportEpt(models.Model):
                                 statement_line, invoices)
                         else:
                             invoices = self.get_invoices_for_reconcile(statement_line)
-                            if not invoices:
-                                continue
-
-                            paid_invoices = invoices.filtered(lambda x: x.reconciled_payment_ids)
-                            unpaid_invoices = invoices.filtered(
-                                lambda x: not x.reconciled_payment_ids.filtered('move_id') and x.amount_residual)
-
-                            if paid_invoices:
-                                move_line_total_amount, currency_ids, paid_move_lines = self.get_paid_move_line_amount(
-                                    statement_line, paid_invoices)
-
-                            if unpaid_invoices and not paid_move_lines:
-                                move_line_total_amount, currency_ids, move_line_data = self.get_unpaid_move_line_data(
-                                    statement_line, unpaid_invoices)
+                            # Refund import may just have recorded a cash payment
+                            # against a net invoice, with no credit note to return.
+                            refreshed_payment = self.find_payment_for_payout_transaction(payout_transaction)
+                            if refreshed_payment and refreshed_payment.move_id:
+                                move_line_total_amount, currency_ids, paid_move_lines = self.get_payment_move_line_amount(
+                                    statement_line, refreshed_payment)
+                            else:
+                                if not invoices:
+                                    continue
+                                paid_invoices = invoices.filtered(lambda x: x.reconciled_payment_ids)
+                                unpaid_invoices = invoices.filtered(
+                                    lambda x: not x.reconciled_payment_ids.filtered('move_id') and x.amount_residual)
+                                if paid_invoices:
+                                    move_line_total_amount, currency_ids, paid_move_lines = self.get_paid_move_line_amount(
+                                        statement_line, paid_invoices)
+                                if unpaid_invoices and not paid_move_lines:
+                                    move_line_total_amount, currency_ids, move_line_data = self.get_unpaid_move_line_data(
+                                        statement_line, unpaid_invoices)
 
                         log_line = self.reconcile_invoice_refund(statement_line, move_line_total_amount, currency_ids,
                                                                  move_line_data, paid_move_lines, log_lines)
@@ -916,7 +940,7 @@ class ShopifyPaymentReportEpt(models.Model):
         :return: Raise warning of call super method.
         """
         for report in self:
-            if report.state != 'draft':
+            if report.state != 'draft' or report.payout_statement_line_ids or report.settlement_move_id:
                 raise UserError(_('You cannot delete Payout Report, Which is not in Draft state.'))
         return super(ShopifyPaymentReportEpt, self).unlink()
 

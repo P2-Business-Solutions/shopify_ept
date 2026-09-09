@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # See LICENSE file for full copyright and licensing details.
-from odoo import models, fields
+from odoo import models, fields, _
+from odoo.exceptions import UserError
 
 
 class ShopifyPayoutReportLineEpt(models.Model):
@@ -48,3 +49,18 @@ class ShopifyPayoutReportLineEpt(models.Model):
     order_id = fields.Many2one('sale.order', string="Order Reference")
     is_processed = fields.Boolean("Processed?")
     is_remaining_statement = fields.Boolean(string="Is Remaining Statement?")
+
+    def write(self, vals):
+        protected = {'payout_id', 'transaction_id', 'transaction_type', 'amount', 'fee', 'net_amount', 'currency_id'}
+        if protected.intersection(vals):
+            linked = self.env['account.bank.statement.line'].search([('payout_line_id', 'in', self.ids)]).payout_line_id
+            for line in linked:
+                if any((line[name].id if name in ('payout_id', 'currency_id') else line[name]) != vals[name]
+                       for name in protected.intersection(vals)):
+                    raise UserError(_('A payout transaction already has a statement line. Review that accounting before changing its source amounts or identity.'))
+        return super().write(vals)
+
+    def unlink(self):
+        if self.env['account.bank.statement.line'].search_count([('payout_line_id', 'in', self.ids)]):
+            raise UserError(_('Remove the eligible unreconciled statement lines explicitly before deleting their payout transactions.'))
+        return super().unlink()

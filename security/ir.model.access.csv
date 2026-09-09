@@ -50,3 +50,7 @@ access_shopify_discount_code_config_ept_user,shopify.discount.code.config.ept.us
 access_shopify_discount_code_config_ept_manager,shopify.discount.code.config.ept.manager,model_shopify_discount_code_config_ept,shopify_ept.group_shopify_manager_ept,1,1,1,1
 access_shopify_order_type_mapping_ept_user,shopify.order.type.mapping.ept.user,model_shopify_order_type_mapping_ept,shopify_ept.group_shopify_ept,1,1,1,0
 access_shopify_order_type_mapping_ept_manager,shopify.order.type.mapping.ept.manager,model_shopify_order_type_mapping_ept,shopify_ept.group_shopify_manager_ept,1,1,1,1
+access_shopify_payment_audit_user,Shopify payment audit read,model_shopify_payment_audit_ept,account.group_account_user,1,0,0,0
+access_shopify_payment_audit_manager,Shopify payment audit manager read,model_shopify_payment_audit_ept,account.group_account_manager,1,0,0,0
+access_shopify_payment_audit_connector,Shopify payment audit connector read,model_shopify_payment_audit_ept,shopify_ept.group_shopify_ept,1,0,0,0
+access_shopify_payment_repair_manager,Shopify payment repair,model_shopify_payment_repair_ept,account.group_account_manager,1,1,1,1

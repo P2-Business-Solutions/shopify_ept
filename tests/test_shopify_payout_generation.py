@@ -61,6 +61,7 @@ class PayoutTestCase(TransactionCase):
                 'account_id': accounts[2].id,
             })],
         })
+        cls.env.user.groups_id |= cls.env.ref('account.group_account_user')
 
     def _payout(self, reference):
         return self.env['shopify.payout.report.ept'].create({
@@ -94,6 +95,21 @@ class PayoutTestCase(TransactionCase):
 
 
 class TestShopifyPayoutGeneration(PayoutTestCase):
+    def test_linked_transactions_cannot_delete_or_change_accounting(self):
+        payout = self._payout('protected-links')
+        payout.generate_bank_statement()
+        transaction = payout.payout_transaction_ids[:1]
+        with self.assertRaises(UserError):
+            transaction.unlink()
+        with self.assertRaises(UserError):
+            transaction.amount = 1
+        with self.assertRaises(UserError):
+            self._statement_lines(payout)[:1].payout_line_id = False
+        payout.state = 'draft'
+        with self.assertRaises(UserError):
+            payout.unlink()
+        self.assertEqual(len(self._statement_lines(payout)), 2)
+
     def test_zero_transactions_do_not_create_statement_lines(self):
         payout = self._payout('zero-line')
         payout.payout_transaction_ids = [Command.create({

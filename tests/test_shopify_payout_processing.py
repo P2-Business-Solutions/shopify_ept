@@ -54,6 +54,20 @@ class TestShopifyPayoutProcessing(unittest.TestCase):
         self.savepoint.__enter__.assert_called_once()
         self.assertIs(self.savepoint.__exit__.call_args.args[0], OperationalError)
 
+    def test_refund_created_during_processing_is_matched_without_second_click(self):
+        self.statement.shopify_transaction_type = 'refund'
+        self.statement.payout_line_id = object()
+        self.statement.amount = -45
+        payment, move_line = SimpleNamespace(move_id=True), object()
+        self.payout.find_payment_for_payout_transaction = Mock(side_effect=[False, payment])
+        self.payout.get_invoices_for_reconcile = Mock(return_value=Records())
+        self.payout.get_payment_move_line_amount = Mock(return_value=(-45, [], [move_line]))
+        self.payout.reconcile_invoice_refund = Mock(return_value=[])
+        self.payout.write = Mock()
+        self.payout.process_bank_statement()
+        self.payout.reconcile_invoice_refund.assert_called_once_with(
+            self.statement, -45, [], [], [move_line], [])
+
     def test_invoice_matching_propagates_database_conflict(self):
         self.payout.shopify_reconcile_bank_statement_line_ept = Mock(
             side_effect=OperationalError('concurrent update'))

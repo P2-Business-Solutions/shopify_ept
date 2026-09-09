@@ -223,6 +223,8 @@ class ShopifyPayoutSettlement(models.Model):
                     'shopify_settlement_reference': payout.payout_reference_id,
                 })
             else:
+                if source.company_id._get_violated_lock_dates(payout.payout_date, False, journal):
+                    raise UserError(_('The payout date is locked. Review the settlement date with accounting before creating a transfer.'))
                 label = _('Shopify payout %s', payout.payout_reference_id)
                 move = self.env['account.move'].with_company(source.company_id).create({
                     'move_type': 'entry', 'journal_id': journal.id,
@@ -239,6 +241,8 @@ class ShopifyPayoutSettlement(models.Model):
                     }) for account, sign in ((transit, 1), (source.default_account_id, -1))],
                 })
                 move.action_post()
+                if move.date != payout.payout_date:
+                    raise UserError(_('Odoo changed the settlement posting date. Review the accounting period before proceeding.'))
                 transit_line = move.line_ids.filtered(lambda line: line.account_id == transit)
             payout.write({
                 'settlement_move_id': move.id, 'settlement_line_id': transit_line.id,
@@ -268,6 +272,27 @@ class ShopifyPayoutSettlement(models.Model):
             'res_model': 'account.move', 'res_id': self.settlement_move_id.id,
             'view_mode': 'form', 'target': 'current',
         }
+
+    def action_preview_payout_payments(self):
+        orders = self.env['sale.order']
+        for transaction in self.payout_transaction_ids.filtered(
+                lambda row: row.transaction_type in ('charge', 'refund', 'payment_refund')):
+            instance = transaction.payout_id.instance_id
+            order = transaction.order_id
+            if not order and transaction.source_order_id:
+                order = self.env['sale.order'].search([
+                    ('shopify_order_id', '=', transaction.source_order_id),
+                    ('shopify_instance_id', '=', instance.id),
+                    ('company_id', '=', instance.shopify_company_id.id),
+                ], limit=2)
+            if (len(order) != 1 or order.shopify_instance_id != instance
+                    or order.company_id != instance.shopify_company_id
+                    or (transaction.source_order_id and order.shopify_order_id != transaction.source_order_id)):
+                raise UserError(_('Each charge/refund must identify one Shopify order in the payout company and store. Import or correct the missing order first.'))
+            orders |= order
+        if not orders:
+            raise UserError(_('This payout selection has no order payments to repair.'))
+        return orders.action_preview_shopify_payments()
 
     def action_open_settlement_bank(self):
         self.ensure_one()

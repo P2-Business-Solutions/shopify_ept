@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_shopify_payment_repair" model="ir.ui.view">
+        <field name="name">shopify.payment.repair.form</field>
+        <field name="model">shopify.payment.repair.ept</field>
+        <field name="arch" type="xml">
+            <form string="Preview / Repair Shopify Payments" create="false" edit="false">
+                <field name="state" invisible="1"/>
+                <field name="order_ids" widget="many2many_tags"/>
+                <div class="alert alert-info" role="alert" invisible="state == 'done'">
+                    Review the transactions below before applying. This records payments and refunds already made in Shopify.
+                    It does not send money or issue a new Shopify refund. Existing invoices and payout statements are retained.
+                </div>
+                <div class="alert alert-success" role="alert" invisible="state != 'done'">
+                    Payment repair applied. Review the audit on the order, then reconcile its existing payout statements.
+                </div>
+                <field name="preview_html" nolabel="1"/>
+                <footer>
+                    <button name="action_apply" type="object" string="Apply Reviewed Repair" class="btn-primary"
+                            invisible="state != 'preview'"/>
+                    <button name="action_preview" type="object" string="Refresh Preview" invisible="state == 'done'"/>
+                    <button string="Close" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+    <record id="view_sale_shopify_payment_sync" model="ir.ui.view">
+        <field name="name">sale.order.shopify.payment.sync</field>
+        <field name="model">sale.order</field>
+        <field name="inherit_id" ref="sale.view_order_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//header" position="inside">
+                <button name="action_preview_shopify_payments" string="Preview / Repair Shopify Payments" type="object"
+                        groups="account.group_account_manager" invisible="not shopify_instance_id"/>
+            </xpath>
+            <xpath expr="//notebook" position="inside">
+                <page string="Shopify Payment Audit" invisible="not shopify_instance_id"
+                      groups="account.group_account_user,account.group_account_manager,shopify_ept.group_shopify_ept">
+                    <field name="shopify_payment_audit_ids" readonly="1">
+                        <list create="false" edit="false" delete="false">
+                            <field name="create_date"/><field name="create_uid"/>
+                            <field name="payment_ids" widget="many2many_tags"/>
+                            <field name="replaced_payment_ids" widget="many2many_tags"/>
+                            <field name="credit_note_ids" widget="many2many_tags"/>
+                        </list>
+                        <form create="false" edit="false" delete="false">
+                            <group><field name="order_id"/><field name="create_date"/><field name="create_uid"/>
+                                <field name="payment_ids" widget="many2many_tags"/>
+                                <field name="replaced_payment_ids" widget="many2many_tags"/>
+                                <field name="credit_note_ids" widget="many2many_tags"/></group>
+                            <field name="plan_text"/>
+                        </form>
+                    </field>
+                </page>
+            </xpath>
+        </field>
+    </record>
+    <record id="action_preview_shopify_payment_repairs" model="ir.actions.server">
+        <field name="name">Preview / Repair Shopify Payments</field>
+        <field name="model_id" ref="sale.model_sale_order"/>
+        <field name="binding_model_id" ref="sale.model_sale_order"/>
+        <field name="binding_view_types">list</field>
+        <field name="groups_id" eval="[(4, ref('account.group_account_manager'))]"/>
+        <field name="state">code</field>
+        <field name="code">if records:
+    action = records.action_preview_shopify_payments()</field>
+    </record>
+    <record id="shopify_payment_audit_company_rule" model="ir.rule">
+        <field name="name">Shopify payment audit company</field>
+        <field name="model_id" ref="model_shopify_payment_audit_ept"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+    <record id="view_payout_payment_repair" model="ir.ui.view">
+        <field name="name">shopify.payout.payment.repair</field>
+        <field name="model">shopify.payout.report.ept</field>
+        <field name="inherit_id" ref="shopify_payout_report_form_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//header" position="inside">
+                <button name="action_preview_payout_payments" string="Preview / Repair Payments" type="object"
+                        groups="account.group_account_manager"/>
+            </xpath>
+        </field>
+    </record>
+    <record id="action_preview_payout_payment_repairs" model="ir.actions.server">
+        <field name="name">Preview / Repair Payments</field>
+        <field name="model_id" ref="model_shopify_payout_report_ept"/>
+        <field name="binding_model_id" ref="model_shopify_payout_report_ept"/>
+        <field name="binding_view_types">list</field>
+        <field name="groups_id" eval="[(4, ref('account.group_account_manager'))]"/>
+        <field name="state">code</field>
+        <field name="code">if records:
+    action = records.action_preview_payout_payments()</field>
+    </record>
+</odoo>
