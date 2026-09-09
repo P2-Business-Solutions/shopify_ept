@@ -437,6 +437,13 @@ class ShopifyInstanceEpt(models.Model):
                                                   help="If checked, it will create a payment for credit note")
     credit_note_payment_journal = fields.Many2one("account.journal", string="Credit Note Payment Journal",
                                                   help=" Selected Journal will be set in Credit note Payment journal.")
+    shopify_transaction_payment_sync = fields.Boolean(
+        string="Record Payments from Shopify Transactions", default=False,
+        help="If checked, the workflow's Register Payment step records each successful Shopify sale, capture "
+             "and refund as its own payment from the order's Shopify transaction history. If the history cannot "
+             "be recorded automatically, delivery validation and order import still complete; the reason is posted "
+             "on the order for Preview / Repair Shopify Payments. If unchecked, the workflow registers one payment "
+             "for the invoice balance as before.")
 
     auto_create_product_category = fields.Boolean(string="Auto Create Product Category?", default=True,
                                                   help="If checked, it will create a product category in odoo.")

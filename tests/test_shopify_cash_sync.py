@@ -15,6 +15,7 @@ class TestShopifyCashSync(PayoutTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        cls.instance.shopify_transaction_payment_sync = True
         cls.outstanding = cls.env['account.account'].create({
             'name': 'Cash Sync Outstanding', 'code': 'CSSOUT', 'account_type': 'asset_current',
             'reconcile': True, 'company_ids': [Command.set(cls.env.company.ids)],
@@ -351,6 +352,45 @@ class TestShopifyCashSync(PayoutTestCase):
         self.assertEqual(payments.amount, 242.10)
         self.assertTrue(order.currency_id.is_zero(invoice.amount_residual))
         self.assertFalse(payments._seek_for_lines()[0].reconciled)
+
+    def test_transaction_payment_recording_is_opt_in(self):
+        order, invoice, payload, events = self._fixture(gross=True)
+        self.instance.shopify_transaction_payment_sync = False
+        try:
+            with patch.object(type(order), '_shopify_cash_source',
+                              side_effect=AssertionError('Shopify must not be read when the setting is off')):
+                order.paid_invoice_ept(invoice)
+        finally:
+            self.instance.shopify_transaction_payment_sync = True
+        self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+        self.assertTrue(order.currency_id.is_zero(invoice.amount_residual))
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_unrecordable_cash_history_does_not_block_invoicing(self):
+        order, invoice, payload, events = self._fixture(gross=True)
+        payload['refunds'] = []
+        count = self.env['account.move'].search_count([])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, [])):
+            order.paid_invoice_ept(invoice)
+        self.assertEqual(self.env['account.move'].search_count([]), count)
+        self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+        self.assertEqual(invoice.amount_residual, invoice.amount_total)
+        self.assertIn('No successful Shopify charge', order.message_ids[:1].body)
+        self.assertTrue(self.env['common.log.lines.ept'].search([
+            ('res_id', '=', order.id), ('message', 'ilike', 'No successful Shopify charge')]))
+
+    def test_zero_value_invoice_skips_cash_recording(self):
+        order, invoice, payload, events = self._fixture(gross=True)
+        zero = self.env['account.move'].create({
+            'move_type': 'out_invoice', 'partner_id': self.partner.id, 'journal_id': self.sales_journal.id,
+            'invoice_line_ids': [Command.create({'product_id': self.product.id, 'quantity': 1, 'price_unit': 0,
+                                                 'tax_ids': [Command.clear()]})],
+        })
+        zero.action_post()
+        with patch.object(type(order), '_shopify_cash_source',
+                          side_effect=AssertionError('Zero invoices must not read Shopify')):
+            order.paid_invoice_ept(zero)
+        self.assertFalse(zero.message_ids.filtered(lambda row: 'skipped' in (row.body or '')))
 
     def test_preview_finds_order_imported_after_payout(self):
         order, invoice, payload, events = self._fixture()

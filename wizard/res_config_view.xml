@@ -427,17 +427,22 @@
                             </div>
                         </div>
                         <!-- Credit Note Register Payment configuration -->
-                        <div class="col-12 col-lg-6 o_setting_box" invisible="not refund_order_webhook">
+                        <div class="col-12 col-lg-6 o_setting_box">
                             <div class="o_setting_left_pane">
                                 <field name="credit_note_register_payment"
                                        invisible="1"/>
+                                <field name="shopify_transaction_payment_sync"/>
                             </div>
                             <div class="o_setting_right_pane">
-                                <span class="o_form_label">Shopify Refund Payments</span>
+                                <label for="shopify_transaction_payment_sync"/>
                                 <div class="text-muted">
-                                    Successful Shopify refunds are recorded separately when the order workflow has
-                                    Register Payment enabled. Credit notes are created only when the invoice still
-                                    includes the refunded items. No new refund is sent to Shopify.
+                                    When enabled, the workflow's Register Payment step records each successful
+                                    Shopify sale, capture and refund as its own payment from the order's transaction
+                                    history. Credit notes are created only when the invoice still includes the
+                                    refunded items. Orders whose history cannot be recorded are not blocked; the
+                                    reason is posted on the order for Preview / Repair Shopify Payments.
+                                    When disabled, the workflow registers one payment for the invoice balance.
+                                    No new refund is sent to Shopify.
                                 </div>
                             </div>
                         </div>

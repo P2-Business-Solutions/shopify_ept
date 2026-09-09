@@ -1,10 +1,22 @@
 # Shopify cash transactions and payment repair
 
-Version 18.0.3.18 records successful Shopify sales/captures and refunds separately.
+Version 18.0.3.19 can record successful Shopify sales/captures and refunds separately.
 It reads Shopify; it never initiates a Shopify charge or refund. Payout settlement
 transfers remain a separate step after the underlying cash movements are reconciled.
 
 ## Configure the forward flow
+
+Transaction-based recording is **off by default**. Enable **Record Payments from
+Shopify Transactions** under Shopify → Configuration → Settings for the instance.
+Upgrading does not enable it. While it is off, the workflow registers one payment for
+the invoice balance exactly as before, and refunds follow the previous credit-note flow.
+
+While it is on, an order whose Shopify history cannot be recorded automatically (no
+successful charge, a gift card, an unsupported currency, a partial invoice, a journal
+without a Manual method) does **not** block delivery validation or order import. No
+payment is created, the invoice stays open, and the reason is posted on the order and
+in the Shopify logs. Review such orders with **Preview / Repair Shopify Payments**.
+Zero-value invoices are skipped because there is no cash to record.
 
 On the order's automatic workflow, enable **Register Payment**. Its gateway must
 identify one bank payment journal in the order company and currency. The journal

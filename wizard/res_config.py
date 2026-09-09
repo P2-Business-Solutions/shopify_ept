@@ -457,6 +457,10 @@ class ResConfigSettings(models.TransientModel):
                                                   help="If checked, it will create a payment for credit note")
     credit_note_payment_journal = fields.Many2one("account.journal", string="Credit Note Payment Journal",
                                                   help=" Selected Journal will be set in Credit note Payment journal.")
+    shopify_transaction_payment_sync = fields.Boolean(
+        string="Record Payments from Shopify Transactions",
+        help="Record each successful Shopify sale, capture and refund as its own payment. "
+             "Off by default; the workflow then registers one payment for the invoice balance.")
 
     auto_create_product_category = fields.Boolean(string="Auto Create Product Category?", default=True,
                                                   help="If checked, it will create a product category in odoo.")
@@ -543,6 +547,7 @@ class ResConfigSettings(models.TransientModel):
             self.update_qty_to_invoice_order_webhook = instance.update_qty_to_invoice_order_webhook
             self.credit_note_register_payment = instance.credit_note_register_payment or False
             self.credit_note_payment_journal = instance.credit_note_payment_journal or False
+            self.shopify_transaction_payment_sync = instance.shopify_transaction_payment_sync or False
             self.auto_create_product_category = instance.auto_create_product_category or False
             self.shopify_instance_product_category = instance.shopify_instance_product_category or False
             self.shopify_tax_grid_id = instance.shopify_tax_grid_id or False
@@ -626,6 +631,7 @@ class ResConfigSettings(models.TransientModel):
             values['update_qty_to_invoice_order_webhook'] = self.update_qty_to_invoice_order_webhook
             values['credit_note_register_payment'] = self.credit_note_register_payment
             values['credit_note_payment_journal'] = self.credit_note_payment_journal or False
+            values['shopify_transaction_payment_sync'] = self.shopify_transaction_payment_sync or False
             values['auto_create_product_category'] = self.auto_create_product_category or False
             values['shopify_instance_product_category'] = self.shopify_instance_product_category or False
             values['shopify_tax_grid_id'] = self.shopify_tax_grid_id or False

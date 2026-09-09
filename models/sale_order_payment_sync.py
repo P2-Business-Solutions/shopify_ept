@@ -1,9 +1,13 @@
 """Shopify cash history drives payments; invoices drive revenue and tax."""
+import logging
+
 from odoo import Command, fields, models, _
 from odoo.exceptions import UserError
 from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
 from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, fingerprint, component_money, money
+
+_logger = logging.getLogger(__name__)
 
 
 class SaleOrderPaymentSync(models.Model):
@@ -466,20 +470,48 @@ class SaleOrderPaymentSync(models.Model):
                            'is_fully_refunded': order.currency_id.is_zero(remaining)})
         return True
 
+    def _shopify_transaction_payments_enabled(self):
+        """Transaction-based payment recording is opt-in per instance."""
+        self.ensure_one()
+        return bool(self.shopify_instance_id and self.shopify_instance_id.shopify_transaction_payment_sync)
+
+    def _log_shopify_cash_sync_failure(self, error):
+        message = _('Shopify payment recording was skipped for %(order)s: %(reason)s '
+                    'The invoice stays open. Review it with Preview / Repair Shopify Payments.',
+                    order=self.name, reason=str(error))
+        _logger.warning(message)
+        self.message_post(body=message)
+        self.env['common.log.lines.ept'].create_common_log_line_ept(
+            shopify_instance_id=self.shopify_instance_id.id, module='shopify_ept', message=message,
+            model_name=self._name, res_id=self.id, order_ref=self.name)
+        return True
+
     def paid_invoice_ept(self, invoices):
-        if not self.shopify_instance_id:
+        if not self._shopify_transaction_payments_enabled():
             return super().paid_invoice_ept(invoices)
-        if not invoices and not self.invoice_ids:
+        documents = invoices or self.invoice_ids
+        if not documents:
             return True
-        self._sync_shopify_cash()
+        if all(move.currency_id.is_zero(move.amount_total) for move in documents):
+            # Zero-value invoices (replacements, full discounts) have no cash to record.
+            return True
+        try:
+            with self.env.cr.savepoint():
+                self._sync_shopify_cash()
+        except UserError as error:
+            # A delivery validation or order import must never fail because the
+            # Shopify cash history cannot be recorded automatically. The invoice
+            # stays open for the repair preview; nothing partial is kept.
+            self._log_shopify_cash_sync_failure(error)
         return True
 
     def create_shopify_partially_refund(self, refunds_data, order_name, created_by='', shopify_financial_status=''):
         # One path decides whether a credit note is needed and records actual cash.
-        if not self.shopify_instance_id:
+        if not self._shopify_transaction_payments_enabled():
             return super().create_shopify_partially_refund(refunds_data, order_name, created_by, shopify_financial_status)
         if not self.auto_workflow_process_id.register_payment:
-            raise UserError(_('Enable transaction payment recording in the Shopify workflow before importing refunds.'))
+            raise UserError(_('Enable Register Payment on the Shopify workflow before importing refunds with '
+                              'Record Payments from Shopify Transactions.'))
         self._sync_shopify_cash()
         return False
 
