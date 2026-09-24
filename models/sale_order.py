@@ -1117,6 +1117,7 @@ class SaleOrder(models.Model):
             order.create_shopify_Delivery_Fee_lines(order_response, instance)
             _logger.info("Created Delivery Fee for order (%s).", order.name)
 
+        order._shopify_apply_external_order_adjustments(instance, order_response)
         order.create_shopify_tax_line(order_response, instance)
 
         # self.set_fulfilment_order_id_and_fulfillment_line_id(order, instance, order_response)
@@ -1297,6 +1298,8 @@ class SaleOrder(models.Model):
 
     def create_shopify_tax_line(self, order_response, instance):
         """Create one untaxed sale order line for Shopify's exact collected tax."""
+        if self._shopify_skip_exact_tax_line(instance, order_response):
+            return False
         tax_amount = self._get_shopify_order_tax_amount(instance, order_response)
         if float_is_zero(tax_amount, precision_digits=2):
             _logger.info("Skipping Shopify exact tax line for Odoo order(%s) and Shopify order(%s): total tax is zero.",
@@ -1328,9 +1331,26 @@ class SaleOrder(models.Model):
                 order_response.get("total_tax_set"), order_response, tax_amount)
         return float(tax_amount or 0.0)
 
+    def _shopify_apply_external_order_adjustments(self, instance, order_response):
+        """Extension hook for a payment source outside Shopify.
+
+        The base connector has no adjustment to apply.  The hook lets an
+        integration add a source-owned line before Shopify's exact tax line is
+        created, without duplicating this import workflow.
+        """
+        self.ensure_one()
+        return False
+
+    def _shopify_skip_exact_tax_line(self, instance, order_response):
+        """Whether an integration supplied the authoritative tax treatment."""
+        self.ensure_one()
+        return False
+
     def update_shopify_tax_line_ept(self, instance, order_response):
         """Synchronize exact Shopify tax without changing posted invoice lines."""
         self.ensure_one()
+        if self._shopify_skip_exact_tax_line(instance, order_response):
+            return False
         tax_product = instance.tax_product_id or self.env.ref(
             'shopify_ept.shopify_tax_product', False
         )
@@ -2800,6 +2820,11 @@ class SaleOrder(models.Model):
 
                 if is_manual_update:
                     order_with_transactions.update_shopify_shipping_lines_ept(instance, order_data)
+                # External payment attributes can arrive on a normal order
+                # update, before the connector resumes the invoice workflow.
+                if not order_data.get('cancel_reason'):
+                    order_with_transactions._shopify_apply_external_order_adjustments(instance, order_data)
+                if is_manual_update:
                     order_with_transactions.update_shopify_tax_line_ept(instance, order_data)
 
                 if order_data.get('fulfillment_status') in (
