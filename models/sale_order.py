@@ -711,6 +711,12 @@ class SaleOrder(models.Model):
             sale_order = self.search_existing_shopify_order(order_response, instance, order_number)
 
             if sale_order:
+                if sale_order._shopify_external_order_error():
+                    # An earlier external settlement failure left this order
+                    # for review. Reprocess its source instead of discarding it
+                    # just because the order now exists.
+                    self.update_shopify_order(order_data_line, "Webhook", instance)
+                    continue
                 sale_order._sync_shopify_discount_data(order_response)
                 if instance.is_delivery_multi_warehouse and sale_order.state in ("draft", "sent"):
                     sale_order.apply_shopify_location_and_warehouse(
@@ -747,6 +753,8 @@ class SaleOrder(models.Model):
                                                                shopify_order_data_queue_line_id=order_data_line.id if order_data_line else False)
                 continue
             order_ids.append(sale_order.id)
+            if sale_order._shopify_record_external_order_error(order_data_line):
+                continue
 
             sale_order.apply_shopify_location_and_warehouse(
                 order_response, instance, pos_order)
@@ -1345,6 +1353,25 @@ class SaleOrder(models.Model):
         """Whether an integration supplied the authoritative tax treatment."""
         self.ensure_one()
         return False
+
+    def _shopify_external_order_error(self):
+        """An integration can hold this order for review without failing HTTP."""
+        self.ensure_one()
+        return False
+
+    def _shopify_record_external_order_error(self, queue_line):
+        self.ensure_one()
+        message = self._shopify_external_order_error()
+        if not message:
+            return False
+        if queue_line:
+            queue_line.write({"state": "failed", "sale_order_id": self.id, "processed_at": datetime.now()})
+        self.env["common.log.lines.ept"].create_common_log_line_ept(
+            shopify_instance_id=self.shopify_instance_id.id, module="shopify_ept", message=message,
+            model_name="sale.order", order_ref=self.name,
+            shopify_order_data_queue_line_id=queue_line.id if queue_line else False,
+        )
+        return True
 
     def update_shopify_tax_line_ept(self, instance, order_response):
         """Synchronize exact Shopify tax without changing posted invoice lines."""
@@ -2786,12 +2813,13 @@ class SaleOrder(models.Model):
                                 env.uid = odoo_bot.id
                                 break
                         self._cr.commit()
-                if order:
+                if order and queue_line.state != "failed":
                     queue_line.write({'state': 'done', 'processed_at': datetime.now()})
                 return True
             try:
                 need_to_done_queue = True
                 is_manual_update = created_by == 'Manual Update'
+                previous_external_error = order._shopify_external_order_error()
                 order_with_transactions = order.with_context(
                     shopify_order_transactions=order_data.get("transaction", [])
                 )
@@ -2824,6 +2852,10 @@ class SaleOrder(models.Model):
                 # update, before the connector resumes the invoice workflow.
                 if not order_data.get('cancel_reason'):
                     order_with_transactions._shopify_apply_external_order_adjustments(instance, order_data)
+                    if order._shopify_record_external_order_error(queue_line):
+                        continue
+                    if previous_external_error and queue_line.state == "failed":
+                        queue_line.state = "draft"
                 if is_manual_update:
                     order_with_transactions.update_shopify_tax_line_ept(instance, order_data)
 
