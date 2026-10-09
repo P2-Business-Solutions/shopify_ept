@@ -33,7 +33,15 @@ Each workflow run fetches the order and all pages of its transaction history. On
 successful sale/capture/refund transactions become payments. Authorizations, voids,
 and unsuccessful transactions do not. Each payment retains its Shopify transaction,
 parent transaction, gateway, original timestamp, currency, and order. The accounting
-date is the transaction's date in the timezone supplied by Shopify.
+date for a new payment is the transaction's date in the timezone supplied by Shopify.
+From version 18.0.3.23, an existing payment with the exact Shopify transaction ID can
+be reused with a different accounting date, including payments recorded when the order
+shipped. Its original posting date and existing payout reconciliations are preserved;
+the Shopify timestamp remains separate source metadata. Amount, currency, direction,
+company, customer, journal, outstanding account and order/document checks still apply.
+Legacy payments without a transaction ID still require an exact date match; repair
+does not infer their identity from the amount alone. The preview shows both the Shopify
+transaction date and the payment's accounting date.
 
 The same Shopify transaction cannot create a second payment for the same instance.
 Calls for an order are serialized. Repeated runs reuse correct payments; an old
@@ -137,11 +145,12 @@ the payment outstanding entries and reconcile the bank withdrawal/deposit.
 
 ### Other exceptions
 
-The preview blocks locked or protected entries; payments already matched at the bank;
+The preview blocks replacements of locked or protected entries or payments already matched at the bank;
 applications involving another order; unidentified or ambiguous legacy payments;
 missing refund-parent history; unsupported currency conversion; gift-card transactions;
 missing/ambiguous gateway journals or payment methods; and invoice/credit-note totals
-that do not fit the proven original or final-net document states.
+that do not fit the proven original or final-net document states. Correct payments
+identified by their Shopify transaction ID can be reused even after payout reconciliation.
 An invoice awaiting additional captures, or a fully refunded order with no posted
 invoice, also requires review rather than manufacturing a balancing document.
 

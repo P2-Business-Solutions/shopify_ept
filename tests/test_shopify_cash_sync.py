@@ -339,6 +339,102 @@ class TestShopifyCashSync(PayoutTestCase):
             order.create_shopify_partially_refund(payload['refunds'], order.name)
             self.assertEqual(order.invoice_ids.filtered(lambda row: row.move_type == 'out_refund'), credit)
 
+    def _assert_identified_receipt_keeps_shipping_date(self, settled):
+        order, invoice, payload, events = self._amount_only_fixture()
+        self.gateway.code = 'paypal'
+        for event in events:
+            event['gateway'] = 'paypal'
+        transaction_date = invoice.invoice_date - timedelta(days=2)
+        events[0]['processed_at'] = transaction_date.isoformat() + 'T10:00:00-04:00'
+        credit = self._reviewed_credit(order, invoice)
+        receipt = self._legacy(invoice, 414.95)
+        receipt.write({'shopify_instance_id': self.instance.id, 'shopify_order_transaction_id': 'charge'})
+        liquidity = receipt._seek_for_lines()[0]
+        if settled:
+            balance = self.env['account.account'].create({
+                'name': 'PayPal Test Balance', 'code': 'CSPPBAL', 'account_type': 'asset_current',
+                'reconcile': True, 'company_ids': [Command.set(self.env.company.ids)],
+            })
+            journal = self.env['account.journal'].create({
+                'name': 'PayPal Test Settlement', 'code': 'CSPP', 'type': 'general',
+                'company_id': self.env.company.id,
+            })
+            settlement = self.env['account.move'].create({
+                'journal_id': journal.id, 'date': receipt.date,
+                'line_ids': [Command.create({
+                    'account_id': balance.id, 'debit': receipt.amount,
+                }), Command.create({
+                    'account_id': self.outstanding.id, 'credit': receipt.amount,
+                    'partner_id': self.partner.id,
+                })],
+            })
+            settlement.action_post()
+            (liquidity | settlement.line_ids.filtered(
+                lambda line: line.account_id == self.outstanding)).reconcile()
+        original_move = receipt.move_id
+        original_date = receipt.date
+        original_items = original_move.line_ids.ids
+        original_matches = (liquidity.matched_debit_ids | liquidity.matched_credit_ids).ids
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            move_count = self.env['account.move'].search_count([])
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            self.assertEqual(wizard.state, 'preview', wizard.preview_html)
+            self.assertEqual(self.env['account.move'].search_count([]), move_count)
+            planned = wizard.plan_json[0]['events'][0]
+            self.assertEqual(planned['payment_id'], receipt.id)
+            self.assertEqual(planned['date'], transaction_date.isoformat())
+            self.assertEqual(planned['payment_date'], original_date.isoformat())
+            self.assertIn('Payment date', wizard.preview_html)
+            wizard.action_apply()
+            payments = self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)])
+            self.assertEqual(payments.filtered(lambda pay: pay.payment_type == 'inbound'), receipt)
+            refund = payments.filtered(lambda pay: pay.payment_type == 'outbound')
+            self.assertEqual(len(refund), 1)
+            self.assertEqual(refund.amount, 9.95)
+            self.assertFalse(refund._seek_for_lines()[0].reconciled)
+            self.assertEqual(receipt.move_id, original_move)
+            self.assertEqual(receipt.date, original_date)
+            self.assertEqual(original_move.date, original_date)
+            self.assertEqual(original_move.line_ids.ids, original_items)
+            self.assertFalse(original_move.reversal_move_ids)
+            self.assertEqual((liquidity.matched_debit_ids | liquidity.matched_credit_ids).ids, original_matches)
+            self.assertEqual(liquidity.reconciled, settled)
+            self.assertEqual(liquidity.amount_residual_currency, 0 if settled else receipt.amount)
+            self.assertTrue(invoice.currency_id.is_zero(invoice.amount_residual))
+            self.assertTrue(credit.currency_id.is_zero(credit.amount_residual))
+            self.assertEqual(self.env['account.move'].search_count([]), move_count + 1)
+            order._sync_shopify_cash()
+            self.assertEqual(self.env['account.move'].search_count([]), move_count + 1)
+
+    def test_identified_receipt_keeps_shipping_date(self):
+        self._assert_identified_receipt_keeps_shipping_date(settled=False)
+
+    def test_paypal_settled_receipt_keeps_shipping_date_and_reconciliation(self):
+        self._assert_identified_receipt_keeps_shipping_date(settled=True)
+
+    def test_unidentified_receipt_with_different_date_is_not_guessed(self):
+        order, invoice, payload, events = self._fixture(gross=True)
+        receipt = self._legacy(invoice, 242.10)
+        events[0]['processed_at'] = (invoice.invoice_date - timedelta(days=2)).isoformat() + 'T10:00:00-04:00'
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'Existing payments do not match Shopify cash history'):
+                order._build_shopify_cash_plan(repair=True)
+        self.assertFalse(receipt.shopify_order_transaction_id)
+        self.assertFalse(receipt.move_id.reversal_move_ids)
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_identified_receipt_with_different_date_still_checks_amount(self):
+        order, invoice, payload, events = self._fixture(gross=True)
+        receipt = self._legacy(invoice, 242.11)
+        receipt.write({'shopify_instance_id': self.instance.id, 'shopify_order_transaction_id': 'charge'})
+        events[0]['processed_at'] = (invoice.invoice_date - timedelta(days=2)).isoformat() + 'T10:00:00-04:00'
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'inconsistent accounting'):
+                order._build_shopify_cash_plan(repair=True)
+        self.assertEqual(receipt.amount, 242.11)
+        self.assertFalse(receipt.move_id.reversal_move_ids)
+        self.assertFalse(order.shopify_payment_audit_ids)
+
     def test_preview_does_not_post_and_repair_reverses_only_net_payment(self):
         order, invoice, payload, events = self._fixture()
         legacy = self._legacy(invoice, 197.10)

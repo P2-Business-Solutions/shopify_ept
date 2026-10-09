@@ -58,12 +58,13 @@ class ShopifyPaymentRepair(models.TransientModel):
                                 % (escape(credit['values']['shopify_refund_id']), escape(str(credit['amount'])),
                                    escape(order.currency_id.name), escape(credit['values']['date'])))
             sections.append(Markup('<table class="table"><thead><tr><th>Action</th><th>Transaction</th><th>Type</th>'
-                                   '<th>Date</th><th>Amount</th><th>Journal</th></tr></thead><tbody>'))
+                                   '<th>Shopify date</th><th>Payment date</th><th>Amount</th><th>Journal</th></tr></thead><tbody>'))
             for event in plan['events']:
                 journal = self.env['account.journal'].browse(event['journal_id'])
-                sections.append(Markup('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s %s</td><td>%s</td></tr>')
+                sections.append(Markup('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s %s</td><td>%s</td></tr>')
                                 % (escape('Reuse payment %s' % event['payment_id'] if event['payment_id'] else 'Create payment'),
                                    escape(event['id']), escape(event['kind']), escape(event['date']),
+                                   escape(event['payment_date']),
                                    escape(event['amount']), escape(event['currency']), escape(journal.display_name)))
             sections.append(Markup('</tbody></table>'))
         self.write({'plan_json': json.loads(json.dumps(plans, default=str)),

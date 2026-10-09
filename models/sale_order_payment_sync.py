@@ -300,9 +300,11 @@ class SaleOrderPaymentSync(models.Model):
             if len(matched) > 1:
                 raise UserError(_('Several legacy payments could match transaction %s. Review their identity.', event['id']))
             if matched:
+                # An exact transaction ID identifies cash recorded later at shipping.
+                # Keep that payment's posting date and any payout reconciliation.
+                # Unidentified legacy payments still require the date in the fallback above.
                 if (matched.payment_type != event['direction'] or matched.currency_id != self.currency_id
                         or matched.company_id != self.company_id or matched.journal_id != method.journal_id
-                        or matched.date != fields.Date.to_date(event['date'])
                         or self.currency_id.compare_amounts(matched.amount, float(event['amount']))
                         or matched.partner_id.commercial_partner_id != self.partner_id.commercial_partner_id
                         or (matched.shopify_cash_order_id and matched.shopify_cash_order_id != self)
@@ -324,6 +326,7 @@ class SaleOrderPaymentSync(models.Model):
                     raise UserError(_('The existing payment does not have the expected outstanding-account entry.'))
                 remaining -= matched
             event['payment_id'] = matched.id if matched else False
+            event['payment_date'] = matched.date.isoformat() if matched else event['date']
             if not matched and self.company_id._get_violated_lock_dates(
                     fields.Date.to_date(event['date']), False, method.journal_id):
                 raise UserError(_('The transaction date is locked. A reviewed accounting correction is required.'))
