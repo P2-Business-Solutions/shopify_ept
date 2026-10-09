@@ -1,5 +1,33 @@
 # Accounting review — 18.0.3.18
 
+## Order-scoped standalone refund credits — 18.0.3.22
+
+Reviewed October 9, 2026 in a disposable Odoo 18 Community/PostgreSQL database with
+the actual connector, common connector library, sale order type and delivery hold
+dependencies. Module installation and upgrade completed. No production records changed.
+
+- **45 accounting tests passed; 1 Enterprise widget test skipped.** The Odoo runner
+  reported zero failures and errors across 46 cash synchronization tests.
+- **19 standalone payment-planning tests passed.** Syntax and whitespace checks passed.
+- A $414.95 original invoice plus a standalone $9.95 amount-only credit was repaired
+  both before and after applying the credit to the invoice. The preview reused the
+  named credit without posting anything; apply created only the $414.95 incoming
+  payment and $9.95 outgoing payment. Invoice and credit receivables closed, each
+  payment's gross outstanding entry remained open for payout matching, and rerunning
+  created no further payments or audit records.
+- A standalone credit must explicitly select this sales order in **Shopify Order**.
+  Credits with the same refund ID on another order, or without an order link, are not
+  candidates. The order's own credits still require matching Shopify source evidence.
+- Wrong customers, stores, currencies, amounts and source refund IDs; conflicting
+  order lines or reversal links; allocations to other invoices; duplicate/draft
+  credits; and changes to a reviewed order link or allocation were rejected.
+
+The existing Enterprise widget/staging checks below remain necessary for that UI.
+The repair does not add sale-line links to standalone credits; their explicit Shopify
+order link makes them available to repair without changing sales quantities.
+
+## Earlier review
+
 Reviewed September 9, 2026. Changes are local; no production accounting or Shopify
 records were modified. Tests used synthetic transactions and a disposable PostgreSQL
 database with the existing Odoo 18.0-20260723 Community image and the actual connector,

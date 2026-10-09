@@ -46,13 +46,13 @@ class TestShopifyCashSync(PayoutTestCase):
             'company_ids': [Command.set(cls.env.company.ids)],
         })
 
-    def _fixture(self, gross=False):
+    def _fixture(self, gross=False, retained=197.10, removed=45.0):
         order = self.env['sale.order'].create({
             'partner_id': self.partner.id, 'shopify_instance_id': self.instance.id, 'shopify_order_id': '135267',
             'shopify_payment_gateway_id': self.gateway.id, 'auto_workflow_process_id': self.workflow.id,
         })
         invoice_lines = []
-        for key, amount in [('retained', 197.10), ('removed', 45.0)]:
+        for key, amount in [('retained', retained), ('removed', removed)]:
             line = self.env['sale.order.line'].create({
                 'order_id': order.id, 'product_id': self.product.id, 'name': key, 'shopify_line_id': key,
                 'product_uom_qty': 1, 'price_unit': amount, 'tax_id': [Command.clear()],
@@ -73,14 +73,225 @@ class TestShopifyCashSync(PayoutTestCase):
         date = invoice.invoice_date.isoformat()
         common = dict(order_id='135267', currency=order.currency_id.name, gateway='shopify_payments',
                       status='success', processed_at=date + 'T10:00:00-04:00')
-        events = [dict(common, id='charge', kind='sale', amount='242.10'),
-                  dict(common, id='refund', kind='refund', amount='45.00', parent_id='charge',
+        events = [dict(common, id='charge', kind='sale', amount='%.2f' % (retained + removed)),
+                  dict(common, id='refund', kind='refund', amount='%.2f' % removed, parent_id='charge',
                        processed_at=fields.Date.today().isoformat() + 'T10:00:00-04:00')]
         payload = {'id': '135267', 'line_items': [dict(id='removed', quantity=1, current_quantity=0)],
                    'refunds': [dict(id='refund-doc', transactions=[dict(id='refund')],
                                    refund_line_items=[dict(line_item_id='removed', quantity=1,
-                                                          subtotal='45.00', total_tax='0.00')])]}
+                                                          subtotal='%.2f' % removed, total_tax='0.00')])]}
         return order, invoice, payload, events
+
+    def _amount_only_fixture(self):
+        order, invoice, payload, events = self._fixture(gross=True, retained=405.0, removed=9.95)
+        events[1]['processed_at'] = events[0]['processed_at']
+        payload['refunds'][0].update(refund_line_items=[], order_adjustments=[{
+            'kind': 'refund_discrepancy', 'amount': '-9.95', 'tax_amount': '0.00',
+        }])
+        return order, invoice, payload, events
+
+    def _reviewed_credit(self, order, invoice, post=True, **overrides):
+        values = {
+            'journal_id': self.sales_journal.id, 'move_type': 'out_refund',
+            'company_id': order.company_id.id, 'partner_id': self.partner.id,
+            'currency_id': order.currency_id.id, 'invoice_date': invoice.invoice_date,
+            'date': invoice.date, 'shopify_instance_id': self.instance.id,
+            'shopify_refund_order_id': order.id, 'shopify_refund_id': 'refund-doc',
+            'is_refund_in_shopify': True,
+            'invoice_line_ids': [Command.create({
+                'product_id': self.product.id, 'name': 'Reviewed hand-delivery adjustment',
+                'account_id': self.revenue.id, 'quantity': 1, 'price_unit': 9.95,
+                'tax_ids': [Command.clear()],
+            })],
+        }
+        values.update(overrides)
+        credit = self.env['account.move'].create(values)
+        if post:
+            credit.action_post()
+        return credit
+
+    def _assert_amount_only_repair(self, applied):
+        order, invoice, payload, events = self._amount_only_fixture()
+        credit = self._reviewed_credit(order, invoice)
+        self.assertNotIn(credit, order.invoice_ids)
+        if applied:
+            (credit.line_ids | invoice.line_ids).filtered(
+                lambda line: line.account_type == 'asset_receivable').reconcile()
+            self.assertEqual(invoice.amount_residual, 405.0)
+            self.assertTrue(credit.currency_id.is_zero(credit.amount_residual))
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            move_count = self.env['account.move'].search_count([])
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            self.assertEqual(wizard.state, 'preview')
+            self.assertEqual(self.env['account.move'].search_count([]), move_count)
+            self.assertEqual(wizard.plan_json[0]['reused_credit_ids'], credit.ids)
+            self.assertFalse(wizard.plan_json[0]['credits'])
+            self.assertIn(credit.name, wizard.preview_html)
+            wizard.action_apply()
+            payments = self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)])
+            self.assertEqual(sorted(payments.mapped('amount')), [9.95, 414.95])
+            self.assertEqual(len(payments), 2)
+            self.assertEqual(invoice.amount_total, 414.95)
+            self.assertTrue(invoice.currency_id.is_zero(invoice.amount_residual))
+            self.assertTrue(credit.currency_id.is_zero(credit.amount_residual))
+            for payment in payments:
+                liquidity, counterpart, _ = payment._seek_for_lines()
+                self.assertFalse(liquidity.reconciled)
+                self.assertEqual(abs(liquidity.amount_residual_currency), payment.amount)
+                self.assertTrue(counterpart.reconciled)
+            self.assertNotIn(credit, order.invoice_ids)
+            self.assertEqual(self.env['account.move'].search_count([]), move_count + 2)
+            audit_count = len(order.shopify_payment_audit_ids)
+            order._sync_shopify_cash()
+            self.assertEqual(len(order.shopify_payment_audit_ids), audit_count)
+            self.assertEqual(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]), payments)
+
+    def test_amount_only_refund_reuses_explicit_order_credit(self):
+        self._assert_amount_only_repair(applied=False)
+
+    def test_amount_only_refund_reuses_credit_already_applied_to_invoice(self):
+        self._assert_amount_only_repair(applied=True)
+
+    def test_standalone_credit_requires_explicit_order_not_just_refund_id(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        self._reviewed_credit(order, invoice, shopify_refund_order_id=False)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'reviewed credit note'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_other_orders_credit_with_same_refund_id_is_not_a_candidate(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        other_order = order.copy({'shopify_order_id': 'another-order'})
+        self._reviewed_credit(other_order, invoice)
+        own_credit = self._reviewed_credit(order, invoice)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            plan = order._build_shopify_cash_plan(repair=True)
+        self.assertEqual(plan['reused_credit_ids'], own_credit.ids)
+        self.assertFalse(plan['credits'])
+
+    def test_explicit_order_credit_still_checks_customer(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        other_partner = self.env['res.partner'].create({
+            'name': 'Other refund customer', 'property_account_receivable_id': self.receivable.id,
+        })
+        self._reviewed_credit(order, invoice, partner_id=other_partner.id)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'another customer'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_explicit_order_credit_still_checks_store(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        self._reviewed_credit(order, invoice, shopify_instance_id=False)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'Shopify store'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_explicit_order_credit_still_checks_source_refund_id(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        self._reviewed_credit(order, invoice, shopify_refund_id='another-refund')
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'reviewed credit note'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_explicit_order_credit_still_checks_currency(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        currency = self.env['res.currency'].with_context(active_test=False).search([
+            ('name', '=', 'EUR' if order.currency_id.name != 'EUR' else 'USD'),
+        ], limit=1)
+        currency.active = True
+        self._reviewed_credit(order, invoice, currency_id=currency.id)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'company and currency'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_explicit_order_credit_still_checks_amount(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        self._reviewed_credit(order, invoice, invoice_line_ids=[Command.create({
+            'name': 'Incorrect adjustment', 'account_id': self.revenue.id,
+            'quantity': 1, 'price_unit': 9.94, 'tax_ids': [Command.clear()],
+        })])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'differs from its Shopify refund'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_explicit_order_credit_with_another_sales_order_line_is_blocked(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        other_order = order.copy({'shopify_order_id': 'another-order'})
+        credit = self._reviewed_credit(order, invoice)
+        credit.invoice_line_ids.sale_line_ids = other_order.order_line[:1]
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'another order'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_sales_order_line_credit_with_conflicting_explicit_order_is_blocked(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        other_order = order.copy({'shopify_order_id': 'another-order'})
+        credit = self._reviewed_credit(other_order, invoice)
+        credit.invoice_line_ids.sale_line_ids = order.order_line[:1]
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'conflicting Shopify order link'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_standalone_credit_reversing_other_invoice_is_blocked(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        other_invoice = invoice.copy({'name': '/'})
+        other_invoice.invoice_line_ids.sale_line_ids = False
+        other_invoice.action_post()
+        self._reviewed_credit(order, invoice, reversed_entry_id=other_invoice.id)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'reverses an invoice outside'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_standalone_credit_applied_to_other_invoice_is_blocked(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        credit = self._reviewed_credit(order, invoice)
+        other_invoice = invoice.copy({'name': '/'})
+        other_invoice.invoice_line_ids.sale_line_ids = False
+        other_invoice.action_post()
+        (credit.line_ids | other_invoice.line_ids).filtered(
+            lambda line: line.account_type == 'asset_receivable').reconcile()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'outside this order'):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_draft_explicit_order_credit_blocks_repair(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        self._reviewed_credit(order, invoice, post=False)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            self.assertEqual(wizard.state, 'blocked')
+            with self.assertRaises(UserError):
+                wizard.action_apply()
+
+    def test_duplicate_explicit_order_refund_credits_block_repair(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        self._reviewed_credit(order, invoice)
+        self._reviewed_credit(order, invoice)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(repair=True)
+
+    def test_changed_standalone_credit_allocation_invalidates_preview(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        credit = self._reviewed_credit(order, invoice)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            (credit.line_ids | invoice.line_ids).filtered(
+                lambda line: line.account_type == 'asset_receivable').reconcile()
+            with self.assertRaisesRegex(UserError, 'changed after preview'):
+                wizard.action_apply()
+            self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_changed_standalone_credit_order_link_invalidates_preview(self):
+        order, invoice, payload, events = self._amount_only_fixture()
+        credit = self._reviewed_credit(order, invoice)
+        other_order = order.copy({'shopify_order_id': 'another-order'})
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            credit.shopify_refund_order_id = other_order
+            with self.assertRaises(UserError):
+                wizard.action_apply()
+            self.assertFalse(order.shopify_payment_audit_ids)
 
     def _legacy(self, invoice, amount):
         payment = self.env['account.payment'].create({

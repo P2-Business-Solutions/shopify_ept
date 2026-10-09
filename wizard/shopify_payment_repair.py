@@ -45,6 +45,10 @@ class ShopifyPaymentRepair(models.TransientModel):
             sections.append(Markup('<p>Invoice treatment: %s. Replace legacy payments: %s. Create credit notes: %s.</p>')
                             % (escape(treatment), escape(', '.join(map(str, plan['replace_ids'])) or 'None'),
                                len(plan['credits'])))
+            for credit in self.env['account.move'].browse(plan['reused_credit_ids']):
+                sections.append(Markup('<p>Reuse credit note %s for Shopify refund %s: %s %s.</p>')
+                                % (escape(credit.display_name), escape(credit.shopify_refund_id),
+                                   escape(str(credit.amount_total)), escape(credit.currency_id.name)))
             for payment in self.env['account.payment'].browse(plan['replace_ids']):
                 sections.append(Markup('<p>Reverse %s (%s %s), entry %s, dated %s. The original entry and reversal remain in the audit trail.</p>')
                                 % (escape(payment.display_name), escape(str(payment.amount)), escape(payment.currency_id.name),

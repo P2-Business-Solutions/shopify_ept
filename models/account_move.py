@@ -29,6 +29,11 @@ class AccountMove(models.Model):
          'This Shopify payout reference already has a settlement entry for this instance.'),
     ]
     shopify_refund_id = fields.Char(help="Id of shopify refund.", copy=False)
+    shopify_refund_order_id = fields.Many2one(
+        'sale.order', string='Shopify Order', copy=False, index=True,
+        check_company=True, ondelete='restrict',
+        help='The Shopify sales order this reviewed credit note belongs to. '
+             'Payment repair only searches standalone credits explicitly linked to its order.')
     is_shopify_multi_payment = fields.Boolean("Multi Payments?", default=False, copy=False,
                                               help="It is used to identify that order has multi-payment gateway or not")
 

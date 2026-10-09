@@ -185,6 +185,7 @@ class SaleOrderPaymentSync(models.Model):
                 'company_id': self.company_id.id, 'partner_id': invoice.partner_id.id,
                 'currency_id': self.currency_id.id, 'invoice_date': date, 'date': date,
                 'reversed_entry_id': invoice.id, 'shopify_instance_id': self.shopify_instance_id.id,
+                'shopify_refund_order_id': self.id,
                 'shopify_refund_id': str(refund['id']), 'is_refund_in_shopify': True,
                 'ref': 'Shopify refund %s' % refund['id'], 'invoice_line_ids': lines}
 
@@ -224,6 +225,15 @@ class SaleOrderPaymentSync(models.Model):
         try:
             events = cash_events(transactions, self.shopify_order_id, self.currency_id.name)
             documents = self.invoice_ids.filtered(lambda move: move.state != 'cancel')
+            # Applying a standalone credit reconciles receivables but does not add
+            # sale-line links. Only an explicit order link makes it a candidate;
+            # source refund identity is validated separately, never inferred.
+            referenced_credits = self.env['account.move'].search([
+                ('move_type', '=', 'out_refund'), ('state', '!=', 'cancel'),
+                ('shopify_refund_order_id', '=', self.id),
+            ])
+            standalone_credits = referenced_credits - documents
+            documents |= referenced_credits
             if documents.filtered(lambda move: move.state != 'posted'):
                 raise UserError(_('Post or remove draft invoices/credit notes before synchronizing cash transactions.'))
             invoices = documents.filtered(lambda move: move.move_type == 'out_invoice')
@@ -233,6 +243,20 @@ class SaleOrderPaymentSync(models.Model):
                 raise UserError(_('Posted invoices in the order company and currency are required.'))
             if documents.invoice_line_ids.sale_line_ids.order_id - self:
                 raise UserError(_('An invoice includes another order. Allocate its payments manually before using this repair.'))
+            if credits.filtered(lambda move: move.shopify_refund_order_id and move.shopify_refund_order_id != self):
+                raise UserError(_('A refund credit has a conflicting Shopify order link.'))
+            if documents.filtered(lambda move: move.commercial_partner_id != self.partner_id.commercial_partner_id):
+                raise UserError(_('The invoice or refund credit belongs to another customer. Review its Shopify refund link.'))
+            for credit in standalone_credits:
+                if credit.shopify_instance_id != self.shopify_instance_id:
+                    raise UserError(_('The standalone refund credit must use this order\'s Shopify store.'))
+                if credit.reversed_entry_id and credit.reversed_entry_id not in invoices:
+                    raise UserError(_('The Shopify refund credit reverses an invoice outside this order.'))
+                lines = credit.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')
+                matches = lines.matched_debit_ids | lines.matched_credit_ids
+                other_moves = (matches.debit_move_id | matches.credit_move_id).move_id - credit
+                if (other_moves - documents).filtered(lambda move: not move.origin_payment_id):
+                    raise UserError(_('The Shopify refund credit is applied to an entry outside this order.'))
             receivable = documents.line_ids.filtered(lambda row: row.account_type == 'asset_receivable').account_id
             if len(receivable) != 1 or not receivable.reconcile:
                 raise UserError(_('The order documents must use one reconcilable receivable account.'))
@@ -332,6 +356,7 @@ class SaleOrderPaymentSync(models.Model):
                        line.matched_debit_ids.ids, line.matched_credit_ids.ids) for line in items.sorted('id')],
         }
         return {'order_id': self.id, 'mode': mode, 'events': events, 'credits': credit_values,
+                'reused_credit_ids': credits.ids,
                 'embedded_refund_ids': embedded_ids, 'invoice_ids': invoices.ids,
                 'source_fingerprint': fingerprint({'order': payload, 'transactions': transactions}),
                 'receivable_account_id': receivable.id,

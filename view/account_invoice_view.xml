@@ -23,6 +23,9 @@
                     <field name="shopify_instance_id" string="Shopify Store"
                            domain="[('shopify_company_id', '=', company_id)]"
                            options="{'no_create': True}" readonly="state == 'cancel'"/>
+                    <field name="shopify_refund_order_id" string="Shopify Order"
+                           domain="[('shopify_instance_id', '=', shopify_instance_id), ('company_id', '=', company_id)]"
+                           options="{'no_create': True}" readonly="state == 'cancel'"/>
                     <field name="shopify_refund_id" string="Shopify Refund ID"
                            placeholder="Shopify refund document ID"
                            help="The Shopify refund document ID, not its payment transaction ID or PayPal reference. Payment repair uses this ID to reuse this reviewed credit note."
@@ -31,8 +34,8 @@
                            readonly="state == 'cancel'"/>
                     <div class="text-muted" colspan="2">
                         Link a reviewed credit note to an existing Shopify refund here.
-                        These fields do not send money or create a refund. Keep the credit note
-                        linked to the original sales order, then post it and run
+                        These fields do not send money or create a refund. Select the original
+                        Shopify order so payment repair can find this credit note. Post it and run
                         Preview / Repair Shopify Payments on that order.
                     </div>
                 </group>

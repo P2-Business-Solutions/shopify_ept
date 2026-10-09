@@ -106,8 +106,13 @@ payment twice. The audit is immutable through ordinary editing/deletion.
 
 For a successful amount-only refund, keep the original gross invoice and prepare a
 reviewed partial credit note for the cash refund amount, with the appropriate account
-and tax treatment. Create it from the original invoice and retain its sales-order line
-links so it appears among that order's invoices and credit notes.
+and tax treatment. Creating it from the original invoice retains its sales-order line
+links. From version 18.0.3.22, a standalone credit note can instead be explicitly linked
+using **Shopify Order**, even when it is absent from the sales order's invoice list.
+Applying a credit to an invoice does not itself create those sales-order links. Repair
+searches standalone credits only by this order field, then validates their store and
+refund identity against this order's source history. It never searches for credits on
+other orders by customer, amount or refund ID alone.
 
 From version 18.0.3.21, accounting managers can open the credit note's **Other Info →
 Shopify Refund** section to select the **Shopify Store**, enter the **Shopify Refund ID**,
@@ -116,9 +121,17 @@ not the Shopify cash transaction ID or PayPal refund reference. These metadata f
 are editable on draft and posted credit notes; setting them does not issue another refund
 or create accounting entries.
 
-Post the credit note before generating a new payment-repair preview. The repair checks
-the linked refund and credit-note amount, reuses the reviewed credit note, and records
-the original gross receipt and separate outgoing refund payment. Then use the PayPal
+From version 18.0.3.22, also select the original **Shopify Order** for a standalone
+credit note. No inferred link or change to invoice lines is needed.
+
+Post the credit note before generating a new payment-repair preview. It may already be
+applied to the original invoice: a reduced outstanding balance does not change the
+invoice's original total or the gross cash receipt that repair records. The preview
+names the credit note it will reuse. The repair checks the linked refund and credit-note
+amount, company, currency and customer; conflicting invoice/order links, allocations
+outside this order and duplicate or draft refund credits require review. It reuses the
+reviewed credit note and records the original gross receipt and separate outgoing
+refund payment. Then use the PayPal
 reference backfill and payout reconciliation in Payment Payout Reconciliation to clear
 the payment outstanding entries and reconcile the bank withdrawal/deposit.
 
