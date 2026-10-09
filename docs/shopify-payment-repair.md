@@ -102,6 +102,28 @@ payment twice. The audit is immutable through ordinary editing/deletion.
 
 ## Cases that require review
 
+### Amount-only refunds with an original invoice
+
+For a successful amount-only refund, keep the original gross invoice and prepare a
+reviewed partial credit note for the cash refund amount, with the appropriate account
+and tax treatment. Create it from the original invoice and retain its sales-order line
+links so it appears among that order's invoices and credit notes.
+
+From version 18.0.3.21, accounting managers can open the credit note's **Other Info →
+Shopify Refund** section to select the **Shopify Store**, enter the **Shopify Refund ID**,
+and check **Refund Already Issued in Shopify**. The ID is Shopify's refund document ID,
+not the Shopify cash transaction ID or PayPal refund reference. These metadata fields
+are editable on draft and posted credit notes; setting them does not issue another refund
+or create accounting entries.
+
+Post the credit note before generating a new payment-repair preview. The repair checks
+the linked refund and credit-note amount, reuses the reviewed credit note, and records
+the original gross receipt and separate outgoing refund payment. Then use the PayPal
+reference backfill and payout reconciliation in Payment Payout Reconciliation to clear
+the payment outstanding entries and reconcile the bank withdrawal/deposit.
+
+### Other exceptions
+
 The preview blocks locked or protected entries; payments already matched at the bank;
 applications involving another order; unidentified or ambiguous legacy payments;
 missing refund-parent history; unsupported currency conversion; gift-card transactions;

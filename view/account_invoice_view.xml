@@ -17,6 +17,26 @@
                 <field name="is_refund_in_shopify" invisible="1"/><!-- Reason for making this field invisible beacuse this field is used in other view field as reference or condition.-->
                 <field name="is_shopify_multi_payment" invisible="1"/><!-- Reason for making this field invisible beacuse this field is used in other view field as reference or condition.-->
             </field>
+            <xpath expr="//page[@id='other_tab']/group[@id='other_tab_group']" position="inside">
+                <group name="shopify_refund_info" string="Shopify Refund"
+                       groups="account.group_account_manager" invisible="move_type != 'out_refund'">
+                    <field name="shopify_instance_id" string="Shopify Store"
+                           domain="[('shopify_company_id', '=', company_id)]"
+                           options="{'no_create': True}" readonly="state == 'cancel'"/>
+                    <field name="shopify_refund_id" string="Shopify Refund ID"
+                           placeholder="Shopify refund document ID"
+                           help="The Shopify refund document ID, not its payment transaction ID or PayPal reference. Payment repair uses this ID to reuse this reviewed credit note."
+                           readonly="state == 'cancel'"/>
+                    <field name="is_refund_in_shopify" string="Refund Already Issued in Shopify"
+                           readonly="state == 'cancel'"/>
+                    <div class="text-muted" colspan="2">
+                        Link a reviewed credit note to an existing Shopify refund here.
+                        These fields do not send money or create a refund. Keep the credit note
+                        linked to the original sales order, then post it and run
+                        Preview / Repair Shopify Payments on that order.
+                    </div>
+                </group>
+            </xpath>
             <xpath expr="//header" position="after">
                 <div class="alert alert-warning" role="alert" style="margin-bottom:0px;"
                      invisible="not is_shopify_multi_payment or state != 'posted' or move_type != 'out_invoice' or payment_state not in ['not_paid','in_payment','partial']">
