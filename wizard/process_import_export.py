@@ -40,7 +40,8 @@ class ShopifyProcessImportExport(models.TransientModel):
          ("export_stock", "Export Stock"),
          ("import_location", "Import Locations"),
          ("import_products_from_csv", "Map Products"),
-         ("import_payout_report", "Import Payout Report")
+         ("import_payout_report", "Import Payout Report"),
+         ("import_payouts_by_ids", "Import Specific Payout(s)")
          ],
         default="sync_product", string="Operation")
     orders_from_date = fields.Datetime(string="From Date")
@@ -76,6 +77,9 @@ class ShopifyProcessImportExport(models.TransientModel):
     export_stock_from = fields.Datetime(help="It is used for exporting stock from Odoo to Shopify.")
     payout_start_date = fields.Date(string="Start Date")
     payout_end_date = fields.Date(string="End Date")
+    shopify_payout_ids = fields.Text(
+        string='Payout IDs',
+        help='Shopify payout IDs, separated by commas or new lines. Use the Payout Reference ID from an existing report or the payout ID from Shopify.')
     skip_existing_product = fields.Boolean(string="Do Not Update Existing Products",
                                            help="Check if you want to skip existing products.")
     csv_file = fields.Binary(help="Select CSV file to upload.")
@@ -216,12 +220,22 @@ class ShopifyProcessImportExport(models.TransientModel):
         elif self.shopify_operation == "update_order_status":
             self.update_order_status()
 
-        elif self.shopify_operation == "import_payout_report":
+        elif self.shopify_operation in ("import_payout_report", "import_payouts_by_ids"):
             product_obj = self.env['product.product']
             ac_module = product_obj.search_installed_module_ept('account_accountant')
             if not ac_module:
                 raise UserError(
                     "Payout reports are only available in the enterprise. The 'Accounting' Apps should be installed.")
+            if self.shopify_operation == 'import_payouts_by_ids':
+                if not instance:
+                    raise UserError(_('Select a Shopify instance.'))
+                payouts = self.env['shopify.payout.report.ept'].get_payout_report_by_ids(self.shopify_payout_ids, instance)
+                action = self.env.ref('shopify_ept.action_shopify_payout_report_ept').read()[0]
+                context = {key: value for key, value in self.env.context.items() if not key.startswith('search_default_')}
+                action.update({'domain': [('id', 'in', payouts.ids)], 'context': context})
+                if len(payouts) == 1:
+                    action.update({'views': [(self.env.ref('shopify_ept.shopify_payout_report_form_view').id, 'form')], 'res_id': payouts.id})
+                return action
             if self.payout_end_date and self.payout_start_date:
                 if self.payout_end_date < self.payout_start_date:
                     raise UserError("The start date must be precede its end date")

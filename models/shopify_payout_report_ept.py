@@ -13,6 +13,7 @@ import ast
 from odoo.tools.float_utils import float_is_zero
 from .shopify_transaction_utils import normalize_shopify_id
 from .shopify_shop_cash_utils import shop_cash_kind, shop_cash_allocations
+from .shopify_payout_import_utils import parse_payout_ids
 
 _logger = logging.getLogger('Shopify Payout')
 
@@ -80,11 +81,44 @@ class ShopifyPaymentReportEpt(models.Model):
 
         self._cr.commit()
         _logger.info("Payout Reports are Created. Generating Bank statement lines...")
-        payouts.generate_bank_statement()
+        payouts._generate_imported_bank_statements()
 
         instance.write({'payout_last_import_date': end_date})
         _logger.info("Payout Reports are Imported.")
         return True
+
+    def get_payout_report_by_ids(self, payout_ids, instance):
+        """Fetch only the requested paid Shopify payouts, with the same reimport repair."""
+        try:
+            identities = parse_payout_ids(payout_ids)
+        except ValueError as error:
+            raise UserError(str(error)) from error
+        instance.ensure_one()
+        instance.connect_in_shopify()
+        reports = []
+        for identity in identities:
+            try:
+                report = shopify.Payouts.find(identity)
+            except OperationalError:
+                raise
+            except Exception as error:
+                raise UserError(_('Could not retrieve Shopify payout %s. Verify its ID, store and payout API access.', identity)) from error
+            data = report.to_dict()
+            if normalize_shopify_id(data.get('id')) != identity:
+                raise UserError(_('Shopify returned a different payout for ID %s.', identity))
+            if data.get('status') != 'paid':
+                raise UserError(_('Shopify payout %s is not Paid yet. Import it after Shopify completes the payout.', identity))
+            reports.append(report)
+        payouts = self.create_payout_reports(reports, instance)
+        payouts._generate_imported_bank_statements()
+        # A targeted import must not move the date-range scheduler's checkpoint.
+        return payouts
+
+    def action_reimport_payouts(self):
+        """Refresh selected reports using their Shopify IDs and retry their accounting."""
+        for instance, payouts in self.grouped('instance_id').items():
+            self.get_payout_report_by_ids(','.join(payouts.mapped('payout_reference_id')), instance)
+        return {'type': 'ir.actions.client', 'tag': 'reload'}
 
     def create_payout_reports(self, payout_reports, instance):
         """
@@ -93,7 +127,7 @@ class ShopifyPaymentReportEpt(models.Model):
         @param payout_reports: List of Payout reports.
         @author: Maulik Barad on Date 03-Dec-2020.
         """
-        payouts = self
+        payouts = self.browse()
         for payout_report in payout_reports:
             payout_data = payout_report.to_dict()
             payout_id = payout_data.get('id')
@@ -102,6 +136,7 @@ class ShopifyPaymentReportEpt(models.Model):
             if payout:
                 _logger.info("Existing Payout Report found for %s.", payout_id)
                 payout.refresh_payout_transaction_links()
+                payout._reprocess_imported_bank_statement()
                 payouts += payout
                 continue
             payout_vals = self.prepare_payout_vals(payout_data, instance)

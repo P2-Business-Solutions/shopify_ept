@@ -15,3 +15,4 @@ from . import test_shopify_transaction_utils
 from . import test_shopify_payment_plan
 from . import test_shopify_cash_sync
 from . import test_shopify_shop_cash
+from . import test_shopify_payout_specific_import

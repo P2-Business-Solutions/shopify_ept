@@ -7,7 +7,7 @@ receiving bank journal. The settlement entry does not book sales, refunds or fee
 
 ## Setup
 
-Upgrade `shopify_ept` to version `18.0.3.25`. On the Shopify instance's **Payout
+Upgrade `shopify_ept` to version `18.0.3.26`. On the Shopify instance's **Payout
 Configurations** tab, configure:
 
 1. **Payout Report Journal:** the separate Shopify settlement bank journal.
@@ -150,13 +150,36 @@ journal items. Posting a Shop Cash credit to a generic account cannot pass this 
 Matched payments and imported breakdowns are visible on the payout transaction.
 **Preview / Repair Payments** includes the orders from grouped Shop Cash transactions.
 
-After upgrading, reimport existing payout reports to retrieve the Shop Cash breakdown
-and then process the outstanding statement lines. Reimporting does not duplicate the
-statement lines or payments. If a historical Shop Cash line was already posted through
-the generic credit/debit mapping, review and undo that reconciliation before matching
-its payments; the upgrade does not rewrite posted accounting or existing transfers.
+After upgrading, reimport existing payout reports to retrieve the Shop Cash breakdown.
+Version `18.0.3.26` retries outstanding statement matches and automatically resets a
+plain generic Shop Cash credit/debit posting before matching its actual payments.
+Grouped credits and refunds use the same checks. Each reset and replacement match is
+atomic: if matching fails, the original posting is restored. Correct payment matches,
+fees and existing settlement transfers are preserved; no duplicate statement lines or
+Shop Cash payments are created. Lines with linked manual accounting or nonstandard
+postings remain for review. The payout shows the reason when reprocessing needs review.
+
+Global and hard accounting locks are respected, including the original statement and
+settlement entry dates. Temporary user lock exceptions do not allow automatic repair
+of a closed period. Locked imports retain their Shopify metadata without changing
+accounting, creating entries in a later period or changing the payout's processing state.
 
 For an invoice paid with $225.91 by card and $40.00 by Shop Cash, matching clears those
 two gross payments independently. Fees of $5.38 and $0.90 and a $21.96 marketplace-tax
 deduction yield a $237.67 payout contribution. Existing marketplace-tax configuration
 is unchanged.
+
+## Reimport selected payouts
+
+In **Shopify → Processes → Shopify Operations**, choose **Import Specific Payout(s)**,
+select the store and enter one or more Shopify payout IDs separated by commas or new
+lines. Use the **Payout Reference ID**, such as `140763300066`, rather than Odoo's report
+number (`PTR00055`). Only the requested Paid payouts are fetched. This import does not
+change the date-range scheduler's last-import checkpoint.
+
+For existing reports, use **Reimport / Reconcile Payout** on a report, or select several
+reports and choose **Action → Reimport / Reconcile Payouts**. The date-range payout import
+also uses this repair path for reports already imported, including Partially Processed
+and Validated payouts. Review messages appear on the report and remain visible in the
+Remaining Reports filter. New open-period payouts still generate statement lines for
+the usual reconciliation workflow.

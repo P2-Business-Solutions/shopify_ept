@@ -445,7 +445,7 @@
                                     </b>
                                 </p>
                             </div>
-                            <div invisible="shopify_operation != 'import_payout_report'">
+                            <div invisible="shopify_operation not in ['import_payout_report','import_payouts_by_ids']">
                                 <p colspan="2" class="alert alert-warning" role="alert">
                                     <b>
                                         <u>
@@ -457,6 +457,9 @@
                                                 Import payout report allows to import payout
                                                 transaction
                                                 report from Shopify store to Odoo.
+                                                Reimporting an existing payout retries outstanding matches and repairs
+                                                generic Shop Cash credit/refund postings in open accounting periods.
+                                                Closed periods are left unchanged.
                                             </li>
                                             <li>
                                                 Payout Report record will be added under Shopify >
@@ -559,7 +562,7 @@
                             </div>
                         </div>
                         <notebook
-                                invisible="shopify_operation not in ['sync_product','import_shipped_orders','import_unshipped_orders','import_orders_by_remote_ids','sync_product_by_remote_ids','export_stock','import_stock','import_payout_report','import_products_from_csv','import_cancel_orders','import_buy_with_prime_orders']">
+                                invisible="shopify_operation not in ['sync_product','import_shipped_orders','import_unshipped_orders','import_orders_by_remote_ids','sync_product_by_remote_ids','export_stock','import_stock','import_payout_report','import_payouts_by_ids','import_products_from_csv','import_cancel_orders','import_buy_with_prime_orders']">
                             <page string='Sync Option'>
                                 <div class="row">
                                     <div class='col-md-6'>
@@ -601,12 +604,12 @@
                                         </group>
                                     </div>
                                     <div class="col-md-6"
-                                         invisible="shopify_operation in ['import_cancel_orders','import_orders_by_remote_ids','sync_product_by_remote_ids','import_payout_report']">
+                                         invisible="shopify_operation in ['import_cancel_orders','import_orders_by_remote_ids','sync_product_by_remote_ids','import_payout_report','import_payouts_by_ids']">
                                         <field name="shopify_video_embed_code" string="Shopify Operation Video"/>
                                     </div>
                                 </div>
                                 <div class="row"
-                                     invisible="shopify_operation not in ['import_orders_by_remote_ids','sync_product_by_remote_ids','import_payout_report']">
+                                     invisible="shopify_operation not in ['import_orders_by_remote_ids','sync_product_by_remote_ids','import_payout_report','import_payouts_by_ids']">
                                     <group name='sync_order_based_on_template_ids'
                                            invisible="shopify_operation != 'import_orders_by_remote_ids'">
                                         <field name='shopify_order_ids' string="Order IDs"
@@ -618,6 +621,12 @@
                                         <field name='shopify_template_ids'
                                                placeholder="4341100314679,4341100314680,4341100314678,4341100314658"
                                                required="shopify_operation == 'sync_product_by_remote_ids'"/>
+                                    </group>
+                                    <group name="import_specific_payouts"
+                                           invisible="shopify_operation != 'import_payouts_by_ids'">
+                                        <field name="shopify_payout_ids"
+                                               placeholder="140763300066,140763300067"
+                                               required="shopify_operation == 'import_payouts_by_ids'"/>
                                     </group>
                                     <group name='import_payout_report'
                                            invisible="shopify_operation != 'import_payout_report'">

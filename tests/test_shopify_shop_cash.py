@@ -1,6 +1,7 @@
 """Shop Cash parsing and real-ledger settlement coverage."""
 import importlib.util
 import json
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -130,9 +131,10 @@ class TestShopCashSettlement(PayoutTestCase):
         _liquidity, suspense, _other = statement._seek_for_lines()
         suspense.write({'account_id': account.id})
 
-    def _process(self, payout):
+    def _process(self, payout, operation=None):
+        operation = operation or payout.process_bank_statement
         if 'bank.rec.widget' in self.env.registry.models:
-            payout.process_bank_statement()
+            return operation()
         else:
             with patch.object(type(payout), 'shopify_reconcile_bank_statement_line_ept',
                               lambda model, statement_id, line_ids: self._ledger_reconcile(model, statement_id, line_ids)), \
@@ -140,7 +142,227 @@ class TestShopCashSettlement(PayoutTestCase):
                                  lambda model, statement, _line: self._book_counterpart(statement,
                                      model.instance_id.transaction_line_ids.filtered(
                                          lambda row: row.transaction_type == statement.shopify_transaction_type).account_id)):
-                payout.process_bank_statement()
+                return operation()
+
+    def test_reimport_repairs_generic_credit_preserves_card_and_is_repeatable(self):
+        order, invoice = self._order('reimport-mixed', 265.91)
+        card = self._payment(order, 225.91, 'reimport-card', gateway='shopify_payments', invoice=invoice)
+        cash = self._payment(order, 40, 'reimport-cash', invoice=invoice)
+        payout = self._cash_payout('140763300066', [{'order_transaction_id': 'reimport-cash', 'amount': '40'}])
+        payout.write({'amount': 265.91, 'payout_transaction_ids': [Command.create({
+            'transaction_id': 'reimport-card-balance', 'transaction_type': 'charge',
+            'source_order_transaction_id': 'reimport-card', 'source_order_id': order.shopify_order_id,
+            'order_id': order.id, 'amount': 225.91, 'net_amount': 225.91,
+            'currency_id': payout.currency_id.id, 'is_remaining_statement': True})]})
+        payout.generate_bank_statement()
+        statements = self._statement_lines(payout)
+        cash_statement = statements.filtered(lambda row: row.payout_line_id.shop_cash_kind)
+        card_statement = statements - cash_statement
+        self._ledger_reconcile(payout, card_statement.id, card._seek_for_lines()[0].ids)
+        self._book_counterpart(cash_statement, self.revenue)
+        payout.state = 'partially_processed'
+        card_items = card_statement.line_ids
+        moves = statements.move_id
+        report = SimpleNamespace(to_dict=lambda: {'id': 140763300066, 'status': 'paid'})
+        cash_data = {'id': '140763300066-balance', 'type': 'credit', 'adjustment_reason': 'shop_cash',
+            'currency': payout.currency_id.name, 'amount': 40, 'fee': 0, 'net': 40,
+            'adjustment_order_transactions': [{'order_transaction_id': 'reimport-cash', 'amount': '40'}]}
+        with patch.object(type(self.instance), 'connect_in_shopify'), \
+                patch.object(shopify.Payouts, 'find', return_value=report), \
+                patch.object(shopify.Transactions, 'find', return_value=[SimpleNamespace(to_dict=lambda: cash_data)]):
+            imported = self._process(payout, lambda: self.env[payout._name].get_payout_report_by_ids('140763300066', self.instance))
+        self.assertEqual(imported, payout)
+        self.assertEqual(payout.state, 'validated')
+        self.assertFalse(payout.reimport_reconciliation_issue)
+        self.assertEqual(self._statement_lines(payout), statements)
+        self.assertEqual(statements.move_id, moves)
+        self.assertEqual(card_statement.line_ids, card_items)
+        self.assertEqual(invoice.payment_state, 'paid')
+        self.assertTrue(all(payment._seek_for_lines()[0].reconciled for payment in card | cash))
+        original_items = statements.line_ids
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(statements.line_ids, original_items)
+
+    def test_reimport_repairs_grouped_credits_and_refunds(self):
+        captures, refunds = self.env['account.payment'], self.env['account.payment']
+        credit_entries, refund_entries = [], []
+        for reference, amount, refund_amount in (('reimport-first', 40, 10), ('reimport-second', 25, 5)):
+            order, invoice = self._order(reference, amount)
+            captures |= self._payment(order, amount, reference + '-cash', invoice=invoice)
+            refunds |= self._payment(order, refund_amount, reference + '-refund', kind='refund')
+            credit_entries.append({'order': {'id': reference}, 'amount': str(amount)})
+            refund_entries.append({'order_transaction_id': reference + '-refund', 'amount': str(refund_amount)})
+        credits = self._cash_payout('reimport-group-credit', credit_entries, fee=1.30)
+        debits = self._cash_payout('reimport-group-refund', refund_entries, amount=-15, reason='shop_cash_refund')
+        for payout in credits | debits:
+            payout.generate_bank_statement()
+            self._book_counterpart(self._statement_lines(payout).filtered(lambda row: row.payout_line_id.shop_cash_kind), self.revenue)
+            payout.state = 'validated'  # Historical generic postings passed the old validation.
+            self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+            self.assertEqual(payout.state, 'validated')
+            self.assertFalse(payout.reimport_reconciliation_issue)
+        self.assertTrue(all(payment._seek_for_lines()[0].reconciled for payment in captures | refunds))
+        self.assertEqual(credits.payout_transaction_ids.filtered('shop_cash_kind').shop_cash_payment_ids, captures)
+        self.assertEqual(debits.payout_transaction_ids.filtered('shop_cash_kind').shop_cash_payment_ids, refunds)
+
+    def test_failed_rematch_restores_generic_posting_and_does_not_steal_payment(self):
+        order, invoice = self._order('consumed-reimport')
+        payment = self._payment(order, 40, 'consumed-reimport-cash', invoice=invoice)
+        original = self._cash_payout('original-payment-owner', [{'order_transaction_id': 'consumed-reimport-cash', 'amount': '40'}])
+        original.generate_bank_statement()
+        self._process(original)
+        payout = self._cash_payout('duplicate-payment-owner', [{'order_transaction_id': 'consumed-reimport-cash', 'amount': '40'}])
+        payout.generate_bank_statement()
+        statement = self._statement_lines(payout)
+        self._book_counterpart(statement, self.revenue)
+        payout.state = 'validated'
+        original_items = statement.line_ids
+        partials = payment._seek_for_lines()[0].matched_credit_ids
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(statement.line_ids, original_items)
+        self.assertTrue(statement.is_reconciled)
+        self.assertEqual(statement._seek_for_lines()[2].account_id, self.revenue)
+        self.assertEqual(payment._seek_for_lines()[0].matched_credit_ids, partials)
+        self.assertEqual(payout.state, 'partially_processed')
+        self.assertTrue(payout.reimport_reconciliation_issue)
+
+    def test_reimport_preserves_linked_manual_match_for_review(self):
+        order, invoice = self._order('manual-cash')
+        cash = self._payment(order, 40, 'manual-cash', invoice=invoice)
+        other_order, _other_invoice = self._order('manual-card')
+        wrong_payment = self._payment(other_order, 40, 'manual-card', gateway='shopify_payments')
+        payout = self._cash_payout('manual-credit', [{'order_transaction_id': 'manual-cash', 'amount': '40'}])
+        payout.generate_bank_statement()
+        statement = self._statement_lines(payout)
+        self._ledger_reconcile(payout, statement.id, wrong_payment._seek_for_lines()[0].ids)
+        payout.state = 'validated'
+        items = statement.line_ids
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(statement.line_ids, items)
+        self.assertTrue(wrong_payment._seek_for_lines()[0].reconciled)
+        self.assertFalse(cash._seek_for_lines()[0].reconciled)
+        self.assertIn('linked accounting', payout.reimport_reconciliation_issue)
+
+    def _legacy_locked_payout(self, lock_field):
+        order, invoice = self._order('locked-' + lock_field)
+        cash = self._payment(order, 40, 'locked-' + lock_field, invoice=invoice)
+        payout = self._cash_payout('locked-payout-' + lock_field,
+            [{'order_transaction_id': cash.shopify_order_transaction_id, 'amount': '40'}])
+        payout.generate_bank_statement()
+        self._book_counterpart(self._statement_lines(payout), self.revenue)
+        payout.state = 'validated'
+        self.env.company[lock_field] = fields.Date.today()
+        return payout, cash
+
+    def test_global_lock_prevents_reset_even_with_user_exception(self):
+        payout, cash = self._legacy_locked_payout('fiscalyear_lock_date')
+        # Even a user allowed to post through an exception must not reprocess a closed payout.
+        self.env['account.lock_exception'].create({'company_id': self.env.company.id,
+            'user_id': self.env.user.id, 'lock_date_field': 'fiscalyear_lock_date',
+            'lock_date': fields.Date.today() - timedelta(days=1), 'reason': 'Test temporary exception'})
+        self.assertLess(self.env.company._get_user_fiscal_lock_date(self.journal), payout.payout_date)
+        items = self._statement_lines(payout).line_ids
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(self._statement_lines(payout).line_ids, items)
+        self.assertEqual(payout.state, 'validated')
+        self.assertFalse(cash._seek_for_lines()[0].reconciled)
+        self.assertIn('closed accounting period', payout.reimport_reconciliation_issue)
+
+    def test_hard_lock_prevents_reset(self):
+        payout, cash = self._legacy_locked_payout('hard_lock_date')
+        items = self._statement_lines(payout).line_ids
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(self._statement_lines(payout).line_ids, items)
+        self.assertEqual(payout.state, 'validated')
+        self.assertFalse(cash._seek_for_lines()[0].reconciled)
+
+    def test_locked_original_statement_blocks_unlocked_payout_date(self):
+        payout, cash = self._legacy_locked_payout('fiscalyear_lock_date')
+        payout.payout_date = fields.Date.today() + timedelta(days=1)
+        items = self._statement_lines(payout).line_ids
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(self._statement_lines(payout).line_ids, items)
+        self.assertFalse(cash._seek_for_lines()[0].reconciled)
+        self.assertIn('Journal entry', payout.reimport_reconciliation_issue)
+
+    def test_reimport_retries_open_payments_without_recreating_statements(self):
+        order, invoice = self._order('retry-open')
+        payout = self._cash_payout('retry-open-credit', [{'order_transaction_id': 'retry-open-cash', 'amount': '40'}])
+        payout.generate_bank_statement()
+        payout.state = 'partially_processed'
+        statements = self._statement_lines(payout)
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        cash = self._payment(order, 40, 'retry-open-cash', invoice=invoice)
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(payout.state, 'validated')
+        self.assertFalse(payout.reimport_reconciliation_issue)
+        self.assertEqual(self._statement_lines(payout), statements)
+        self.assertTrue(cash._seek_for_lines()[0].reconciled)
+
+    def test_successful_repair_survives_an_unbalanced_payout_validation(self):
+        order, invoice = self._order('unbalanced-reimport')
+        cash = self._payment(order, 40, 'unbalanced-cash', invoice=invoice)
+        payout = self._cash_payout('unbalanced-credit', [{'order_transaction_id': 'unbalanced-cash', 'amount': '40'}])
+        payout.amount = 41
+        payout.generate_bank_statement()
+        self._book_counterpart(self._statement_lines(payout), self.revenue)
+        payout.state = 'validated'
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(payout.state, 'partially_processed')
+        self.assertTrue(cash._seek_for_lines()[0].reconciled)
+        payout._check_shop_cash_reconciliation(payout.payout_transaction_ids.filtered('shop_cash_kind'), self._statement_lines(payout))
+        self.assertIn('does not balance', payout.reimport_reconciliation_issue)
+
+    def _legacy_payout_with_bank_matched_transfer(self, settlement_date=None):
+        transit = self.env['account.account'].create({'name': 'Reimport Transit', 'code': 'SCRTRANS',
+            'account_type': 'asset_current', 'reconcile': True, 'company_ids': [Command.set(self.env.company.ids)]})
+        bank_account = self.journal.default_account_id.copy({'code': 'SCRBANK'})
+        bank = self.journal.copy({'name': 'Reimport Receiving Bank', 'code': 'SCRB', 'default_account_id': bank_account.id})
+        bank.inbound_payment_method_line_ids.payment_account_id = transit
+        transfer_journal = self.env['account.journal'].create({'name': 'Reimport Transfers', 'type': 'general', 'code': 'SCRT'})
+        self.instance.write({'shopify_payout_bank_journal_id': bank.id, 'shopify_payout_transit_account_id': transit.id,
+            'shopify_payout_transfer_journal_id': transfer_journal.id})
+        order, invoice = self._order('bank-matched-reimport')
+        cash = self._payment(order, 40, 'bank-matched-cash', invoice=invoice)
+        payout = self._cash_payout('bank-matched-credit', [{'order_transaction_id': 'bank-matched-cash', 'amount': '40'}])
+        payout.generate_bank_statement()
+        self._process(payout)
+        if settlement_date:
+            payout.payout_date = settlement_date
+        payout.action_create_settlement_transfer()
+        payout.payout_date = fields.Date.today()
+        bank_line = self.env['account.bank.statement.line'].create({'journal_id': bank.id,
+            'date': fields.Date.today(), 'payment_ref': 'Reimport Bank Deposit', 'amount': payout.amount,
+            'counterpart_account_id': transit.id})
+        (payout.settlement_line_id | bank_line.line_ids.filtered(lambda line: line.account_id == transit)).reconcile()
+        statement = self._statement_lines(payout)
+        statement.action_undo_reconciliation()
+        self._book_counterpart(statement, self.revenue)
+        return payout, cash, bank_line
+
+    def test_repair_preserves_existing_transfer_and_bank_match(self):
+        payout, cash, bank_line = self._legacy_payout_with_bank_matched_transfer()
+        move, items = payout.settlement_move_id, payout.settlement_move_id.line_ids
+        partials = payout.settlement_line_id.matched_credit_ids
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(payout.settlement_move_id, move)
+        self.assertEqual(move.line_ids, items)
+        self.assertEqual(payout.settlement_line_id.matched_credit_ids, partials)
+        self.assertEqual(payout.settlement_status, 'matched')
+        self.assertEqual(payout.settlement_bank_line_ids, bank_line)
+        self.assertTrue(cash._seek_for_lines()[0].reconciled)
+        self.assertEqual(self.env['account.move'].search_count([('shopify_settlement_payout_id', '=', payout.id)]), 1)
+
+    def test_locked_settlement_entry_blocks_open_statement_repair(self):
+        yesterday = fields.Date.today() - timedelta(days=1)
+        payout, cash, _bank_line = self._legacy_payout_with_bank_matched_transfer(settlement_date=yesterday)
+        self.env.company.fiscalyear_lock_date = yesterday
+        items = self._statement_lines(payout).line_ids
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(self._statement_lines(payout).line_ids, items)
+        self.assertEqual(payout.settlement_move_id.date, yesterday)
+        self.assertFalse(cash._seek_for_lines()[0].reconciled)
+        self.assertIn('Journal entry', payout.reimport_reconciliation_issue)
 
     def test_card_and_shop_cash_clear_invoice_and_validate_payout(self):
         order, invoice = self._order('mixed', 265.91)

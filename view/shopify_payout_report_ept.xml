@@ -13,7 +13,7 @@
                 <field name="statement_id"/>
                 <field name="payout_transaction_ids" string="Shopify Order ID" filter_domain="[('payout_transaction_ids.source_order_id', '=', self)]"/>
                 <filter name="remaining_reports" string="Remaining Reports"
-                        domain="['|', ('state', '!=', 'validated'), ('settlement_status', '!=', 'matched')]"/>
+                        domain="['|', '|', ('state', '!=', 'validated'), ('settlement_status', '!=', 'matched'), ('reimport_reconciliation_issue', '!=', False)]"/>
                 <filter name="awaiting_bank" string="Awaiting Bank Match"
                         domain="[('settlement_status', 'in', ['pending', 'partial'])]"/>
                 <filter name="settlement_review" string="Settlement Needs Review"
@@ -73,6 +73,8 @@
                     <button name="shopify_view_bank_statement" string="View Statement"
                             class="oe_highlight"
                             type="object"/>
+                    <button name="action_reimport_payouts" string="Reimport / Reconcile Payout"
+                            groups="account.group_account_user" type="object"/>
                     <button name="action_create_settlement_transfer" string="Create Settlement Transfer"
                             invisible="state not in ['processed', 'validated'] or settlement_move_id"
                             groups="account.group_account_user" type="object" class="oe_highlight"/>
@@ -90,6 +92,9 @@
                         Automatic Scheduler, Please
                         process it manually.
                     </strong>
+                </div>
+                <div class="alert alert-warning" role="alert" invisible="not reimport_reconciliation_issue">
+                    <field name="reimport_reconciliation_issue" readonly="1" nolabel="1"/>
                 </div>
                 <sheet>
                     <div class="oe_title" style="width:500px;">
@@ -234,6 +239,19 @@
 if records:
     records.generate_bank_statement()
     action = {'type': 'ir.actions.client', 'tag': 'reload'}
+        </field>
+    </record>
+
+    <record id="action_reimport_shopify_payouts" model="ir.actions.server">
+        <field name="name">Reimport / Reconcile Payouts</field>
+        <field name="model_id" ref="model_shopify_payout_report_ept"/>
+        <field name="binding_model_id" ref="model_shopify_payout_report_ept"/>
+        <field name="binding_view_types">list</field>
+        <field name="groups_id" eval="[(4, ref('account.group_account_user'))]"/>
+        <field name="state">code</field>
+        <field name="code">
+if records:
+    action = records.action_reimport_payouts()
         </field>
     </record>
 
