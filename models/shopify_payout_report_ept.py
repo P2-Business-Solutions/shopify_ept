@@ -12,6 +12,7 @@ from ..shopify.pyactiveresource.connection import ClientError
 import ast
 from odoo.tools.float_utils import float_is_zero
 from .shopify_transaction_utils import normalize_shopify_id
+from .shopify_shop_cash_utils import shop_cash_kind, shop_cash_allocations
 
 _logger = logging.getLogger('Shopify Payout')
 
@@ -125,7 +126,7 @@ class ShopifyPaymentReportEpt(models.Model):
         transaction_all = shopify.Transactions().find(payout_id=self.payout_reference_id, limit=250)
         transaction_all = self.shopify_list_all_transactions(transaction_all)
         for transaction in transaction_all:
-            transaction_data = transaction.to_dict()
+            transaction_data = self._enrich_shop_cash_transaction(transaction.to_dict())
             transaction_vals = self.prepare_transaction_vals(transaction_data, self.instance_id)
             shopify_payout_report_line_obj.create(transaction_vals)
 
@@ -157,7 +158,7 @@ class ShopifyPaymentReportEpt(models.Model):
         }
         statement_line_obj = self.env["account.bank.statement.line"]
         for transaction in transactions:
-            transaction_data = transaction.to_dict()
+            transaction_data = self._enrich_shop_cash_transaction(transaction.to_dict())
             payout_line = existing_lines.get(
                 normalize_shopify_id(transaction_data.get("id"))
             )
@@ -170,6 +171,10 @@ class ShopifyPaymentReportEpt(models.Model):
                 "source_order_transaction_id": values.get("source_order_transaction_id"),
                 "source_type": values.get("source_type"),
                 "order_id": values.get("order_id"),
+                "raw_transaction_type": values.get("raw_transaction_type"),
+                "adjustment_reason": values.get("adjustment_reason"),
+                "shop_cash_allocations": values.get("shop_cash_allocations"),
+                "shop_cash_detail_error": values.get("shop_cash_detail_error"),
             }
             payout_line.write(link_values)
             statement_line_obj.search([
@@ -214,6 +219,11 @@ class ShopifyPaymentReportEpt(models.Model):
         raw_transaction_type = data.get('type', '')
         adjustment_reason = data.get('adjustment_reason', '')
         transaction_type = 'tax_adjustment' if adjustment_reason == 'tax_adjustment' else raw_transaction_type
+        cash_kind = shop_cash_kind(raw_transaction_type, adjustment_reason)
+        if raw_transaction_type.lower() in ('shop_cash_credit', 'shop_cash_refund_debit_reversal'):
+            transaction_type = 'credit'
+        elif raw_transaction_type.lower() in ('shop_cash_refund_debit', 'shop_cash_credit_reversal'):
+            transaction_type = 'debit'
         amount = data.get('amount', 0.0)
         fee = data.get('fee', 0.0)
         net_amount = data.get('net', 0.0)
@@ -235,6 +245,9 @@ class ShopifyPaymentReportEpt(models.Model):
             'transaction_type': transaction_type,
             'raw_transaction_type': raw_transaction_type,
             'adjustment_reason': adjustment_reason,
+            'shop_cash_allocations': (data.get('shop_cash_allocations') if 'shop_cash_allocations' in data
+                                      else shop_cash_allocations(data)) if cash_kind else False,
+            'shop_cash_detail_error': data.get('shop_cash_detail_error') or False,
             'order_id': order_id and order_id.id,
             'amount': amount,
             'fee': fee,
@@ -442,6 +455,10 @@ class ShopifyPaymentReportEpt(models.Model):
                 counter_part_account_id = self.instance_id.transaction_line_ids.filtered(lambda l: l.transaction_type
                                                                                                    ==
                                                                                                    transaction.transaction_type).account_id
+                if transaction.shop_cash_kind:
+                    # Keep this open for matching actual payments, even if a
+                    # generic credit/debit account has been configured.
+                    counter_part_account_id = self.env['account.account']
                 bank_line_vals = {
                     # 'name': name or reference,
                     'payment_ref': name or reference,
@@ -832,7 +849,9 @@ class ShopifyPaymentReportEpt(models.Model):
             paid_move_lines = []
             try:
                 with self.env.cr.savepoint():
-                    if statement_line.shopify_transaction_type in ["charge", "refund", "payment_refund"]:
+                    if getattr(getattr(statement_line, 'payout_line_id', False), 'shop_cash_kind', False):
+                        self._reconcile_shop_cash_statement(statement_line)
+                    elif statement_line.shopify_transaction_type in ["charge", "refund", "payment_refund"]:
                         payout_transaction = statement_line.payout_line_id
                         exact_payment = self.find_payment_for_payout_transaction(payout_transaction)
                         if exact_payment and exact_payment.move_id:

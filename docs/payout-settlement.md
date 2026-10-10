@@ -7,7 +7,7 @@ receiving bank journal. The settlement entry does not book sales, refunds or fee
 
 ## Setup
 
-Upgrade `shopify_ept` to version `18.0.3.18`. On the Shopify instance's **Payout
+Upgrade `shopify_ept` to version `18.0.3.25`. On the Shopify instance's **Payout
 Configurations** tab, configure:
 
 1. **Payout Report Journal:** the separate Shopify settlement bank journal.
@@ -123,3 +123,40 @@ foreign currency, also check the exchange difference and company-currency balanc
 For invoices that already exclude refunded items, use the transaction payment flow
 and the Preview / Repair Payments action described in [Shopify payment repair](shopify-payment-repair.md).
 Reimporting payout reports alone does not correct invoice-sized legacy payments.
+
+## Shop Cash payments and grouped settlements
+
+Version `18.0.3.25` matches Shop Cash credits and refund debits against the actual
+Shop Cash payment entries. Card payments on the same invoice continue to match
+independently. Fees are booked once from the balance transaction fee fields.
+
+Shopify can settle several orders in one Shop Cash credit, and the credit can arrive
+on a different payout from the card payment. The connector retains the order-level
+breakdown and matches every included capture or refund. If REST omits that breakdown,
+it reads the exact balance transaction through GraphQL, verifies the payout ID,
+currency and gross/fee/net amounts, and retains the order transaction IDs. The existing
+Shopify credentials need permission to read payouts. No customer charge or refund is
+sent by this matching process.
+
+Matching verifies company, store, currency, payment direction and the `shop_cash`
+gateway. An order-only breakdown requires unambiguous Shop Cash payments; it does not
+match unrelated payments by amount. Missing orders/payments, incomplete breakdowns,
+ambiguous legacy records, unexpected signs and already consumed payments remain
+exceptions. Shop Cash settlement reversals also require accounting review. Historical
+Shop Campaign billing adjustments are not treated as customer Shop Cash payments.
+
+Payout validation checks the actual reconciliations between statement and payment
+journal items. Posting a Shop Cash credit to a generic account cannot pass this check.
+Matched payments and imported breakdowns are visible on the payout transaction.
+**Preview / Repair Payments** includes the orders from grouped Shop Cash transactions.
+
+After upgrading, reimport existing payout reports to retrieve the Shop Cash breakdown
+and then process the outstanding statement lines. Reimporting does not duplicate the
+statement lines or payments. If a historical Shop Cash line was already posted through
+the generic credit/debit mapping, review and undo that reconciliation before matching
+its payments; the upgrade does not rewrite posted accounting or existing transfers.
+
+For an invoice paid with $225.91 by card and $40.00 by Shop Cash, matching clears those
+two gross payments independently. Fees of $5.38 and $0.90 and a $21.96 marketplace-tax
+deduction yield a $237.67 payout contribution. Existing marketplace-tax configuration
+is unchanged.

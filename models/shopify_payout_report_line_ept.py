@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # See LICENSE file for full copyright and licensing details.
-from odoo import models, fields, _
+from odoo import api, models, fields, _
 from odoo.exceptions import UserError
+from .shopify_shop_cash_utils import shop_cash_kind
 
 
 class ShopifyPayoutReportLineEpt(models.Model):
@@ -38,6 +39,16 @@ class ShopifyPayoutReportLineEpt(models.Model):
     adjustment_reason = fields.Char(
         string="Adjustment Reason",
         help="The adjustment reason returned by Shopify, when applicable.")
+    shop_cash_kind = fields.Selection([
+        ('shop_cash_credit', 'Shop Cash Credit'),
+        ('shop_cash_refund_debit', 'Shop Cash Refund'),
+        ('shop_cash_credit_reversal', 'Shop Cash Credit Reversal'),
+        ('shop_cash_refund_debit_reversal', 'Shop Cash Refund Reversal'),
+    ], compute='_compute_shop_cash_kind', store=True, string='Shop Cash Activity')
+    shop_cash_allocations = fields.Json(string='Shop Cash Order Breakdown', readonly=True, copy=False)
+    shop_cash_detail_error = fields.Char(string='Shop Cash Detail Issue', readonly=True, copy=False)
+    shop_cash_payment_ids = fields.Many2many('account.payment', string='Matched Shop Cash Payments',
+                                           readonly=True, copy=False)
     currency_id = fields.Many2one('res.currency', string='Currency', help="currency code of the payout.")
     source_type = fields.Char(
         string="Resource Leading Transaction",
@@ -49,6 +60,12 @@ class ShopifyPayoutReportLineEpt(models.Model):
     order_id = fields.Many2one('sale.order', string="Order Reference")
     is_processed = fields.Boolean("Processed?")
     is_remaining_statement = fields.Boolean(string="Is Remaining Statement?")
+
+    @api.depends('raw_transaction_type', 'transaction_type', 'adjustment_reason')
+    def _compute_shop_cash_kind(self):
+        for line in self:
+            line.shop_cash_kind = shop_cash_kind(line.raw_transaction_type or line.transaction_type,
+                                                line.adjustment_reason)
 
     def write(self, vals):
         protected = {'payout_id', 'transaction_id', 'transaction_type', 'amount', 'fee', 'net_amount', 'currency_id'}

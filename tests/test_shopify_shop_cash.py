@@ -1,0 +1,368 @@
+"""Shop Cash parsing and real-ledger settlement coverage."""
+import importlib.util
+import json
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+try:
+    from .test_shopify_payout_generation import PayoutTestCase, ODOO_AVAILABLE
+except ImportError:
+    from test_shopify_payout_generation import PayoutTestCase, ODOO_AVAILABLE
+
+spec = importlib.util.spec_from_file_location('shop_cash_utils', Path(__file__).resolve().parents[1] / 'models' / 'shopify_shop_cash_utils.py')
+utils = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(utils)
+
+if ODOO_AVAILABLE:
+    from odoo import Command, fields
+    from odoo.exceptions import UserError
+    from .. import shopify
+
+
+class TestShopCashEvidence(unittest.TestCase):
+    def test_only_payment_activity_is_classified(self):
+        self.assertEqual(utils.shop_cash_kind('credit', 'shop_cash'), 'shop_cash_credit')
+        self.assertEqual(utils.shop_cash_kind('debit', 'shop_cash_refund'), 'shop_cash_refund_debit')
+        self.assertEqual(utils.shop_cash_kind('SHOP_CASH_CREDIT', None), 'shop_cash_credit')
+        self.assertFalse(utils.shop_cash_kind('credit', 'shop_cash_campaign_billing'))
+        self.assertFalse(utils.shop_cash_kind('credit', 'tax_adjustment'))
+
+    def test_rest_adjustment_id_is_not_used_as_payment_id(self):
+        result = utils.shop_cash_allocations({'adjustment_order_transactions': [
+            {'id': 999, 'order': {'id': 123}, 'amount': '40.00', 'fees': '.90', 'net': '39.10'}]})
+        self.assertEqual(result, [{'order_id': '123', 'transaction_id': '', 'amount': '40.00',
+                                   'fee': '0.90', 'net': '39.10'}])
+
+    def test_duplicate_or_unidentified_allocations_are_rejected(self):
+        row = {'order_transaction_id': 123, 'amount': '40.00'}
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            utils.shop_cash_allocations({'adjustment_order_transactions': [row, row]})
+        with self.assertRaisesRegex(ValueError, 'lacks'):
+            utils.shop_cash_allocations({'adjustment_order_transactions': [{'id': 123, 'amount': '40'}]})
+
+    def test_nonfinite_zero_and_invalid_amounts_are_rejected(self):
+        for amount in ('NaN', 'Infinity', 'oops', '0'):
+            with self.subTest(amount=amount), self.assertRaises(ValueError):
+                utils.shop_cash_allocations({'adjustment_order_transactions': [
+                    {'order_transaction_id': 123, 'amount': amount}]})
+
+
+class TestShopCashSettlement(PayoutTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.outstanding = cls.env['account.account'].create({
+            'name': 'Shop Cash Outstanding', 'code': 'SCOUT', 'account_type': 'asset_current',
+            'reconcile': True, 'company_ids': [Command.set(cls.env.company.ids)],
+        })
+        cls.receivable = cls.env['account.account'].create({
+            'name': 'Shop Cash Receivable', 'code': 'SCREC', 'account_type': 'asset_receivable',
+            'reconcile': True, 'company_ids': [Command.set(cls.env.company.ids)],
+        })
+        cls.revenue = cls.env['account.account'].create({
+            'name': 'Shop Cash Test Sales', 'code': 'SCINC', 'account_type': 'income',
+            'company_ids': [Command.set(cls.env.company.ids)],
+        })
+        cls.sales_journal = cls.env['account.journal'].create({'name': 'Shop Cash Sales', 'type': 'sale', 'code': 'SCS'})
+        cls.product = cls.env['product.product'].create({'name': 'Shop Cash Test Item', 'type': 'service'})
+        cls.journal.autocheck_on_post = True
+        (cls.journal.inbound_payment_method_line_ids | cls.journal.outbound_payment_method_line_ids).write({
+            'payment_account_id': cls.outstanding.id,
+        })
+        # A generic credit mapping must not automatically book Shop Cash.
+        cls.instance.transaction_line_ids = [Command.create({
+            'transaction_type': 'credit', 'account_id': cls.revenue.id,
+        })]
+
+    def _order(self, reference, amount=40):
+        partner = self.env['res.partner'].create({'name': reference, 'property_account_receivable_id': self.receivable.id})
+        order = self.env['sale.order'].create({'partner_id': partner.id, 'shopify_instance_id': self.instance.id,
+                                              'shopify_order_id': reference})
+        line = self.env['sale.order.line'].create({'order_id': order.id, 'product_id': self.product.id,
+            'price_unit': amount, 'product_uom_qty': 1, 'tax_id': [Command.clear()]})
+        invoice = self.env['account.move'].create({'move_type': 'out_invoice', 'journal_id': self.sales_journal.id,
+            'partner_id': partner.id, 'invoice_date': fields.Date.today(), 'invoice_line_ids': [Command.create({
+                'product_id': self.product.id, 'quantity': 1, 'price_unit': amount, 'account_id': self.revenue.id,
+                'tax_ids': [Command.clear()], 'sale_line_ids': [Command.link(line.id)],
+            })]})
+        invoice.action_post()
+        return order, invoice
+
+    def _payment(self, order, amount, transaction_id, kind='capture', gateway='shop_cash', invoice=None):
+        direction = 'outbound' if kind == 'refund' else 'inbound'
+        methods = self.journal.outbound_payment_method_line_ids if direction == 'outbound' else self.journal.inbound_payment_method_line_ids
+        payment = self.env['account.payment'].create({'payment_type': direction, 'partner_type': 'customer',
+            'partner_id': order.partner_id.id, 'journal_id': self.journal.id, 'payment_method_line_id': methods[:1].id,
+            'amount': amount, 'currency_id': self.env.company.currency_id.id,
+            'shopify_cash_order_id': order.id, 'shopify_instance_id': self.instance.id,
+            'shopify_order_transaction_id': transaction_id, 'shopify_cash_gateway': gateway, 'shopify_cash_kind': kind})
+        payment.action_post()
+        if invoice:
+            (payment._seek_for_lines()[1] | invoice.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')).reconcile()
+        return payment
+
+    def _cash_payout(self, reference, entries, amount=None, fee=0, reason='shop_cash', source_id=None):
+        gross = sum(float(item['amount']) for item in entries) if amount is None else amount
+        payout = self.env['shopify.payout.report.ept'].create({'instance_id': self.instance.id,
+            'payout_reference_id': reference, 'payout_date': fields.Date.today(),
+            'payout_status': 'paid', 'currency_id': self.env.company.currency_id.id, 'amount': gross - fee})
+        values = payout.prepare_transaction_vals({'id': reference + '-balance', 'type': 'credit' if gross > 0 else 'debit',
+            'currency': self.env.company.currency_id.name, 'amount': gross, 'fee': fee, 'net': gross - fee,
+            'adjustment_reason': reason, 'adjustment_order_transactions': entries,
+            'source_order_id': source_id}, self.instance)
+        payout.payout_transaction_ids = [Command.create(values), Command.create({
+            'transaction_type': 'fees', 'amount': -fee, 'net_amount': -fee,
+            'currency_id': payout.currency_id.id, 'is_remaining_statement': True})]
+        return payout
+
+    def _ledger_reconcile(self, payout, statement_id, line_ids):
+        """Use actual Odoo journal items when Enterprise's widget is unavailable."""
+        statement = self.env['account.bank.statement.line'].browse(statement_id)
+        lines = self.env['account.move.line'].browse(line_ids)
+        self.assertEqual(len(lines.account_id), 1)
+        self._book_counterpart(statement, lines.account_id)
+        counterparts = statement.line_ids.filtered(lambda line: line.account_id == lines.account_id)
+        (lines | counterparts).reconcile()
+
+    def _book_counterpart(self, statement, account):
+        _liquidity, suspense, _other = statement._seek_for_lines()
+        suspense.write({'account_id': account.id})
+
+    def _process(self, payout):
+        if 'bank.rec.widget' in self.env.registry.models:
+            payout.process_bank_statement()
+        else:
+            with patch.object(type(payout), 'shopify_reconcile_bank_statement_line_ept',
+                              lambda model, statement_id, line_ids: self._ledger_reconcile(model, statement_id, line_ids)), \
+                    patch.object(type(payout), 'shopify_reconcile_other_bank_statement_line_ept',
+                                 lambda model, statement, _line: self._book_counterpart(statement,
+                                     model.instance_id.transaction_line_ids.filtered(
+                                         lambda row: row.transaction_type == statement.shopify_transaction_type).account_id)):
+                payout.process_bank_statement()
+
+    def test_card_and_shop_cash_clear_invoice_and_validate_payout(self):
+        order, invoice = self._order('mixed', 265.91)
+        card = self._payment(order, 225.91, 'card', gateway='shopify_payments', invoice=invoice)
+        cash = self._payment(order, 40, 'cash', invoice=invoice)
+        self.assertEqual(invoice.amount_residual, 0)
+        self.assertFalse(any(payment._seek_for_lines()[0].reconciled for payment in card | cash))
+        payout = self._cash_payout('mixed-payout', [{'order_transaction_id': 'cash', 'amount': '40'}], fee=.90)
+        payout.write({'amount': 237.67, 'payout_transaction_ids': [Command.create({
+            'transaction_id': 'card-balance', 'transaction_type': 'charge', 'source_order_id': 'mixed',
+            'source_order_transaction_id': 'card', 'order_id': order.id, 'amount': 225.91,
+            'fee': 5.38, 'net_amount': 220.53, 'currency_id': payout.currency_id.id,
+            'is_remaining_statement': True}), Command.create({
+                'transaction_id': 'tax-balance', 'transaction_type': 'tax_adjustment', 'amount': -21.96,
+                'currency_id': payout.currency_id.id, 'is_remaining_statement': True})]})
+        payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'fees').write({'amount': -6.28})
+        self.instance.transaction_line_ids = [Command.create({'transaction_type': 'tax_adjustment',
+            'account_id': self.revenue.id})]
+        payout.generate_bank_statement()
+        cash_statement = self._statement_lines(payout).filtered(lambda row: row.payout_line_id.shop_cash_kind)
+        self.assertFalse(cash_statement.is_reconciled)
+        self._process(payout)
+        self.assertEqual(payout.state, 'validated')
+        self.assertEqual(invoice.payment_state, 'paid')
+        self.assertTrue(all(payment._seek_for_lines()[0].reconciled for payment in card | cash))
+        self.assertEqual(cash_statement.payout_line_id.shop_cash_payment_ids, cash)
+        original_moves = self._statement_lines(payout).move_id
+        self._process(payout)
+        payout.generate_bank_statement()
+        self.assertEqual(self._statement_lines(payout).move_id, original_moves)
+
+    def test_grouped_credit_then_grouped_partial_refunds_are_independent(self):
+        payments = self.env['account.payment']
+        refund_payments = self.env['account.payment']
+        credit_entries, refund_entries = [], []
+        for reference, amount, refund_amount in (('first', 40, 10), ('second', 25, 5)):
+            order, invoice = self._order(reference, amount)
+            payments |= self._payment(order, amount, reference + '-cash', invoice=invoice)
+            refund_payments |= self._payment(order, refund_amount, reference + '-refund', kind='refund')
+            credit_entries.append({'order': {'id': reference}, 'amount': str(amount)})
+            refund_entries.append({'order_transaction_id': reference + '-refund', 'amount': str(refund_amount)})
+        credits = self._cash_payout('group-credit', credit_entries, fee=1.30)
+        refunds = self._cash_payout('group-refund', refund_entries, amount=-15, reason='shop_cash_refund')
+        for payout in credits | refunds:
+            payout.generate_bank_statement()
+            self._process(payout)
+            self.assertEqual(payout.state, 'validated')
+        self.assertTrue(all(payment._seek_for_lines()[0].reconciled for payment in payments | refund_payments))
+        self.assertEqual(credits.payout_transaction_ids.filtered('shop_cash_kind').shop_cash_payment_ids, payments)
+        self.assertEqual(refunds.payout_transaction_ids.filtered('shop_cash_kind').shop_cash_payment_ids, refund_payments)
+        self._process(refunds)
+        self.assertEqual(len(self._statement_lines(credits | refunds)), 3)
+
+    def test_incomplete_group_does_not_consume_any_payment(self):
+        order, invoice = self._order('present')
+        payment = self._payment(order, 40, 'present-cash', invoice=invoice)
+        payout = self._cash_payout('incomplete', [{'order': {'id': 'present'}, 'amount': '40'},
+            {'order': {'id': 'missing'}, 'amount': '25'}])
+        payout.generate_bank_statement()
+        with self.assertRaisesRegex(UserError, 'missing Shop Cash order'):
+            self._process(payout)
+        self.assertFalse(payment._seek_for_lines()[0].reconciled)
+        self.assertFalse(self._statement_lines(payout).is_reconciled)
+        self.assertNotEqual(payout.state, 'validated')
+
+    def test_generic_account_posting_cannot_validate_shop_cash(self):
+        order, invoice = self._order('generic')
+        payment = self._payment(order, 40, 'generic-cash', invoice=invoice)
+        payout = self._cash_payout('generic-credit', [{'order_transaction_id': 'generic-cash', 'amount': '40'}])
+        payout.generate_bank_statement()
+        self._book_counterpart(self._statement_lines(payout), self.revenue)
+        with self.assertRaisesRegex(UserError, 'actual capture/refund'):
+            payout.validate_statement()
+        self.assertFalse(payment._seek_for_lines()[0].reconciled)
+
+    def test_wrong_gateway_duplicate_identity_and_amount_mismatch_block_matching(self):
+        order, invoice = self._order('wrong', 40)
+        payment = self._payment(order, 40, 'wrong-cash', gateway='shopify_payments', invoice=invoice)
+        payout = self._cash_payout('wrong-credit', [{'order_transaction_id': 'wrong-cash', 'amount': '40'}])
+        with self.assertRaisesRegex(UserError, 'inconsistent gateway'):
+            payout._resolve_shop_cash_payments(payout.payout_transaction_ids.filtered('shop_cash_kind'))
+        payment.shopify_cash_gateway = 'shop_cash'
+        transaction = payout.payout_transaction_ids.filtered('shop_cash_kind')
+        transaction.shop_cash_allocations = [{'transaction_id': 'wrong-cash', 'amount': '39'}]
+        with self.assertRaisesRegex(UserError, 'gross amount'):
+            payout._resolve_shop_cash_payments(transaction)
+        transaction.shop_cash_allocations = [{'transaction_id': 'wrong-cash', 'amount': '20'}] * 2
+        with self.assertRaisesRegex(UserError, 'duplicate'):
+            payout._resolve_shop_cash_payments(transaction)
+
+    def test_ambiguous_same_order_payments_are_not_guessed(self):
+        order, invoice = self._order('ambiguous', 80)
+        self._payment(order, 40, 'cash-one', invoice=invoice)
+        self._payment(order, 40, 'cash-two', invoice=invoice)
+        payout = self._cash_payout('ambiguous-credit', [{'order': {'id': 'ambiguous'}, 'amount': '40'}])
+        with self.assertRaisesRegex(UserError, 'ambiguous'):
+            payout._resolve_shop_cash_payments(payout.payout_transaction_ids.filtered('shop_cash_kind'))
+
+    def test_already_settled_payment_cannot_be_consumed_by_another_payout(self):
+        order, invoice = self._order('repeat')
+        self._payment(order, 40, 'repeat-cash', invoice=invoice)
+        first = self._cash_payout('repeat-first', [{'order_transaction_id': 'repeat-cash', 'amount': '40'}])
+        first.generate_bank_statement()
+        self._process(first)
+        second = self._cash_payout('repeat-second', [{'order_transaction_id': 'repeat-cash', 'amount': '40'}])
+        second.generate_bank_statement()
+        with self.assertRaisesRegex(UserError, 'already settled'):
+            self._process(second)
+        self.assertNotEqual(second.state, 'validated')
+
+    def test_graphql_fallback_verifies_exact_balance_and_retains_transaction_ids(self):
+        payout = self._cash_payout('123', [])
+        data = {'id': '456', 'type': 'credit', 'adjustment_reason': 'shop_cash',
+                'currency': self.env.company.currency_id.name, 'amount': '40', 'fee': '.90', 'net': '39.10'}
+        currency = payout.currency_id.name
+        node = {'id': 'gid://shopify/ShopifyPaymentsBalanceTransaction/456',
+            'associatedPayout': {'id': 'gid://shopify/ShopifyPaymentsPayout/123'},
+            'amount': {'amount': '40', 'currencyCode': currency}, 'fee': {'amount': '.90', 'currencyCode': currency},
+            'net': {'amount': '39.10', 'currencyCode': currency}, 'adjustmentsOrders': [{
+                'orderTransactionId': 'cash-id', 'amount': {'amount': '40', 'currencyCode': currency},
+                'fees': {'amount': '.90', 'currencyCode': currency}, 'net': {'amount': '39.10', 'currencyCode': currency}}]}
+        with patch.object(type(self.instance), 'connect_in_shopify'), \
+                patch.object(shopify, 'GraphQL') as graphql:
+            execute = graphql.return_value.execute
+            graphql.return_value.headers = {'User-Agent': 'test'}
+            execute.return_value = json.dumps({'data': {'node': node}})
+            result = payout._enrich_shop_cash_transaction(data)
+            self.assertFalse(result['shop_cash_detail_error'])
+            self.assertEqual(result['shop_cash_allocations'][0]['transaction_id'], 'cash-id')
+            self.assertEqual(execute.call_args.kwargs['variables']['id'], node['id'])
+            self.assertEqual(graphql.return_value.headers['X-Shopify-Access-Token'], self.instance.shopify_password)
+            node['associatedPayout']['id'] = 'gid://shopify/ShopifyPaymentsPayout/999'
+            execute.return_value = json.dumps({'data': {'node': node}})
+            result = payout._enrich_shop_cash_transaction(data)
+            self.assertFalse(result['shop_cash_allocations'])
+            self.assertIn('another', result['shop_cash_detail_error'])
+
+    def test_reimport_backfills_existing_breakdown_without_new_statement_lines(self):
+        payout = self._cash_payout('refresh', [], amount=40)
+        payout.generate_bank_statement()
+        statements = self._statement_lines(payout)
+        data = {'id': 'refresh-balance', 'type': 'credit', 'adjustment_reason': 'shop_cash',
+            'currency': payout.currency_id.name, 'amount': 40, 'fee': 0, 'net': 40,
+            'adjustment_order_transactions': [{'order_transaction_id': 'cash', 'amount': '40'}]}
+        with patch.object(shopify.Transactions, 'find', return_value=[SimpleNamespace(to_dict=lambda: data)]):
+            payout.refresh_payout_transaction_links()
+        self.assertEqual(payout.payout_transaction_ids.filtered('shop_cash_kind').shop_cash_allocations[0]['transaction_id'], 'cash')
+        self.assertEqual(self._statement_lines(payout), statements)
+
+    def test_legacy_split_payment_uses_gateway_evidence_from_order(self):
+        order, invoice = self._order('legacy', 265.91)
+        cash = self._payment(order, 40, 'legacy-cash', invoice=invoice)
+        self._payment(order, 225.91, 'legacy-card', gateway='shopify_payments', invoice=invoice)
+        gateway = self.env['shopify.payment.gateway.ept'].create({'code': 'shop_cash',
+            'name': 'Shop Cash', 'shopify_instance_id': self.instance.id})
+        workflow = self.env['sale.workflow.process.ept'].create({'name': 'Shop Cash Legacy', 'journal_id': self.journal.id})
+        order.write({'is_shopify_multi_payment': True, 'shopify_payment_ids': [Command.create({
+            'payment_gateway_id': gateway.id, 'workflow_id': workflow.id, 'amount': 40,
+            'payment_transaction_id': 'legacy-cash'})]})
+        cash.write({'shopify_cash_gateway': False, 'shopify_cash_order_id': False, 'shopify_order_transaction_id': False})
+        payout = self._cash_payout('legacy-credit', [{'order': {'id': 'legacy'}, 'amount': '40'}])
+        payout.generate_bank_statement()
+        self._process(payout)
+        self.assertTrue(cash._seek_for_lines()[0].reconciled)
+        self.assertEqual(payout.state, 'validated')
+
+    def test_cancelled_full_refund_without_invoice_settles_both_directions(self):
+        order, invoice = self._order('cancelled')
+        invoice.button_draft()
+        invoice.unlink()
+        order.write({'state': 'cancel', 'canceled_in_shopify': True})
+        capture = self._payment(order, 40, 'cancelled-cash')
+        refund = self._payment(order, 40, 'cancelled-refund', kind='refund')
+        (capture._seek_for_lines()[1] | refund._seek_for_lines()[1]).reconcile()
+        credits = self._cash_payout('cancelled-credit', [{'order_transaction_id': 'cancelled-cash', 'amount': '40'}], fee=.90)
+        refunds = self._cash_payout('cancelled-debit', [{'order_transaction_id': 'cancelled-refund', 'amount': '-40'}],
+                                    amount=-40, reason='shop_cash_refund')
+        for payout in credits | refunds:
+            payout.generate_bank_statement()
+            self._process(payout)
+            self.assertEqual(payout.state, 'validated')
+        self.assertTrue(capture._seek_for_lines()[0].reconciled)
+        self.assertTrue(refund._seek_for_lines()[0].reconciled)
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
+
+    def test_grouped_order_allocation_can_match_multiple_captures_for_one_order(self):
+        order, invoice = self._order('multi-capture', 40)
+        payments = self._payment(order, 15, 'capture-first', invoice=invoice) | self._payment(order, 25, 'capture-second', invoice=invoice)
+        payout = self._cash_payout('multi-capture-credit', [{'order': {'id': 'multi-capture'}, 'amount': '40'}])
+        payout.generate_bank_statement()
+        self._process(payout)
+        self.assertEqual(payout.payout_transaction_ids.filtered('shop_cash_kind').shop_cash_payment_ids, payments)
+        self.assertTrue(all(payment._seek_for_lines()[0].reconciled for payment in payments))
+
+    def test_preview_includes_all_orders_from_grouped_credit(self):
+        first, _invoice = self._order('preview-first', 40)
+        second, _invoice = self._order('preview-second', 25)
+        payout = self._cash_payout('preview-group', [{'order': {'id': 'preview-first'}, 'amount': '40'},
+            {'order': {'id': 'preview-second'}, 'amount': '25'}])
+        collected = []
+        with patch.object(type(first), 'action_preview_shopify_payments', lambda orders: collected.extend(orders.ids)):
+            payout.action_preview_payout_payments()
+        self.assertEqual(set(collected), set((first | second).ids))
+
+    def test_missing_details_and_reversal_require_review(self):
+        payout = self._cash_payout('missing-details', [], amount=40)
+        payout.generate_bank_statement()
+        with self.assertRaisesRegex(UserError, 'Reimport'):
+            self._process(payout)
+        transaction = payout.payout_transaction_ids.filtered('shop_cash_kind')
+        transaction.raw_transaction_type = 'shop_cash_credit_reversal'
+        with self.assertRaisesRegex(UserError, 'reversals require'):
+            self._process(payout)
+
+    def test_graphql_permission_error_keeps_shop_cash_open_for_review(self):
+        payout = self._cash_payout('permissions', [], amount=40)
+        data = {'id': '1', 'type': 'credit', 'adjustment_reason': 'shop_cash',
+            'currency': payout.currency_id.name, 'amount': '40', 'fee': '0', 'net': '40'}
+        with patch.object(type(self.instance), 'connect_in_shopify'), patch.object(shopify, 'GraphQL') as graphql:
+            graphql.return_value.headers = {}
+            graphql.return_value.execute.return_value = json.dumps({'errors': [{'message': 'Access denied'}]})
+            enriched = payout._enrich_shop_cash_transaction(data)
+        self.assertFalse(enriched['shop_cash_allocations'])
+        self.assertIn('permissions', enriched['shop_cash_detail_error'])

@@ -123,6 +123,8 @@ class ShopifyPayoutSettlement(models.Model):
             if (linked.shopify_transaction_type != transaction.transaction_type
                     or (transaction.currency_id and transaction.currency_id != currency)):
                 raise UserError(_('A payout transaction has an inconsistent type or currency.'))
+            if transaction.shop_cash_kind:
+                self._check_shop_cash_reconciliation(transaction, linked)
         if statements.filtered(lambda row: row.payout_line_id not in self.payout_transaction_ids):
             raise UserError(_('The payout contains statement lines without a matching payout transaction.'))
         if statements.filtered(
@@ -276,7 +278,10 @@ class ShopifyPayoutSettlement(models.Model):
     def action_preview_payout_payments(self):
         orders = self.env['sale.order']
         for transaction in self.payout_transaction_ids.filtered(
-                lambda row: row.transaction_type in ('charge', 'refund', 'payment_refund')):
+                lambda row: row.transaction_type in ('charge', 'refund', 'payment_refund') or row.shop_cash_kind):
+            if transaction.shop_cash_kind:
+                orders |= transaction.payout_id._shop_cash_orders_for_preview(transaction)
+                continue
             instance = transaction.payout_id.instance_id
             order = transaction.order_id
             if not order and transaction.source_order_id:

@@ -140,6 +140,8 @@
                                     <field name="transaction_type" readonly="1"/>
                                     <field name="raw_transaction_type" readonly="1" optional="hide"/>
                                     <field name="adjustment_reason" readonly="1" optional="hide"/>
+                                    <field name="shop_cash_kind" readonly="1" optional="show"/>
+                                    <field name="shop_cash_payment_ids" widget="many2many_tags" optional="hide"/>
                                     <field name="transaction_id" readonly="1"/>
                                     <field name="source_order_transaction_id" readonly="1" optional="show"/>
                                     <field name="order_id" readonly="1"/>
@@ -168,6 +170,10 @@
                                             <field name="transaction_type" readonly="1"/>
                                             <field name="raw_transaction_type" readonly="1"/>
                                             <field name="adjustment_reason" readonly="1"/>
+                                            <field name="shop_cash_kind" readonly="1"/>
+                                            <field name="shop_cash_detail_error" readonly="1"/>
+                                            <field name="shop_cash_payment_ids" widget="many2many_tags" readonly="1"/>
+                                            <field name="shop_cash_allocations" widget="jsonb" readonly="1"/>
                                             <field name="currency_id" readonly="1"/>
                                             <field name="source_type" readonly="1"/>
                                         </group>
