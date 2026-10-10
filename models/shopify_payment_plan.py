@@ -102,6 +102,18 @@ def invoice_mode(events, invoice_total, credits, compare, embedded_refunds=0):
     raise PaymentPlanError('Invoice and credit-note totals do not represent either the original sale or its final net amount.')
 
 
+def prove_cancelled_cash(payload, events, compare):
+    """A fully reversed, unfulfilled cancellation needs no revenue documents."""
+    if not (payload.get('cancelled_at') or payload.get('cancel_reason')):
+        raise PaymentPlanError('Shopify has not cancelled this order.')
+    if payload.get('fulfillments') or payload.get('fulfillment_status') not in (None, '', 'unfulfilled'):
+        raise PaymentPlanError('The cancelled order has fulfillment history; review its invoice and credit note.')
+    gross = sum(money(row['amount']) for row in events if row['kind'] != 'refund')
+    refunded = sum(money(row['amount']) for row in events if row['kind'] == 'refund')
+    if payload.get('financial_status') != 'refunded' or compare(float(gross), float(refunded)):
+        raise PaymentPlanError('A cancelled order without an invoice must be fully refunded before cash can be synchronized.')
+
+
 def prove_net_refunds(payload, events, invoiced_quantities):
     """Do not infer an already-net invoice from an amount difference alone."""
     lines = {str(row['id']): row for row in payload.get('line_items', [])}

@@ -5,7 +5,7 @@ from odoo import Command, fields, models, _
 from odoo.exceptions import UserError
 from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
-from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, fingerprint, component_money, money
+from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, prove_cancelled_cash, fingerprint, component_money, money
 
 _logger = logging.getLogger(__name__)
 
@@ -238,7 +238,8 @@ class SaleOrderPaymentSync(models.Model):
                 raise UserError(_('Post or remove draft invoices/credit notes before synchronizing cash transactions.'))
             invoices = documents.filtered(lambda move: move.move_type == 'out_invoice')
             credits = documents.filtered(lambda move: move.move_type == 'out_refund')
-            if not invoices or documents.filtered(lambda move: move.company_id != self.company_id
+            cancelled_cash = not documents and self.state == 'cancel' and self.canceled_in_shopify
+            if (not invoices and not cancelled_cash) or documents.filtered(lambda move: move.company_id != self.company_id
                                                   or move.currency_id != self.currency_id):
                 raise UserError(_('Posted invoices in the order company and currency are required.'))
             if documents.invoice_line_ids.sale_line_ids.order_id - self:
@@ -258,7 +259,13 @@ class SaleOrderPaymentSync(models.Model):
                 if (other_moves - documents).filtered(lambda move: not move.origin_payment_id):
                     raise UserError(_('The Shopify refund credit is applied to an entry outside this order.'))
             receivable = documents.line_ids.filtered(lambda row: row.account_type == 'asset_receivable').account_id
-            if len(receivable) != 1 or not receivable.reconcile:
+            if cancelled_cash:
+                prove_cancelled_cash(payload, events, self.currency_id.compare_amounts)
+                if self.picking_ids.filtered(lambda picking: picking.state == 'done'):
+                    raise UserError(_('The cancelled order has completed stock movements. Review its accounting manually.'))
+                receivable = self.partner_id.commercial_partner_id.with_company(self.company_id).property_account_receivable_id
+            if (len(receivable) != 1 or not receivable.reconcile or receivable.deprecated
+                    or receivable.account_type != 'asset_receivable' or self.company_id not in receivable.company_ids):
                 raise UserError(_('The order documents must use one reconcilable receivable account.'))
             prior = self.shopify_payment_audit_ids.sorted('id', reverse=True)[:1].plan or {}
             embedded_ids = prior.get('embedded_refund_ids', [])
@@ -267,9 +274,11 @@ class SaleOrderPaymentSync(models.Model):
                     or (embedded_ids and sorted(invoices.ids) != sorted(prior.get('invoice_ids', [])))):
                 raise UserError(_('The invoice or refunds from the previous net-invoice audit are missing. Review the history.'))
             embedded_amount = sum(money(refund_events[key]['amount']) for key in embedded_ids)
-            mode = invoice_mode(events, sum(invoices.mapped('amount_total')), sum(credits.mapped('amount_total')),
-                                self.currency_id.compare_amounts, embedded_amount)
-            credit_values = self._shopify_refund_documents(payload, events, invoices, credits, mode, embedded_ids)
+            mode = 'cancelled_cash' if cancelled_cash else invoice_mode(
+                events, sum(invoices.mapped('amount_total')), sum(credits.mapped('amount_total')),
+                self.currency_id.compare_amounts, embedded_amount)
+            credit_values = [] if cancelled_cash else self._shopify_refund_documents(
+                payload, events, invoices, credits, mode, embedded_ids)
             if mode == 'net':
                 embedded_ids = sorted(refund_events)
         except (KeyError, TypeError, ValueError) as error:
@@ -319,6 +328,10 @@ class SaleOrderPaymentSync(models.Model):
                     if matched[field_name] and matched[field_name] != expected:
                         raise UserError(_('Previously recorded transaction metadata changed. Review Shopify transaction %s.', event['id']))
                 liquidity, counterpart, writeoffs = matched._seek_for_lines()
+                matches = counterpart.matched_debit_ids | counterpart.matched_credit_ids
+                allocated_moves = (matches.debit_move_id | matches.credit_move_id).move_id - matched.move_id
+                if cancelled_cash and allocated_moves - candidates.move_id:
+                    raise UserError(_('A cancellation payment is applied outside this order\'s receipt/refund group.'))
                 if (len(liquidity) != 1 or writeoffs or len(counterpart) != 1
                         or counterpart.account_id != receivable
                         or liquidity.account_id != method.payment_account_id
@@ -496,6 +509,35 @@ class SaleOrderPaymentSync(models.Model):
                 raise UserError(_('Refunds exceed the original gateway payment.'))
             payment.write({'remaining_refund_amount': remaining,
                            'is_fully_refunded': order.currency_id.is_zero(remaining)})
+        return True
+
+    def _process_shopify_cancelled_import(self, payload, queue_line):
+        """Cancel without fulfillment; keep failed cash recording retryable."""
+        self.ensure_one()
+        try:
+            with self.env.cr.savepoint():
+                if not self.with_context(shopify_cancel_cash_only=True).cancel_shopify_order():
+                    raise UserError(_('This cancelled Shopify order has completed deliveries. Review its cancellation manually.'))
+            has_cash = payload.get('financial_status') in ('paid', 'partially_paid', 'refunded', 'partially_refunded') or any(
+                row.get('status') == 'success' and row.get('kind') in ('sale', 'capture', 'refund')
+                for row in payload.get('transaction', []))
+            if has_cash:
+                if not self._shopify_transaction_payments_enabled() or not self.auto_workflow_process_id.register_payment:
+                    raise UserError(_('Enable Record Payments from Shopify Transactions on the store and Register Payment '
+                                      'on the gateway workflow, then retry this cancelled order to record its cash history.'))
+                self._sync_shopify_cash()
+        except Exception as error:
+            message = _('Cancelled Shopify order %(order)s needs financial review: %(reason)s',
+                        order=self.name, reason=str(error))
+            self.message_post(body=message)
+            self.env['common.log.lines.ept'].create_common_log_line_ept(
+                shopify_instance_id=self.shopify_instance_id.id, module='shopify_ept', message=message,
+                model_name=self._name, res_id=self.id, order_ref=self.name,
+                shopify_order_data_queue_line_id=queue_line.id)
+            queue_line.write({'state': 'failed', 'processed_at': fields.Datetime.now(), 'sale_order_id': self.id})
+            return False
+        queue_line.write({'state': 'done', 'processed_at': fields.Datetime.now(),
+                          'sale_order_id': self.id, 'order_data': False})
         return True
 
     def _shopify_transaction_payments_enabled(self):

@@ -9,6 +9,7 @@ from odoo.exceptions import UserError
 
 from .. import shopify
 from ..shopify.pyactiveresource.connection import ClientError
+from .shopify_order_utils import is_cancelled_shopify_order
 
 
 class ShopifyPaymentGateway(models.Model):
@@ -94,6 +95,15 @@ class ShopifyPaymentGateway(models.Model):
              ('financial_status', '=', order_response.get('financial_status')),
              ('shopify_order_payment_status.status', '=', order_status)
              ])
+        if (not workflow_config and is_cancelled_shopify_order(order_response)
+                and order_response.get('financial_status') in ('refunded', 'partially_refunded')):
+            # A cancellation only needs the original gateway's payment setup.
+            workflow_config = self.env['sale.auto.workflow.configuration.ept'].search([
+                ('shopify_instance_id', '=', instance.id),
+                ('payment_gateway_id', '=', shopify_payment_gateway.id),
+                ('financial_status', '=', 'paid'),
+                ('shopify_order_payment_status.status', '=', order_status),
+            ])
         if not workflow_config:
             message = "- Automatic order process workflow configuration not found for this order " \
                       "%s. \n - System tries to find the workflow based on combination of Payment " \

@@ -155,9 +155,8 @@
                                     <div class="text-muted">
                                         If checked, It will create a cron job to automatically Import Cancel Orders in
                                         Odoo at certain intervals.
-                                        <li>It will fetch Cancel Order data from Shopify store
-                                            and will cancel imported orders if imported orders are canceled on
-                                            Shopify store.
+                                        <li>Imports canceled Shopify orders, including orders missing from Odoo,
+                                            and queues their payment and refund history for processing.
                                         </li>
                                     </div>
                                     <div class="o_onboard_cron_settings"

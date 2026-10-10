@@ -473,7 +473,7 @@ class ShopifyProcessImportExport(models.TransientModel):
         to_date = datetime.now()
         if not from_date:
             from_date = to_date - timedelta(3)
-        sale_order_obj.import_shopify_cancel_order(instance, from_date, to_date)
+        sale_order_obj.import_shopify_cancel_order(instance, from_date, to_date, created_by='scheduled_action')
         return True
 
     @api.model

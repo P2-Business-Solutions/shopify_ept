@@ -232,9 +232,9 @@
                                         </u>
                                         <ol>
                                             <li>
-                                                It will start fetching Cancel Order data from Shopify store
-                                                and will cancel imported orders if imported orders are canceled on
-                                                Shopify store.
+                                                Imports canceled Shopify orders, including orders missing from Odoo.
+                                                Fully refunded cancellations before fulfillment can record the original
+                                                receipt and refund when transaction payment recording is enabled.
                                             </li>
                                             <li>
                                                 It will fetch the cancel orders for the dates specified in

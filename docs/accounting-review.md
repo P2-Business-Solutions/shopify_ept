@@ -96,6 +96,32 @@ Enterprise widget behavior is tested separately.
 | Receivables, outstanding payments, Shopify clearing, transit | Each zero |
 | Settlement statuses | Both Bank Matched |
 
+## Canceled-order import verification — October 10, 2026
+
+Version 18.0.3.24 was installed and upgraded in an isolated Odoo 18 Community /
+PostgreSQL 16 database with Payment Payout Reconciliation 18.0.1.18.0 and the
+connector's dependencies. The final connector test run reported **zero failures and
+zero errors across 96 database tests: 93 passed and 3 Enterprise widget checks skipped**.
+The standalone suite passed **85 tests**; its 96 database tests were executed separately.
+Python syntax, edited XML parsing and `git diff --check` passed.
+
+The canceled-order cases verify an original 242.10 receipt and next-day 242.10
+refund without an invoice or credit note. Both customer receivable entries close;
+each outstanding entry remains available to its own payout. Reimporting the order
+reuses its payments and audit, while partial refunds and missing configuration keep
+the queue retryable and the order canceled. Tests also cover retaining refunded order
+lines, using the paid gateway workflow when no refunded workflow is configured,
+requesting canceled orders without a fulfillment filter, processing subsequent pages,
+skipping fulfillment requests, reviewed cash-only repair, preserving a posted original
+invoice with only the confirmed partial refund, and refusing allocations to another order.
+
+The PayPal integration test uses the actual payout app's reference-backfill wizard and
+activity importer/matcher/poster. It verifies separate capture/refund references,
+clears both payment outstanding entries, retains the 3.00 processing fee in the PayPal
+balance, and reuses the settled payments without adding ledger entries. Shopify and
+processor source responses are controlled fixtures; these checks do not call a live
+merchant account. Enterprise bank reconciliation UI validation remains a staging check.
+
 ## Remaining release check
 
 Run the three widget tests in the actual Odoo Enterprise staging environment:

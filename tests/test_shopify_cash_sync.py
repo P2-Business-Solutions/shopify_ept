@@ -1,5 +1,6 @@
 """Database integration tests for gross cash with net invoices and historical repair."""
 from datetime import timedelta
+import json
 from copy import deepcopy
 from unittest.mock import patch
 try:
@@ -45,6 +46,286 @@ class TestShopifyCashSync(PayoutTestCase):
             'name': 'Cash Sync Sales', 'code': 'CSSSALE', 'account_type': 'income',
             'company_ids': [Command.set(cls.env.company.ids)],
         })
+
+    def _cancelled_fixture(self, gateway='shopify_payments'):
+        order, invoice, payload, events = self._fixture()
+        invoice.button_draft()
+        invoice.unlink()
+        self.gateway.code = gateway
+        events[1]['amount'] = events[0]['amount']
+        for event in events:
+            event['gateway'] = gateway
+        payload.update(cancelled_at=events[1]['processed_at'], financial_status='refunded',
+                       cancel_reason=None, fulfillments=[], fulfillment_status=None,
+                       order_number=123, name='#123', created_at=events[0]['processed_at'])
+        queue = self.env['shopify.order.data.queue.ept'].create({
+            'shopify_instance_id': self.instance.id, 'queue_type': 'unshipped', 'created_by': 'import',
+        })
+        queue_line = self.env['shopify.order.data.queue.line.ept'].create({
+            'shopify_order_data_queue_id': queue.id, 'shopify_instance_id': self.instance.id,
+            'shopify_order_id': order.shopify_order_id, 'order_data': json.dumps(dict(payload, transaction=events)),
+        })
+        return order, payload, events, queue_line
+
+    def test_cancelled_import_records_full_cash_without_invoice_or_delivery(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+            payments = self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)])
+            self.assertEqual(order.state, 'cancel')
+            self.assertTrue(order.canceled_in_shopify)
+            self.assertFalse(order.invoice_ids)
+            self.assertFalse(order.picking_ids)
+            self.assertEqual(queue_line.state, 'done')
+            self.assertFalse(queue_line.order_data)
+            self.assertEqual(payments.mapped('amount'), [242.10, 242.10])
+            self.assertEqual(set(payments.mapped('payment_type')), {'inbound', 'outbound'})
+            self.assertTrue(all(pay._seek_for_lines()[1].reconciled for pay in payments))
+            self.assertTrue(all(not pay._seek_for_lines()[0].reconciled for pay in payments))
+            self.assertEqual(set(payments.mapped('date')), {fields.Date.to_date(event['processed_at'][:10]) for event in events})
+            self.assertEqual(order.shopify_payment_audit_ids.plan['mode'], 'cancelled_cash')
+            original_moves = payments.move_id
+            order._process_shopify_cancelled_import(payload, queue_line)
+            self.assertEqual(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]), payments)
+            self.assertEqual(payments.move_id, original_moves)
+            self.assertEqual(len(order.shopify_payment_audit_ids), 1)
+
+    def test_cancelled_queue_import_bypasses_auto_workflow_and_retries_existing_order(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        self.instance.import_order_after_date = fields.Date.to_date('2020-01-01')
+        with patch.object(type(self.instance), 'connect_in_shopify'), \
+                patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)), \
+                patch.object(type(order), 'search_existing_shopify_order', side_effect=[self.env['sale.order'], order]), \
+                patch.object(type(order), 'prepare_shopify_customer_and_addresses', return_value=(self.partner, self.partner, self.partner)), \
+                patch.object(type(order), 'check_mismatch_details', return_value=False), \
+                patch.object(type(order), 'shopify_create_order', return_value=order), \
+                patch.object(type(order), 'apply_shopify_location_and_warehouse', side_effect=AssertionError('Unexpected fulfillment workflow')):
+            self.env['sale.order'].import_shopify_orders(queue_line, self.instance)
+            self.assertEqual(queue_line.state, 'done')
+            self.assertEqual(queue_line.sale_order_id, order)
+            self.assertEqual(order.state, 'cancel')
+            queue_line.write({'state': 'draft', 'order_data': json.dumps(dict(payload, transaction=events))})
+            self.env['sale.order'].import_shopify_orders(queue_line, self.instance)
+            self.assertEqual(queue_line.state, 'done')
+            self.assertEqual(len(order.shopify_payment_audit_ids), 1)
+
+    def test_cancelled_partial_refund_keeps_order_cancelled_and_queue_retryable(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        events[1]['amount'] = '45.00'
+        payload['financial_status'] = 'partially_refunded'
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertFalse(order._process_shopify_cancelled_import(payload, queue_line))
+        self.assertEqual(order.state, 'cancel')
+        self.assertEqual(queue_line.state, 'failed')
+        self.assertTrue(queue_line.order_data)
+        self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+
+    def test_cancelled_import_requires_opt_in_then_can_retry(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        self.instance.shopify_transaction_payment_sync = False
+        self.assertFalse(order._process_shopify_cancelled_import(payload, queue_line))
+        self.assertEqual(order.state, 'cancel')
+        self.assertEqual(queue_line.state, 'failed')
+        self.instance.shopify_transaction_payment_sync = True
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+
+    def test_cancelled_authorization_only_creates_no_payments(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        payload['financial_status'] = 'voided'
+        payload['transaction'] = [dict(events[0], kind='authorization')]
+        self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+        self.assertEqual(order.state, 'cancel')
+        self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+
+    def test_cancelled_cash_requires_source_cancellation_and_no_fulfillment(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        order.write({'state': 'cancel', 'canceled_in_shopify': True})
+        for changes in ({'cancelled_at': None}, {'fulfillments': [{'id': 'delivery'}]}):
+            source = dict(payload, **changes)
+            with patch.object(type(order), '_shopify_cash_source', return_value=(source, events)), self.assertRaises(UserError):
+                order._sync_shopify_cash()
+        self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+
+    def test_cancelled_cash_preview_can_apply_without_invoice(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        order.write({'state': 'cancel', 'canceled_in_shopify': True})
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            self.assertEqual(wizard.state, 'preview', wizard.preview_html)
+            self.assertIn('receipt and refund only', wizard.preview_html)
+            self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+            wizard.action_apply()
+            self.assertEqual(wizard.state, 'done')
+            self.assertFalse(order.invoice_ids)
+
+    def test_cancelled_cash_matches_charge_and_refund_payouts_without_invoice(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            order._process_shopify_cancelled_import(payload, queue_line)
+        for event in events:
+            payout = self._payout('cancelled-' + event['id'])
+            payout.payout_transaction_ids.unlink()
+            transaction = self.env['shopify.payout.report.line.ept'].create({
+                'payout_id': payout.id, 'transaction_id': 'balance-' + event['id'],
+                'source_order_transaction_id': event['id'], 'source_order_id': order.shopify_order_id,
+                'order_id': order.id, 'amount': 242.10 if event['kind'] == 'sale' else -242.10,
+                'transaction_type': 'charge' if event['kind'] == 'sale' else 'refund',
+            })
+            self.assertEqual(payout.find_payment_for_payout_transaction(transaction).shopify_order_transaction_id, event['id'])
+
+    def test_cancelled_paypal_payments_support_reference_backfill(self):
+        if 'payout.shopify.backfill' not in self.env:
+            self.skipTest('Payment Payout Reconciliation is not installed')
+        order, payload, events, queue_line = self._cancelled_fixture(gateway='paypal')
+        events[0]['receipt'] = {'transaction_id': 'CAP12345678901234'}
+        events[1]['receipt'] = {'refund_transaction_id': 'REF12345678901234'}
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+            payments = self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)])
+            wallet, transit = self.env['account.account'].create([
+                {'name': name, 'code': code, 'account_type': 'asset_current', 'reconcile': True,
+                 'company_ids': [Command.set(self.env.company.ids)]}
+                for name, code in [('PayPal Cancellation Balance', 'CSPPBAL'), ('PayPal Cancellation Transit', 'CSPPTRN')]
+            ])
+            receiving_bank = self.env['account.journal'].create({
+                'name': 'PayPal Cancellation Bank', 'code': 'CSBK', 'type': 'bank',
+                'default_account_id': self.journal.default_account_id.id,
+                'suspense_account_id': self.journal.suspense_account_id.id,
+            })
+            self.env['account.payment.method.line'].create({
+                'name': 'PayPal cancellation deposits', 'journal_id': receiving_bank.id,
+                'payment_method_id': self.env.ref('account.account_payment_method_manual_in').id,
+                'payment_account_id': transit.id,
+            })
+            connection = self.env['payout.connection'].create({
+                'name': 'Cancelled PayPal Test', 'processor': 'paypal', 'merchant_reference': 'cancelled-test',
+                'payment_journal_ids': [Command.set(self.journal.ids)], 'bank_journal_id': receiving_bank.id,
+                'journal_id': self.env['account.journal'].create({'name': 'PayPal Settlement Test', 'code': 'CSPP', 'type': 'general'}).id,
+                'clearing_account_ids': [Command.set(self.outstanding.ids)],
+                'balance_account_id': wallet.id, 'transit_account_id': transit.id,
+                'fee_account_id': self.instance.transaction_line_ids.account_id.id,
+            })
+            wizard = self.env['payout.shopify.backfill'].create({
+                'connection_id': connection.id, 'payment_ids': [Command.set(payments.ids)],
+                'date_from': min(payments.mapped('date')), 'date_to': max(payments.mapped('date')),
+            })
+            wizard.action_preview()
+            self.assertEqual({row['status'] for row in wizard.plan_json}, {'ready'}, wizard.preview_html)
+            wizard.action_apply()
+            self.assertEqual(set(payments.mapped('payout_reference')), {'CAP12345678901234', 'REF12345678901234'})
+            self.assertEqual(payments.payout_connection_id, connection)
+            self.assertFalse(order.invoice_ids)
+            from odoo.addons.payment_payout_reconciliation.services.processors import batch, row
+            activities = self.env['payout.batch']
+            for event in events:
+                refund = event['kind'] == 'refund'
+                reference = event['receipt']['refund_transaction_id' if refund else 'transaction_id']
+                activities |= activities._import_report(connection, batch(
+                    reference, event['date'] if 'date' in event else event['processed_at'][:10], order.currency_id.name,
+                    [row(reference, reference, 'refund' if refund else 'payment',
+                         -242.10 if refund else 242.10, 0 if refund else 3,
+                         order.currency_id.name, 'T1107' if refund else 'T0003')]))
+            activities.action_match()
+            activities.action_post()
+            self.assertTrue(all(pay._seek_for_lines()[0].reconciled for pay in payments))
+            self.assertEqual(sum(activities.move_id.line_ids.filtered(lambda line: line.account_id == wallet).mapped('balance')), -3)
+            count = self.env['account.move'].search_count([])
+            order._sync_shopify_cash()
+            self.assertEqual(self.env['account.move'].search_count([]), count)
+            self.assertTrue(all(pay._seek_for_lines()[0].reconciled for pay in payments))
+
+    def test_cancelled_order_creation_keeps_refunded_lines_and_uses_paid_workflow(self):
+        _order, payload, events, queue_line = self._cancelled_fixture()
+        self.workflow.picking_policy = 'direct'
+        self.env['sale.auto.workflow.configuration.ept'].create({
+            'shopify_instance_id': self.instance.id, 'payment_gateway_id': self.gateway.id,
+            'financial_status': 'paid', 'shopify_order_payment_status': self.env.ref('shopify_ept.unshipped').id,
+            'auto_workflow_id': self.workflow.id,
+        })
+        self.product.default_code = 'CANCELLED-TEST'
+        payload.update(currency=self.env.company.currency_id.name, source_name='web', tags='',
+                       payment_gateway_names=['shopify_payments'], transaction=events, total_discounts=0,
+                       line_items=[dict(id='original', sku='CANCELLED-TEST', quantity=1, current_quantity=0,
+                                        price=242.10, requires_shipping=False, name='Original cancelled item')])
+        order = self.env['sale.order'].shopify_create_order(
+            self.instance, self.partner, self.partner, self.partner, queue_line, payload, payload['line_items'], 123)
+        self.assertTrue(order)
+        self.assertEqual(order.order_line.shopify_line_id, 'original')
+        self.assertEqual(order.order_line.product_uom_qty, 1)
+        self.assertEqual(order.auto_workflow_process_id, self.workflow)
+        self.assertEqual(order.state, 'draft')
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
+
+    def test_cancelled_request_uses_status_filter_without_fulfillment_filter(self):
+        from .. import shopify
+        from unittest.mock import Mock
+        remote = Mock()
+        remote.find.return_value = []
+        queues = self.env['shopify.order.data.queue.ept']
+        self.instance.shopify_store_time_zone = 'UTC'
+        with patch.object(shopify, 'Order', return_value=remote):
+            queues.shopify_order_request(self.instance, fields.Datetime.now(), fields.Datetime.now(), 'cancelled')
+        self.assertEqual(remote.find.call_args.kwargs['status'], 'cancelled')
+        self.assertNotIn('fulfillment_status', remote.find.call_args.kwargs)
+
+    def test_cancelled_import_queues_every_page_and_activates_processor(self):
+        from unittest.mock import Mock
+        queues = self.env['shopify.order.data.queue.ept']
+        line_model = self.env['shopify.order.data.queue.line.ept']
+        orders = [Mock() for _ in range(250)]
+        processor = self.env.ref('shopify_ept.process_shopify_order_queue')
+        processor.active = False
+        with patch.object(type(self.instance), 'connect_in_shopify'), \
+                patch.object(type(queues), 'shopify_order_request', return_value=orders) as request, \
+                patch.object(type(line_model), 'create_order_data_queue_line', return_value=[100]) as first_page, \
+                patch.object(type(queues), 'list_all_orders', return_value=[101]) as remaining_pages:
+            result = queues.shopify_create_order_data_queues(
+                self.instance, fields.Datetime.now(), fields.Datetime.now(), order_type='cancelled')
+        self.assertEqual(result, [100, 101])
+        self.assertEqual(request.call_args.args[-1], 'cancelled')
+        self.assertEqual(first_page.call_args.args[2], 'unshipped')
+        remaining_pages.assert_called_once()
+        self.assertTrue(processor.active)
+
+    def test_cancelled_queue_does_not_fetch_fulfillment_orders(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        self.instance.is_delivery_multi_warehouse = True
+        queue_line.shopify_order_data_queue_id.created_by = 'webhook'
+        line_model = self.env['shopify.order.data.queue.line.ept']
+        with patch.object(type(self.instance), 'connect_in_shopify'), \
+                patch.object(type(line_model), 'create_order_queue_line', return_value=True), \
+                patch.object(type(order), 'get_shopify_fulfillment_orders', side_effect=AssertionError('Unexpected fulfillment fetch')):
+            line_model.create_order_data_queue_line([payload], self.instance, 'unshipped', created_by='webhook')
+
+    def test_cancelled_existing_invoice_uses_confirmed_refund_without_full_reversal(self):
+        order, invoice, payload, events = self._fixture(gross=True)
+        payload.update(cancelled_at=events[1]['processed_at'], financial_status='partially_refunded')
+        queue_line = self.env['shopify.order.data.queue.line.ept'].create({
+            'shopify_instance_id': self.instance.id, 'order_data': json.dumps(payload),
+        })
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+        self.assertEqual(order.state, 'cancel')
+        self.assertEqual(invoice.state, 'posted')
+        credits = order.invoice_ids.filtered(lambda move: move.move_type == 'out_refund')
+        self.assertEqual(credits.amount_total, 45.0)
+        self.assertEqual(len(credits), 1)
+        payments = self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)])
+        self.assertEqual(sorted(payments.mapped('amount')), [45.0, 242.10])
+
+    def test_cancelled_cash_refuses_receivable_allocation_to_other_order(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            order._process_shopify_cancelled_import(payload, queue_line)
+            payments = self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)])
+            payments.move_id.line_ids.filtered(lambda line: line.account_type == 'asset_receivable').remove_move_reconcile()
+            _other_order, other_invoice, _other_payload, _other_events = self._fixture(gross=True)
+            receipt = payments.filtered(lambda pay: pay.payment_type == 'inbound')
+            (receipt._seek_for_lines()[1] | other_invoice.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')).reconcile()
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(repair=True)
 
     def _fixture(self, gross=False, retained=197.10, removed=45.0):
         order = self.env['sale.order'].create({

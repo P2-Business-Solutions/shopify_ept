@@ -16,11 +16,16 @@ def is_removed_order_line(line):
         return False
 
 
-def filter_importable_order_lines(lines):
+def is_cancelled_shopify_order(order):
+    """Recognize cancellations even when a webhook omits the reason."""
+    return bool((order or {}).get("cancelled_at") or (order or {}).get("cancel_reason"))
+
+
+def filter_importable_order_lines(lines, include_removed=False):
     """Exclude line items that remain in Shopify payloads after removal."""
     return [
         line for line in (lines or [])
-        if not is_removed_order_line(line)
+        if include_removed or not is_removed_order_line(line)
     ]
 
 

@@ -75,6 +75,49 @@ verified tax calculations or the existing separate Shopify tax line, and shippin
 explicitly available refund amounts/taxes. Existing credit notes require the matching
 Shopify Refund ID. Presentment-currency components must explicitly match the cash currency.
 
+## Import canceled orders
+
+From version 18.0.3.24, **Import Cancel Orders** queues canceled orders even when
+they are missing from Odoo, follows every result page, and uses the normal queue
+processor. Shopify's [order API](https://shopify.dev/docs/api/admin-rest/latest/resources/order)
+supports `status=cancelled`. The cancellation cron uses the same path. Importing by
+Shopify order ID and cancellation webhooks also use this treatment. A cancellation
+timestamp is sufficient when the source omits the cancellation reason.
+
+For an order paid, canceled before fulfillment, and fully refunded, the connector
+imports the original lines and leaves the sales order **Canceled**. It does not run
+the order confirmation, delivery, or invoice workflow. Enable **Record Payments from
+Shopify Transactions** on the store and **Register Payment** on the gateway workflow
+to record each successful sale/capture and refund as a separate posted payment with
+its original amount, date, parent ID and order link. A matching refunded workflow
+is used when configured; otherwise a refunded cancellation can use the gateway's
+paid workflow for its payment journal configuration.
+
+When there is no invoice or credit note and both Shopify and the complete cash
+history prove a full refund with no fulfillment, the payments clear each other's
+customer receivable entries. No revenue invoice or credit note is created. Each
+payment's outstanding entry stays open for its own payout. Existing posted invoices
+continue through the original/net invoice checks and supported credit-note flow.
+Unpaid authorization/void cancellations create no payments.
+
+Canceled orders with partial refunds, missing cash history, fulfillment history,
+ambiguous payments, or incomplete payment configuration remain available for review.
+Financial recording rolls back and the queue line stays **Failed**, linked to the
+order with its source payload retained. Reprocessing that line or importing the order
+again retries the cash history instead of skipping the existing canceled order.
+**Preview / Repair Shopify Payments** also supports verified full cancellations
+without an invoice. Repeated processing reuses the existing payments.
+
+For PayPal, these payments carry both **Shopify Cash Order** and the exact **Shopify
+Order Transaction ID**, which Payment Payout Reconciliation uses without requiring an
+invoice. In that app, select the payments and use **Backfill Shopify PayPal References**
+to preview and apply each transaction's separate PayPal capture/refund reference and
+connection. Then match and post the PayPal activities. The connector does not guess
+a PayPal connection or substitute the capture reference for the refund reference.
+If the app's canceled-order wizard already recorded identified payments, compatible
+payments can be reused; differing journals, accounts, dates without an exact ID, or
+allocations outside the cancellation require review.
+
 ## Repair existing orders
 
 An accounting manager can open **Preview / Repair Shopify Payments** on an order or
@@ -151,8 +194,9 @@ missing refund-parent history; unsupported currency conversion; gift-card transa
 missing/ambiguous gateway journals or payment methods; and invoice/credit-note totals
 that do not fit the proven original or final-net document states. Correct payments
 identified by their Shopify transaction ID can be reused even after payout reconciliation.
-An invoice awaiting additional captures, or a fully refunded order with no posted
-invoice, also requires review rather than manufacturing a balancing document.
+An invoice awaiting additional captures requires review. A fully refunded order with
+no posted invoice is supported only for a verified cancellation before fulfillment;
+other missing-invoice histories require review.
 
 Unproven mixed document histories (some reductions embedded in the invoice and other reductions
 represented by credit notes), goodwill/order-adjustment refunds, duties/additional fees,

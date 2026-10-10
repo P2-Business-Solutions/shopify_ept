@@ -129,6 +129,21 @@ class TestShopifyPaymentPlan(unittest.TestCase):
         with self.assertRaises(plan.PaymentPlanError):
             plan.cash_events([self.raw[0], row], 'order', 'USD')
 
+    def test_fully_refunded_cancellation_needs_no_invoice_components(self):
+        events = plan.cash_events([self.raw[0], transaction('full', 'refund', '242.10', parent_id='charge')], 'order', 'USD')
+        payload = dict(cancelled_at='2026-10-10T10:00:00Z', financial_status='refunded', refunds=[])
+        plan.prove_cancelled_cash(payload, events, compare)
+
+    def test_cancelled_cash_requires_full_refund_and_no_fulfillment(self):
+        events = plan.cash_events([self.raw[0], transaction('full', 'refund', '242.10', parent_id='charge')], 'order', 'USD')
+        valid = dict(cancelled_at='2026-10-10T10:00:00Z', financial_status='refunded')
+        for changes in ({'cancelled_at': None}, {'financial_status': 'partially_refunded'},
+                        {'fulfillment_status': 'fulfilled'}, {'fulfillments': [{'id': 'shipment'}]}):
+            with self.subTest(changes=changes), self.assertRaises(plan.PaymentPlanError):
+                plan.prove_cancelled_cash(dict(valid, **changes), events, compare)
+        with self.assertRaises(plan.PaymentPlanError):
+            plan.prove_cancelled_cash(valid, self.events, compare)
+
     def test_full_refund_of_original_invoice(self):
         events = plan.cash_events([self.raw[0], transaction('full', 'refund', '242.10', parent_id='charge')], 'order', 'USD')
         self.assertEqual(plan.invoice_mode(events, 242.10, 242.10, compare), 'gross')

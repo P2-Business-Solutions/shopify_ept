@@ -15,6 +15,16 @@ SPEC.loader.exec_module(UTILS)
 
 class TestShopifyOrderUtils(unittest.TestCase):
 
+    def test_cancellation_timestamp_does_not_require_a_reason(self):
+        self.assertTrue(UTILS.is_cancelled_shopify_order({'cancelled_at': '2026-10-10T10:00:00Z'}))
+        self.assertTrue(UTILS.is_cancelled_shopify_order({'cancel_reason': 'customer'}))
+        self.assertFalse(UTILS.is_cancelled_shopify_order({'cancelled_at': None, 'cancel_reason': None}))
+
+    def test_cancelled_order_can_retain_original_refunded_lines(self):
+        lines = [{'id': 101, 'quantity': 2, 'current_quantity': 0}]
+        self.assertEqual(UTILS.filter_importable_order_lines(lines, include_removed=True), lines)
+        self.assertEqual(lines[0]['current_quantity'], 0)
+
     def test_removed_order_lines_are_excluded(self):
         lines = [
             {"id": 101, "quantity": 2, "current_quantity": 2},

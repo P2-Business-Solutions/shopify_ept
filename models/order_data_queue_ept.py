@@ -185,7 +185,16 @@ class ShopifyOrderDataQueueEpt(models.Model):
         start = time.time()
         order_queues = []
         instance.connect_in_shopify()
-        if order_type not in ["shipped", "buy_with_prime"]:
+        if order_type == 'cancelled':
+            orders = self.shopify_order_request(instance, from_date, to_date, order_type)
+            if orders:
+                page_size = len(orders)
+                order_queues = order_data_queue_line_obj.create_order_data_queue_line(
+                    orders, instance, 'unshipped', created_by)
+                if page_size >= 250:
+                    order_queues += self.list_all_orders(orders, instance, created_by, 'unshipped')
+            instance.last_cancel_order_import_date = to_date - timedelta(days=2)
+        elif order_type not in ["shipped", "buy_with_prime"]:
             queue_type = 'unshipped'
             for order_status_id in instance.shopify_order_status_ids:
                 order_status = order_status_id.status
@@ -231,10 +240,11 @@ class ShopifyOrderDataQueueEpt(models.Model):
         """
         from_date, to_date = self.convert_dates_by_timezone(instance, from_date, to_date)
         try:
-            order_ids = shopify.Order().find(status="any",
-                                             fulfillment_status=order_type,
-                                             updated_at_min=from_date,
-                                             updated_at_max=to_date, limit=250)
+            filters = {'status': 'cancelled' if order_type == 'cancelled' else 'any',
+                       'updated_at_min': from_date, 'updated_at_max': to_date, 'limit': 250}
+            if order_type != 'cancelled':
+                filters['fulfillment_status'] = order_type
+            order_ids = shopify.Order().find(**filters)
         except Exception as error:
             raise UserError(error)
 

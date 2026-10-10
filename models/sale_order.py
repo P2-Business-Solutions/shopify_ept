@@ -27,6 +27,7 @@ from .shopify_fulfillment_utils import (
 )
 from .shopify_order_utils import (
     filter_importable_order_lines,
+    is_cancelled_shopify_order,
     find_matching_shopify_tag,
     get_shopify_discount_allocations_by_line_id,
     get_shopify_discount_applications,
@@ -368,7 +369,7 @@ class SaleOrder(models.Model):
         sale_order_line_obj = self.env["sale.order.line"]
         total_discount = order_response.get("total_discounts", 0.0)
         order_number = order_response.get("order_number")
-        for line in filter_importable_order_lines(lines):
+        for line in filter_importable_order_lines(lines, include_removed=is_cancelled_shopify_order(order_response)):
             is_custom_line, is_gift_card_line, product = self.search_custom_tip_gift_card_product(line, instance)
             price = line.get("price")
             if instance.order_visible_currency:
@@ -711,6 +712,9 @@ class SaleOrder(models.Model):
             sale_order = self.search_existing_shopify_order(order_response, instance, order_number)
 
             if sale_order:
+                if is_cancelled_shopify_order(order_response):
+                    sale_order._process_shopify_cancelled_import(order_response, order_data_line)
+                    continue
                 if sale_order._shopify_external_order_error():
                     # An earlier external settlement failure left this order
                     # for review. Reprocess its source instead of discarding it
@@ -733,8 +737,9 @@ class SaleOrder(models.Model):
                 continue
 
             lines = filter_importable_order_lines(
-                order_response.get("line_items"))
-            if self.check_mismatch_details(lines, instance, order_number, order_data_line):
+                order_response.get("line_items"), include_removed=is_cancelled_shopify_order(order_response))
+            if self.check_mismatch_details(lines, instance, order_number, order_data_line,
+                                           include_removed=is_cancelled_shopify_order(order_response)):
                 _logger.info("Mismatch details found in this Shopify Order(%s) and id (%s)", order_number,
                              order_response.get("id"))
                 order_data_line.write({"state": "failed", "processed_at": datetime.now()})
@@ -753,6 +758,9 @@ class SaleOrder(models.Model):
                                                                shopify_order_data_queue_line_id=order_data_line.id if order_data_line else False)
                 continue
             order_ids.append(sale_order.id)
+            if is_cancelled_shopify_order(order_response):
+                sale_order._process_shopify_cancelled_import(order_response, order_data_line)
+                continue
             if sale_order._shopify_record_external_order_error(order_data_line):
                 continue
 
@@ -893,38 +901,10 @@ class SaleOrder(models.Model):
             return exception
         return False
 
-    def import_shopify_cancel_order(self, instance, from_date, to_date):
-        """ This method is used if Shopify orders imported in odoo and after Shopify store in some orders are canceled
-            then this method cancel imported orders and created a log note.
-            @param : instance,from_date,to_date
-            @return: True
-            @author: Meera Sidapara @Emipro Technologies Pvt. Ltd on date 16 March 2022.
-            Task_id: 185873
-        """
-        shopify_order_data_queue_obj = self.env["shopify.order.data.queue.ept"]
-        instance.connect_in_shopify()
-        order_ids = shopify_order_data_queue_obj.shopify_order_request(instance, from_date, to_date, order_type="any")
-        for order in order_ids:
-            order_data = order.to_dict()
-            if order_data.get('cancel_reason'):
-                message = ""
-                if order_data.get('cancel_reason') == "customer":
-                    message = "Customer changed/canceled Order"
-                elif order_data.get('cancel_reason') == "fraud":
-                    message = "Fraudulent order"
-                elif order_data.get('cancel_reason') == "inventory":
-                    message = "Items unavailable"
-                elif order_data.get('cancel_reason') == "declined":
-                    message = "Payment declined"
-                elif order_data.get('cancel_reason') == "other":
-                    message = "Other"
-                sale_order = self.search_existing_shopify_order(order_data, instance, order_data.get("order_number"))
-                if sale_order and sale_order.state != 'cancel':
-                    sale_order.write({'canceled_in_shopify': True})
-                    sale_order.message_post(
-                        body=_("The reason for the order cancellation on this Shopify store is that %s.", message))
-                    sale_order.cancel_shopify_order()
-        instance.last_cancel_order_import_date = to_date - timedelta(days=2)
+    def import_shopify_cancel_order(self, instance, from_date, to_date, created_by='import'):
+        """Queue cancellations, including orders that were never imported."""
+        self.env['shopify.order.data.queue.ept'].shopify_create_order_data_queues(
+            instance, from_date, to_date, created_by=created_by, order_type='cancelled')
         return True
 
     def create_shipped_order_refund(self, shopify_financial_status, order_response, sale_order, created_by):
@@ -982,7 +962,7 @@ class SaleOrder(models.Model):
 
         return sale_order
 
-    def check_mismatch_details(self, lines, instance, order_number, order_data_queue_line):
+    def check_mismatch_details(self, lines, instance, order_number, order_data_queue_line, include_removed=False):
         """This method used to check the mismatch details in the order lines.
             @param : self, lines, instance, order_number, order_data_queue_line
             @author: Haresh Mori @Emipro Technologies Pvt. Ltd on date 11/11/2019.
@@ -992,7 +972,7 @@ class SaleOrder(models.Model):
         common_log_line_obj = self.env["common.log.lines.ept"]
         mismatch = False
 
-        for line in filter_importable_order_lines(lines):
+        for line in filter_importable_order_lines(lines, include_removed=include_removed):
             shopify_variant = self.search_shopify_variant(line, instance)
             if shopify_variant:
                 continue
@@ -1125,7 +1105,8 @@ class SaleOrder(models.Model):
             order.create_shopify_Delivery_Fee_lines(order_response, instance)
             _logger.info("Created Delivery Fee for order (%s).", order.name)
 
-        order._shopify_apply_external_order_adjustments(instance, order_response)
+        if not is_cancelled_shopify_order(order_response):
+            order._shopify_apply_external_order_adjustments(instance, order_response)
         order.create_shopify_tax_line(order_response, instance)
 
         # self.set_fulfilment_order_id_and_fulfillment_line_id(order, instance, order_response)
@@ -2818,6 +2799,10 @@ class SaleOrder(models.Model):
                 return True
             try:
                 need_to_done_queue = True
+                if is_cancelled_shopify_order(order_data):
+                    order._sync_shopify_discount_data(order_data)
+                    order._process_shopify_cancelled_import(order_data, queue_line)
+                    continue
                 is_manual_update = created_by == 'Manual Update'
                 previous_external_error = order._shopify_external_order_error()
                 order_with_transactions = order.with_context(
@@ -3509,10 +3494,14 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         self.canceled_in_shopify = True
         self.write({'shopify_order_status': 'Canceled'})
         if "draft" in self.invoice_ids.mapped("state"):
-            for invoice_id in self.invoice_ids:
+            for invoice_id in self.invoice_ids.filtered(lambda move: move.state == 'draft'):
                 invoice_id.message_post(
                     body=_("Order %s has been canceled in the Shopify store.", self.shopify_order_number))
                 invoice_id.button_cancel()
+
+        if self.env.context.get('shopify_cancel_cash_only'):
+            # Cash synchronization uses actual refunds and preserves posted invoices.
+            return True
 
         # Calling the credit note creation process to prevent duplication creation of the refunds.
         context_dict = self.env.context

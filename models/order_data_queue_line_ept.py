@@ -7,6 +7,7 @@ from odoo import models, fields
 from .. import shopify
 from ..shopify.pyactiveresource.connection import ClientError
 from dateutil.relativedelta import relativedelta
+from .shopify_order_utils import is_cancelled_shopify_order
 
 _logger = logging.getLogger("Shopify Order Queue Line")
 
@@ -124,7 +125,8 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
             instance.connect_in_shopify()
         for order in orders_data:
             fulfillment_data = []
-            if needs_fulfillment_data:
+            cancelled = is_cancelled_shopify_order(order if isinstance(order, dict) else order.to_dict())
+            if needs_fulfillment_data and not cancelled:
                 order_id = order.get('id') if isinstance(order, dict) else order.id
                 fulfillment_data = self.env["sale.order"].get_shopify_fulfillment_orders(order_id)
             if created_by == "webhook" and not is_new_order:
