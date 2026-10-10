@@ -52,6 +52,7 @@
                 <field name="detail"/><field name="review_html" nolabel="1"/>
                 <footer><button name="action_open_order" type="object" string="Open Order" invisible="not order_id"/>
                     <button name="action_open_shopify_order" type="object" string="Open Shopify Order"/>
+                    <button name="action_back_to_bulk_repair" type="object" string="Back to Bulk Repair" class="btn-primary"/>
                     <button string="Close" special="cancel"/></footer>
             </form>
         </field>

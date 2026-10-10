@@ -178,6 +178,16 @@ class ShopifyPayoutRepairLine(models.Model):
                         or (credits.shopify_refund_order_id and credits.shopify_refund_order_id != order)):
             raise UserError(_('An existing refund credit has conflicting totals, customer or source identity.'))
         values = self._historical_credit_values(payload, refund, parts, partner, sales_journal, credit_date, order)
+        if credits:
+            expected, actual = {}, {}
+            for command in values['invoice_line_ids']:
+                line = command[2]
+                expected[line['account_id']] = expected.get(line['account_id'], 0.0) + line['quantity'] * line['price_unit']
+            for line in credits.invoice_line_ids:
+                actual[line.account_id.id] = actual.get(line.account_id.id, 0.0) + line.price_subtotal
+            if (expected.keys() != actual.keys() or credits.invoice_line_ids.tax_ids
+                    or any(currency.compare_amounts(expected[key], actual[key]) for key in expected)):
+                raise UserError(_('The existing historical credit uses different refund accounts or allocations. Review and correct the credit before matching its cash.'))
         plan_events = []
         for event in refund_events:
             journal = instance.credit_note_payment_journal or instance.shopify_settlement_report_journal_id
@@ -250,7 +260,7 @@ class ShopifyPayoutRepairLine(models.Model):
 
     def _historical_credit_values(self, payload, refund, parts, partner, journal, date, order):
         instance, company = self.payout_id.instance_id, self.payout_id.instance_id.shopify_company_id
-        lines, tax_amount = [], 0.0
+        lines, tax_amount, resolved = [], 0.0, []
         sources = {str(line['id']): line for line in payload['line_items']}
         for part in parts:
             if part['kind'] == 'item':
@@ -270,6 +280,17 @@ class ShopifyPayoutRepairLine(models.Model):
             account = product.property_account_income_id or product.categ_id.property_account_income_categ_id
             if instance.shopify_fiscal_position_id:
                 account = instance.shopify_fiscal_position_id.map_account(account)
+            resolved.append((part, name, account))
+        component_accounts = self.env['account.account'].browse(sorted({account.id for part, _name, account in resolved
+            if part['kind'] != 'adjustment' and account}))
+        if len(component_accounts) > 1 and any(part['kind'] == 'adjustment' for part in parts):
+            raise UserError(_('The refund adjustment spans multiple revenue accounts. Review and allocate the credit manually before reconciling this refund.'))
+        for part, name, account in resolved:
+            if part['kind'] == 'adjustment' and component_accounts:
+                # Preserve the returned sale's classification, including Readers.
+                # The generic adjustment product is only the account fallback
+                # when the refund has no item or shipping component to follow.
+                account = component_accounts
             if not account or account.deprecated or company not in account.company_ids or account.account_type not in ('income', 'income_other'):
                 raise UserError(_('Configure the refund product\'s income/returns account in this company.'))
             # Account-only historical credits do not manufacture an inventory or

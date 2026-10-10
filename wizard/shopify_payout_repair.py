@@ -127,7 +127,7 @@ class ShopifyPayoutRepair(models.TransientModel):
     def _summary(self, plan):
         if plan['kind'] == 'historical':
             lines = plan['values']['invoice_line_ids']
-            accounts = self.env['account.account'].browse([command[2]['account_id'] for command in lines])
+            accounts = self.env['account.account'].browse(sorted({command[2]['account_id'] for command in lines}))
             return _('%(order)s: %(action)s refund credit %(amount)s; %(count)s exact cash refund(s). Accounts: %(accounts)s. Original receipt remains in opening balances.',
                      order=plan['source_name'], action='Post/reuse' if plan['post'] else 'Prepare/reuse',
                      amount=plan['amount'], count=len(plan['events']), accounts=', '.join(accounts.mapped('display_name')))
@@ -282,3 +282,7 @@ class ShopifyPayoutRepairLine(models.TransientModel):
         self.ensure_one()
         return {'type': 'ir.actions.act_window', 'res_model': self._name, 'res_id': self.id,
                 'view_mode': 'form', 'target': 'new', 'name': _('Review Repair Details')}
+
+    def action_back_to_bulk_repair(self):
+        self.ensure_one()
+        return self.wizard_id._reopen()

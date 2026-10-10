@@ -153,24 +153,7 @@ class SaleOrderPaymentSync(models.Model):
         parts, _cash = refund_components(refund, events, self.currency_id.name, shop_currency,
                                          self.currency_id.compare_amounts)
         adjustment_total = 0.0
-        for part in parts:
-            if part['kind'] not in ('adjustment', 'shipping') or (part['kind'] == 'shipping' and refund.get('refund_shipping_lines')):
-                continue
-            product = (self.shopify_instance_id.shipping_product_id if part['kind'] == 'shipping'
-                       else self.shopify_instance_id.refund_adjustment_product_id).with_company(self.company_id)
-            account = product.property_account_income_id or product.categ_id.property_account_income_categ_id
-            if self.fiscal_position_id:
-                account = self.fiscal_position_id.map_account(account)
-            if (not product or not account or account.deprecated or self.company_id not in account.company_ids
-                    or account.account_type not in ('income', 'income_other')):
-                raise UserError(_('Configure the Shopify refund adjustment/shipping product and its income or returns account, or link a reviewed credit note.'))
-            subtotal, tax = float(part['subtotal']), float(part['tax'])
-            adjustment_total += subtotal + tax
-            tax_total += tax
-            lines.append(Command.create({'product_id': product.id, 'name': 'Shopify refund %s: %s' %
-                                         (part['kind'], part.get('reason', refund['id'])),
-                                         'account_id': account.id, 'quantity': 1, 'price_unit': subtotal,
-                                         'tax_ids': [Command.clear()]}))
+        component_accounts = self.env['account.account']
         for item in refund.get('refund_line_items', []):
             original = invoice.invoice_line_ids.filtered(
                 lambda line: line.sale_line_ids.shopify_line_id == str(item.get('line_item_id')))
@@ -191,6 +174,7 @@ class SaleOrderPaymentSync(models.Model):
         for original, qty, subtotal, tax in components:
             if len(original) != 1 or qty <= 0 or qty > original.quantity or subtotal < 0 or tax < 0:
                 raise UserError(_('Refund components cannot be uniquely traced to the original invoice.'))
+            component_accounts |= original.account_id
             if original.tax_ids:
                 # Price-included taxes need the tax-inclusive base.
                 included = all(original.tax_ids.mapped('price_include'))
@@ -214,6 +198,32 @@ class SaleOrderPaymentSync(models.Model):
                 'tax_ids': [Command.set(original.tax_ids.ids)],
                 'sale_line_ids': [Command.set(original.sale_line_ids.ids)],
             }))
+        # Legacy shipping components must resolve before discrepancy adjustments
+        # so mixed item/shipping accounts also require a reviewed allocation.
+        for part in sorted(parts, key=lambda part: part['kind'] == 'adjustment'):
+            if part['kind'] not in ('adjustment', 'shipping') or (part['kind'] == 'shipping' and refund.get('refund_shipping_lines')):
+                continue
+            product = (self.shopify_instance_id.shipping_product_id if part['kind'] == 'shipping'
+                       else self.shopify_instance_id.refund_adjustment_product_id).with_company(self.company_id)
+            account = product.property_account_income_id or product.categ_id.property_account_income_categ_id
+            if self.fiscal_position_id:
+                account = self.fiscal_position_id.map_account(account)
+            if part['kind'] == 'adjustment' and component_accounts:
+                if len(component_accounts) != 1:
+                    raise UserError(_('The refund adjustment spans multiple revenue accounts. Review and allocate the credit manually before reconciling this refund.'))
+                account = component_accounts
+            if (not product or not account or account.deprecated or self.company_id not in account.company_ids
+                    or account.account_type not in ('income', 'income_other')):
+                raise UserError(_('Configure the Shopify refund adjustment/shipping product and its income or returns account, or link a reviewed credit note.'))
+            if part['kind'] == 'shipping':
+                component_accounts |= account
+            subtotal, tax = float(part['subtotal']), float(part['tax'])
+            adjustment_total += subtotal + tax
+            tax_total += tax
+            lines.append(Command.create({'product_id': product.id, 'name': 'Shopify refund %s: %s' %
+                                         (part['kind'], part.get('reason', refund['id'])),
+                                         'account_id': account.id, 'quantity': 1, 'price_unit': subtotal,
+                                         'tax_ids': [Command.clear()]}))
         if tax_total:
             tax_product = self.shopify_instance_id.tax_product_id or self.env.ref('shopify_ept.shopify_tax_product', False)
             original_tax = invoice.invoice_line_ids.filtered(

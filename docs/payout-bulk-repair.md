@@ -14,6 +14,11 @@ issue a new Shopify refund.
    existing accounting, without posting. Ready cases are selected; each exception
    remains in the same list with its source order and explanation. **Details**
    shows exact cash amounts, dates, invoice/credit treatment and account IDs.
+   In version **18.0.3.29**, **Back to Bulk Repair** returns from Details to the
+   same preview and selected cases. **Apply Selected Ready Cases** is on that
+   main dialog; Details alone does not create accounting entries. On 18.0.3.28,
+   closing Details dismisses the dialog, so reopen the bulk action and preview
+   again to reach Apply.
 3. Use **Open Order** to correct Odoo orders/invoices directly. **Shopify** opens
    the original source order, including orders absent from Odoo. Payout transaction
    rows also have these shortcuts. Refresh after making corrections.
@@ -44,13 +49,24 @@ receipt, sales order, original revenue invoice, delivery or manufacturing order 
 created. The original cash collection remains represented by opening balances.
 
 Items require exact Shopify variant mappings and a mapped existing customer.
-Shipping and discrepancy lines use the instance's configured shipping/refund
-adjustment products and income/returns accounts. Shopify discrepancy amounts are
+Shipping lines use the configured shipping income/returns account. In version
+**18.0.3.30**, discrepancy adjustments follow the refunded components' revenue
+account when they share one GL. A Readers return and its discrepancy therefore
+both use the Readers GL. Current-period returns follow the original invoice
+account; historical returns follow the mapped product/category account. A refund
+spanning different revenue accounts requires a reviewed allocation. Amount-only
+refunds still use the configured refund-adjustment product/account. Shopify discrepancy amounts are
 subtracted from calculated refund components: for order **#129128**, returned value
 224.10 less an adjustment of 8.75 explains the 215.35 cash refund. An unknown
 adjustment type or unexplained difference stays in review. Explicit refund tax
 uses the existing Shopify credit tax account/separate tax product configuration.
 This does not change production tax configuration.
+
+If an existing historical credit uses different accounts or allocations from
+the reviewed source plan, it stays in review instead of silently reusing the
+incorrect GLs. Posted credits are not rewritten by this repair. Account summaries
+list each GL once; Details retains the individual source components, including
+offsetting pending/refund discrepancy entries.
 
 Historical credit lines contain account, description and quantity rather than stock
 product links. Inventory returns and any required inventory/COGS adjustments must
@@ -99,9 +115,11 @@ historical activity/credit linking actions.
 
 ## Validation
 
-The local Odoo 18 module upgrade and suite completed with 148 passing tests and
+The local Odoo 18 module upgrade and suite completed with 152 passing tests and
 three skipped Enterprise bank-reconciliation-widget tests. All 101 standalone
-checks passed. The 14 bulk repair tests also passed after the final multi-payout
-audit and stable-preview changes, including one refund document split across
-two payouts. Enterprise widget behavior still needs validation in staging.
+checks passed. The 18 bulk repair tests cover one refund document split across
+two payouts, category-inherited Readers accounts distinct from the generic
+adjustment account, offsetting pending adjustments, current-period credits,
+mixed-account review and existing historical credits with incorrect GLs.
+Enterprise widget behavior still needs validation in staging.
 Production payouts were inspected without changing their accounting.

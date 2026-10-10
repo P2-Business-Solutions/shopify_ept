@@ -22,20 +22,26 @@ class TestShopifyPayoutRepair(PayoutTestCase):
         super().setUpClass()
         cls.env.user.groups_id |= cls.env.ref('account.group_account_manager')
         cls.instance.shopify_transaction_payment_sync = True
-        cls.outstanding, cls.receivable, cls.revenue = cls.env['account.account'].create([
+        cls.outstanding, cls.receivable, cls.revenue, cls.adjustment_revenue = cls.env['account.account'].create([
             dict(name=name, code=code, account_type=kind, reconcile=kind != 'income', company_ids=[Command.set(cls.env.company.ids)])
             for name, code, kind in [('Bulk Outstanding', 'BULKOUT', 'asset_current'),
                                      ('Bulk Receivable', 'BULKREC', 'asset_receivable'),
-                                     ('Bulk Returns', 'BULKSALE', 'income')]
+                                     ('Bulk Returns', 'BULKSALE', 'income'),
+                                     ('Generic Adjustment Sales', 'BULKADJ', 'income')]
         ])
         (cls.journal.inbound_payment_method_line_ids | cls.journal.outbound_payment_method_line_ids).payment_account_id = cls.outstanding
         cls.partner = cls.env['res.partner'].create(dict(name='Bulk Customer', property_account_receivable_id=cls.receivable.id))
         cls.sales_journal = cls.env['account.journal'].create(dict(name='Bulk Sales', code='BULKS', type='sale', company_id=cls.env.company.id))
-        cls.product = cls.env['product.product'].create(dict(name='Bulk Returned Item', type='service', property_account_income_id=cls.revenue.id))
+        cls.reader_category = cls.env['product.category'].create(dict(name='Bulk Readers',
+            property_account_income_categ_id=cls.revenue.id))
+        cls.product = cls.env['product.product'].create(dict(name='Bulk Returned Item', type='service',
+            categ_id=cls.reader_category.id, property_account_income_id=False))
+        cls.adjustment_product = cls.env['product.product'].create(dict(name='Generic Refund Adjustment', type='service',
+            property_account_income_id=cls.adjustment_revenue.id))
         cls.gateway = cls.env['shopify.payment.gateway.ept'].create(dict(name='Shopify Payments', code='shopify_payments', shopify_instance_id=cls.instance.id))
         cls.workflow = cls.env['sale.workflow.process.ept'].create(dict(name='Bulk Workflow', journal_id=cls.journal.id, register_payment=True,
             inbound_payment_method_id=cls.journal.inbound_payment_method_line_ids[:1].payment_method_id.id))
-        cls.instance.refund_adjustment_product_id = cls.product
+        cls.instance.refund_adjustment_product_id = cls.adjustment_product
         cls.env['shopify.res.partner.ept'].create(dict(partner_id=cls.partner.id, shopify_instance_id=cls.instance.id, shopify_customer_id='customer'))
         template = cls.env['shopify.product.template.ept'].create(dict(name='Bulk Template', shopify_instance_id=cls.instance.id))
         cls.env['shopify.product.product.ept'].create(dict(name='Bulk Variant', shopify_instance_id=cls.instance.id,
@@ -80,6 +86,9 @@ class TestShopifyPayoutRepair(PayoutTestCase):
             self.assertEqual(credit.state, 'posted')
             self.assertEqual(credit.amount_total, 215.35)
             self.assertEqual(credit.invoice_line_ids.mapped('price_unit'), [224.10, -8.75])
+            self.assertEqual(credit.invoice_line_ids.account_id, self.revenue)
+            self.assertAlmostEqual(sum(credit.line_ids.filtered(lambda line: line.account_id == self.revenue).mapped('balance')), 215.35)
+            self.assertFalse(credit.line_ids.filtered(lambda line: line.account_id == self.adjustment_revenue))
             self.assertEqual(credit.amount_residual, 0)
             self.assertEqual(payment.amount, 215.35)
             self.assertEqual(payment.payment_type, 'outbound')
@@ -90,6 +99,66 @@ class TestShopifyPayoutRepair(PayoutTestCase):
             wizard.action_apply()
             self.assertEqual(wizard.line_ids.credit_ids, credit)
             self.assertEqual(wizard.line_ids.payment_ids, payment)
+
+    def test_pending_refund_discrepancies_follow_returned_account_and_summary_is_unique(self):
+        payout, wizard, payload, events = self._historical()
+        payload['refunds'][0]['order_adjustments'].extend([
+            dict(kind='refund_discrepancy', amount='215.35', tax_amount='0', reason='Refund discrepancy'),
+            dict(kind='refund_discrepancy', amount='-215.35', tax_amount='0', reason='Pending refund discrepancy'),
+        ])
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+            self.assertEqual(wizard.line_ids.status, 'ready', wizard.line_ids.detail)
+            self.assertEqual(wizard.line_ids.detail.count(self.revenue.display_name), 1)
+            self.assertNotIn(self.adjustment_revenue.display_name, wizard.line_ids.detail)
+            wizard.action_apply()
+        credit = wizard.line_ids.credit_ids
+        self.assertEqual(len(credit.invoice_line_ids), 4)
+        self.assertEqual(credit.invoice_line_ids.account_id, self.revenue)
+        self.assertAlmostEqual(sum(credit.line_ids.filtered(lambda line: line.account_id == self.revenue).mapped('balance')), 215.35)
+
+    def test_mixed_refund_accounts_require_explicit_adjustment_allocation(self):
+        payout, wizard, payload, events = self._historical()
+        template = self.env['shopify.product.template.ept'].create(dict(name='Mixed Refund Template', shopify_instance_id=self.instance.id))
+        self.env['shopify.product.product.ept'].create(dict(name='Mixed Refund Variant', shopify_instance_id=self.instance.id,
+            shopify_template_id=template.id, product_id=self.adjustment_product.id, variant_id='mixed-variant'))
+        payload['line_items'].append(dict(id='second-item', quantity=1, current_quantity=0, variant_id='mixed-variant'))
+        payload['fulfillments'][0]['line_items'].append(dict(id='second-item', quantity=1))
+        payload['refunds'][0]['refund_line_items'].append(dict(line_item_id='second-item', quantity=1, subtotal='20', total_tax='0'))
+        payload['refunds'][0]['order_adjustments'][0]['amount'] = '28.75'
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+        self.assertEqual(wizard.line_ids.status, 'review')
+        self.assertIn('multiple revenue accounts', wizard.line_ids.detail)
+        self.assertFalse(wizard.line_ids.selected)
+        self.assertFalse(wizard.line_ids.credit_ids)
+
+    def test_existing_historical_credit_on_generic_adjustment_account_needs_review(self):
+        payout, wizard, payload, events = self._historical()
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+            credit = self.env['account.move'].create(wizard.line_ids.plan['values'])
+            credit.invoice_line_ids.filtered(lambda line: line.price_unit < 0).account_id = self.adjustment_revenue
+            credit.action_post()
+            wizard.action_preview()
+        self.assertEqual(wizard.line_ids.status, 'review')
+        self.assertIn('different refund accounts', wizard.line_ids.detail)
+        self.assertFalse(wizard.line_ids.payment_ids)
+        self.assertTrue(credit.invoice_line_ids.filtered(lambda line: line.account_id == self.adjustment_revenue))
+        self.assertEqual(credit.state, 'posted')
+
+    def test_current_order_refund_discrepancy_follows_original_item_account(self):
+        order, invoice, payload, events = self._fixture(gross=True, retained=188.35, removed=53.75)
+        events[1]['amount'] = '45.00'
+        payload['refunds'][0]['order_adjustments'] = [dict(kind='refund_discrepancy', amount='8.75', tax_amount='0')]
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            plan = order._build_shopify_cash_plan(repair=True)
+            order._apply_shopify_cash_plan(plan)
+        credit = order.shopify_payment_audit_ids.credit_note_ids
+        self.assertEqual(credit.amount_total, 45)
+        self.assertEqual(credit.invoice_line_ids.account_id, self.revenue)
+        self.assertFalse(credit.line_ids.filtered(lambda line: line.account_id == self.adjustment_revenue))
+        self.assertAlmostEqual(sum(credit.line_ids.filtered(lambda line: line.account_id == self.revenue).mapped('balance')), 45)
 
     def test_historical_refund_matches_and_validates_existing_statement(self):
         payout, wizard, payload, events = self._historical()
