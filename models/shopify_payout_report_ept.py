@@ -473,7 +473,14 @@ class ShopifyPaymentReportEpt(models.Model):
                     lambda move: move.state == "posted"
                 )[:1]
             else:
-                domain, invoice, log_line = self.check_for_invoice_refund(transaction, log_lines)
+                reviewed_ids = self.env.context.get('shopify_bulk_repaired_line_ids')
+                if (reviewed_ids is not None and transaction.transaction_type in ('charge', 'refund', 'payment_refund')):
+                    # Financial documents were reviewed by the bulk planner.
+                    # Generation only creates statement rows, including for the
+                    # cases deliberately left unselected or blocked.
+                    domain = []
+                else:
+                    domain, invoice, log_line = self.check_for_invoice_refund(transaction, log_lines)
                 # An ambiguous invoice is not suitable for statement metadata.
                 if len(invoice) != 1:
                     invoice = self.env['account.move']
@@ -884,7 +891,15 @@ class ShopifyPaymentReportEpt(models.Model):
         log_lines = []
         _logger.info("Processing Bank Statement line of payout : %s.", self.name)
         statement_lines = statement_line_obj.search([('payout_id', '=', self.id)])
-        for statement_line in statement_lines.filtered(lambda x: not x.is_reconciled):
+        remaining = statement_lines.filtered(lambda x: not x.is_reconciled)
+        reviewed_ids = self.env.context.get('shopify_bulk_repaired_line_ids')
+        if reviewed_ids is not None:
+            # Bulk repair must not run the legacy refund importer on unrelated
+            # customer exceptions that the accountant has left for review.
+            remaining = remaining.filtered(lambda line: line.payout_line_id.id in reviewed_ids
+                or (line.shopify_transaction_type not in ('charge', 'refund', 'payment_refund')
+                    and not line.payout_line_id.shop_cash_kind))
+        for statement_line in remaining:
             move_line_data = []
             move_line_total_amount = 0.0
             currency_ids = []

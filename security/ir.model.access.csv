@@ -54,3 +54,6 @@ access_shopify_payment_audit_user,Shopify payment audit read,model_shopify_payme
 access_shopify_payment_audit_manager,Shopify payment audit manager read,model_shopify_payment_audit_ept,account.group_account_manager,1,0,0,0
 access_shopify_payment_audit_connector,Shopify payment audit connector read,model_shopify_payment_audit_ept,shopify_ept.group_shopify_ept,1,0,0,0
 access_shopify_payment_repair_manager,Shopify payment repair,model_shopify_payment_repair_ept,account.group_account_manager,1,1,1,1
+access_shopify_payout_repair_manager,Shopify payout repair,model_shopify_payout_repair_ept,account.group_account_manager,1,1,1,1
+access_shopify_payout_repair_line_manager,Shopify payout repair case,model_shopify_payout_repair_line_ept,account.group_account_manager,1,1,1,1
+access_shopify_payout_repair_audit_user,Shopify payout repair audit,model_shopify_payout_repair_audit_ept,account.group_account_user,1,0,0,0

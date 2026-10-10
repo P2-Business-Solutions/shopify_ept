@@ -1,5 +1,9 @@
 # Shopify cash transactions and payment repair
 
+Version **18.0.3.28** adds [bulk payout exception processing](payout-bulk-repair.md),
+including historical fulfilled-order refund credits, direct order navigation,
+retroactive discount/order-edit refund evidence and independent ready-case execution.
+
 Version 18.0.3.19 can record successful Shopify sales/captures and refunds separately.
 It reads Shopify; it never initiates a Shopify charge or refund. Payout settlement
 transfers remain a separate step after the underlying cash movements are reconciled.

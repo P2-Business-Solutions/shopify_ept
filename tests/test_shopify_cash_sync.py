@@ -46,6 +46,7 @@ class TestShopifyCashSync(PayoutTestCase):
             'name': 'Cash Sync Sales', 'code': 'CSSSALE', 'account_type': 'income',
             'company_ids': [Command.set(cls.env.company.ids)],
         })
+        cls.product.property_account_income_id = cls.revenue
 
     def _cancelled_fixture(self, gateway='shopify_payments'):
         order, invoice, payload, events = self._fixture()
@@ -1139,9 +1140,13 @@ class TestShopifyCashSync(PayoutTestCase):
 
     def test_gross_refund_preserves_invoice_tax(self):
         order, invoice, payload, events = self._fixture(gross=True)
+        order.company_id.country_id = self.env.ref('base.us')
+        group = self.env['account.tax.group'].create({'name': 'Cash Sync Tax',
+            'company_id': order.company_id.id, 'country_id': self.env.ref('base.us').id})
         tax = self.env['account.tax'].create({
             'name': 'Cash Sync 10%', 'amount': 10, 'amount_type': 'percent',
             'type_tax_use': 'sale', 'company_id': order.company_id.id,
+            'tax_group_id': group.id,
         })
         invoice.button_draft()
         invoice.invoice_line_ids.filtered(lambda line: line.name == 'removed').tax_ids = tax

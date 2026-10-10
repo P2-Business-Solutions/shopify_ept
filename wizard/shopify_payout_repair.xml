@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="shopify_payout_repair_audit_company_rule" model="ir.rule">
+        <field name="name">Shopify payout repair audit company</field>
+        <field name="model_id" ref="model_shopify_payout_repair_audit_ept"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+    <record id="view_shopify_payout_bulk_repair" model="ir.ui.view">
+        <field name="name">shopify.payout.bulk.repair.form</field>
+        <field name="model">shopify.payout.repair.ept</field>
+        <field name="arch" type="xml">
+            <form string="Bulk Repair Payout Transactions" create="false">
+                <field name="preview_settings" invisible="1"/>
+                <field name="payout_ids" widget="many2many_tags"/>
+                <group>
+                    <group><field name="cutover_date"/><field name="timezone"/><field name="sales_journal_id"/></group>
+                    <group><field name="post_historical"/><field name="open_only"/><field name="rematch_payouts"/></group>
+                </group>
+                <div class="alert alert-info" role="alert">
+                    Historical refunds record returns and cash already refunded in Shopify, using the configured income/adjustment and exact tax accounts.
+                    Original collections remain in opening balances. Review the accounts and adjustments in Details before applying.
+                    Inventory returns are handled separately. This action never sends money or customer notifications.
+                </div>
+                <field name="result" nolabel="1"/>
+                <field name="line_ids" nolabel="1" readonly="0">
+                    <list editable="bottom" create="false" delete="false" decoration-danger="status == 'review'" decoration-success="status == 'done'">
+                        <field name="selected" readonly="status != 'ready'"/>
+                        <field name="status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
+                        <field name="transaction_ids" widget="many2many_tags" optional="hide"/>
+                        <field name="detail"/>
+                        <button name="action_open_details" string="Details" type="object"/>
+                        <button name="action_open_order" string="Open Order" type="object" invisible="not order_id"/>
+                        <button name="action_open_shopify_order" string="Shopify" type="object"/>
+                    </list>
+                </field>
+                <footer>
+                    <button name="action_preview" type="object" string="Preview / Refresh" class="btn-primary"/>
+                    <button name="action_apply" type="object" string="Apply Selected Ready Cases" invisible="not preview_settings"/>
+                    <button string="Close" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+    <record id="view_shopify_payout_repair_case" model="ir.ui.view">
+        <field name="name">shopify.payout.repair.case.form</field>
+        <field name="model">shopify.payout.repair.line.ept</field>
+        <field name="arch" type="xml">
+            <form create="false" edit="false">
+                <group><field name="status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
+                    <field name="transaction_ids" widget="many2many_tags"/>
+                    <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/></group>
+                <field name="detail"/><field name="review_html" nolabel="1"/>
+                <footer><button name="action_open_order" type="object" string="Open Order" invisible="not order_id"/>
+                    <button name="action_open_shopify_order" type="object" string="Open Shopify Order"/>
+                    <button string="Close" special="cancel"/></footer>
+            </form>
+        </field>
+    </record>
+    <record id="view_payout_bulk_repair_button" model="ir.ui.view">
+        <field name="name">shopify.payout.bulk.repair.button</field>
+        <field name="model">shopify.payout.report.ept</field>
+        <field name="inherit_id" ref="shopify_payout_report_form_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//header" position="inside">
+                <button name="action_bulk_repair_transactions" type="object" string="Bulk Repair Transactions" groups="account.group_account_manager"/>
+            </xpath>
+            <xpath expr="//notebook" position="inside">
+                <page string="Bulk Repair Audit" groups="account.group_account_user">
+                    <field name="repair_audit_ids" readonly="1">
+                        <list create="false" edit="false" delete="false">
+                            <field name="create_date"/><field name="create_uid"/><field name="source_order_id"/>
+                            <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
+                        </list>
+                        <form create="false" edit="false" delete="false">
+                            <group><field name="create_date"/><field name="create_uid"/><field name="source_order_id"/>
+                                <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/></group>
+                            <field name="plan" widget="jsonb"/>
+                        </form>
+                    </field>
+                </page>
+            </xpath>
+            <xpath expr="//field[@name='payout_transaction_ids']/list" position="inside">
+                <button name="action_open_order" string="Open Order" type="object" invisible="not source_order_id and not order_id"/>
+                <button name="action_open_shopify_order" string="Shopify" type="object" invisible="not source_order_id"/>
+            </xpath>
+            <xpath expr="//field[@name='payout_transaction_ids']/form" position="inside">
+                <footer><button name="action_open_order" string="Open Order" type="object" invisible="not source_order_id and not order_id"/>
+                    <button name="action_open_shopify_order" string="Shopify" type="object" invisible="not source_order_id"/></footer>
+            </xpath>
+        </field>
+    </record>
+    <record id="action_bulk_shopify_payout_repairs" model="ir.actions.server">
+        <field name="name">Bulk Repair Payout Transactions</field>
+        <field name="model_id" ref="model_shopify_payout_report_ept"/>
+        <field name="binding_model_id" ref="model_shopify_payout_report_ept"/>
+        <field name="binding_view_types">list,form</field>
+        <field name="groups_id" eval="[(4, ref('account.group_account_manager'))]"/>
+        <field name="state">code</field>
+        <field name="code">if records:
+    action = records.action_bulk_repair_transactions()</field>
+    </record>
+</odoo>

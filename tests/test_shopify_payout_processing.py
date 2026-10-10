@@ -39,6 +39,7 @@ class TestShopifyPayoutProcessing(unittest.TestCase):
         self.payout._context = {'cron_process': True}
         self.savepoint = MagicMock()
         self.env = MagicMock()
+        self.env.context = self.payout._context
         self.env.cr.savepoint.return_value = self.savepoint
         self.payout.env = self.env
         self.statement = SimpleNamespace(id=2, is_reconciled=False, amount=97,

@@ -6,6 +6,7 @@ from odoo.exceptions import UserError
 from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
 from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, prove_cancelled_cash, fingerprint, component_money, money
+from .shopify_refund_plan import prove_final_net_invoice, refund_components
 
 _logger = logging.getLogger(__name__)
 
@@ -77,12 +78,29 @@ class SaleOrderPaymentSync(models.Model):
                 key = line.sale_line_ids.shopify_line_id
                 if key:
                     quantities[key] = quantities.get(key, 0) + line.quantity
-            prove_net_refunds(payload, events, quantities)
+            try:
+                prove_net_refunds(payload, events, quantities)
+            except ValueError:
+                # Order edits and retroactive discounts need final-order evidence
+                # as well as the gross/refund cash pair; a difference alone is insufficient.
+                prove_final_net_invoice(payload, events, quantities,
+                                        sum(invoices.mapped('amount_total')), self.currency_id.compare_amounts)
+                tax_product = self.shopify_instance_id.tax_product_id
+                exact_tax = invoices.invoice_line_ids.filtered(lambda line: line.product_id == tax_product)
+                tax = sum(invoices.mapped('amount_tax')) + sum(exact_tax.mapped('price_subtotal'))
+                source_tax = component_money(payload, 'current_total_tax', self.currency_id.name,
+                                             payload.get('currency', self.currency_id.name))
+                if self.currency_id.compare_amounts(tax, float(source_tax)):
+                    raise UserError(_('The final Shopify tax and invoice tax do not agree. Review the invoice.'))
             return []
         prepared = []
         covered = set()
         refunded_quantities = {}
         known_credits = self.env['account.move']
+        source_refund_ids = {str(refund.get('id')) for refund in payload.get('refunds', [])
+                             if refund_events.keys() & {str(row.get('id')) for row in refund.get('transactions', [])}}
+        if credits.filtered(lambda credit: credit.shopify_refund_id not in source_refund_ids):
+            raise UserError(_('An existing reviewed credit note has an unknown Shopify Refund ID. Correct its source link before proceeding.'))
         for refund in payload.get('refunds', []):
             ids = {str(row.get('id')) for row in refund.get('transactions', [])} & refund_events.keys()
             if not ids:
@@ -108,16 +126,23 @@ class SaleOrderPaymentSync(models.Model):
                     raise UserError(_('A posted credit note differs from its Shopify refund transactions.'))
                 known_credits |= credit
                 continue
+            unlinked = self.env['account.move'].search([
+                ('shopify_instance_id', '=', self.shopify_instance_id.id),
+                ('company_id', '=', self.company_id.id), ('shopify_refund_id', '=', str(refund.get('id'))),
+                ('move_type', '=', 'out_refund'), ('state', '!=', 'cancel'), ('id', 'not in', credits.ids),
+            ], limit=1)
+            if unlinked:
+                raise UserError(_('An existing reviewed credit note identifies this refund but is not linked to this order. Review its identity and order link first.'))
             prepared.append({'values': self._shopify_credit_values(
                 refund, amount, invoices, min(refund_events[key]['date'] for key in ids),
-                payload.get('currency', self.currency_id.name)), 'amount': amount})
+                payload.get('currency', self.currency_id.name), events), 'amount': amount})
         if covered != refund_events.keys() or credits - known_credits:
             raise UserError(_('Cash refunds and existing credit notes must each have a unique Shopify refund link.'))
         return prepared
 
-    def _shopify_credit_values(self, refund, amount, invoices, date, shop_currency):
+    def _shopify_credit_values(self, refund, amount, invoices, date, shop_currency, events):
         """Build supported item/shipping refunds; verify tax and total before posting."""
-        if refund.get('order_adjustments') or refund.get('duties') or refund.get('additional_fees'):
+        if refund.get('duties') or refund.get('refund_duties') or refund.get('additional_fees'):
             raise UserError(_('Refund adjustments, duties or additional fees need a reviewed credit note linked by Shopify Refund ID.'))
         if len(invoices) != 1:
             raise UserError(_('Create and link the refund credit note manually when an order has multiple invoices.'))
@@ -125,6 +150,27 @@ class SaleOrderPaymentSync(models.Model):
         lines = []
         tax_total = 0.0
         components = []
+        parts, _cash = refund_components(refund, events, self.currency_id.name, shop_currency,
+                                         self.currency_id.compare_amounts)
+        adjustment_total = 0.0
+        for part in parts:
+            if part['kind'] not in ('adjustment', 'shipping') or (part['kind'] == 'shipping' and refund.get('refund_shipping_lines')):
+                continue
+            product = (self.shopify_instance_id.shipping_product_id if part['kind'] == 'shipping'
+                       else self.shopify_instance_id.refund_adjustment_product_id).with_company(self.company_id)
+            account = product.property_account_income_id or product.categ_id.property_account_income_categ_id
+            if self.fiscal_position_id:
+                account = self.fiscal_position_id.map_account(account)
+            if (not product or not account or account.deprecated or self.company_id not in account.company_ids
+                    or account.account_type not in ('income', 'income_other')):
+                raise UserError(_('Configure the Shopify refund adjustment/shipping product and its income or returns account, or link a reviewed credit note.'))
+            subtotal, tax = float(part['subtotal']), float(part['tax'])
+            adjustment_total += subtotal + tax
+            tax_total += tax
+            lines.append(Command.create({'product_id': product.id, 'name': 'Shopify refund %s: %s' %
+                                         (part['kind'], part.get('reason', refund['id'])),
+                                         'account_id': account.id, 'quantity': 1, 'price_unit': subtotal,
+                                         'tax_ids': [Command.clear()]}))
         for item in refund.get('refund_line_items', []):
             original = invoice.invoice_line_ids.filtered(
                 lambda line: line.sale_line_ids.shopify_line_id == str(item.get('line_item_id')))
@@ -177,7 +223,7 @@ class SaleOrderPaymentSync(models.Model):
             lines.append(Command.create({'product_id': original_tax.product_id.id, 'name': original_tax.name,
                                          'account_id': original_tax.account_id.id, 'quantity': 1,
                                          'price_unit': tax_total, 'tax_ids': [Command.clear()]}))
-        if not lines or self.currency_id.compare_amounts(sum(part[2] + part[3] for part in components), amount):
+        if not lines or self.currency_id.compare_amounts(sum(part[2] + part[3] for part in components) + adjustment_total, amount):
             raise UserError(_('Refund items, shipping and taxes do not explain the successful cash refund.'))
         if self.company_id._get_violated_lock_dates(fields.Date.to_date(date), True, invoice.journal_id):
             raise UserError(_('The refund date is locked. A reviewed accounting correction is required.'))
@@ -346,14 +392,17 @@ class SaleOrderPaymentSync(models.Model):
         replacements = self.env['account.payment']
         if remaining:
             # Only the demonstrable single net-payment legacy shape is replaced.
-            if (not repair or mode != 'net' or len(remaining) != 1 or remaining.payment_type != 'inbound'
+            final_amount = sum(invoices.mapped('amount_total'))
+            if mode == 'gross':
+                final_amount -= sum(float(row['amount']) for row in events if row['kind'] == 'refund')
+            if (not repair or mode not in ('net', 'gross') or len(remaining) != 1 or remaining.payment_type != 'inbound'
                     or remaining.shopify_order_transaction_id or remaining.currency_id != self.currency_id
                     or remaining.company_id != self.company_id
                     or (remaining.shopify_instance_id and remaining.shopify_instance_id != self.shopify_instance_id)
                     or (remaining.shopify_cash_order_id and remaining.shopify_cash_order_id != self)
                     or remaining.journal_id.id not in [row['journal_id'] for row in events if row['direction'] == 'inbound']
                     or remaining.partner_id.commercial_partner_id != self.partner_id.commercial_partner_id
-                    or self.currency_id.compare_amounts(remaining.amount, sum(invoices.mapped('amount_total')))
+                    or self.currency_id.compare_amounts(remaining.amount, final_amount)
                     or any(row['payment_id'] for row in events if row['direction'] == 'inbound')):
                 raise UserError(_('Existing payments do not match Shopify cash history. Use Preview / Repair Shopify Payments; ambiguous cases require accounting review.'))
             self._check_shopify_replacement(remaining, documents)
@@ -400,7 +449,8 @@ class SaleOrderPaymentSync(models.Model):
             payment.write({'state': 'canceled', 'invoice_ids': [Command.clear()]})
             for document in documents:
                 document.matched_payment_ids -= payment
-            payment.message_post(body=_('Replaced through Shopify cash-history repair; reversal: %s.', reversal.name))
+            payment_post = payment._message_log if self.env.context.get('shopify_silent_cancelled_import') else payment.message_post
+            payment_post(body=_('Replaced through Shopify cash-history repair; reversal: %s.', reversal.name))
         credits = self.env['account.move']
         for planned_credit in plan['credits']:
             values = planned_credit['values']
