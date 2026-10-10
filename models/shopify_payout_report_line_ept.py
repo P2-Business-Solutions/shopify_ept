@@ -77,6 +77,24 @@ class ShopifyPayoutReportLineEpt(models.Model):
                     raise UserError(_('A payout transaction already has a statement line. Review that accounting before changing its source amounts or identity.'))
         return super().write(vals)
 
+    def _refresh_imported_fee_values(self, fee, net_amount):
+        """Refresh API fee metadata without relaxing public accounting guards."""
+        self.ensure_one()
+        return super().write({'fee': fee, 'net_amount': net_amount})
+
+    def _set_reimported_fee_total(self, amount):
+        """The repair path must update eligible accounting before its source row."""
+        self.ensure_one()
+        if self.transaction_type != 'fees' or self.transaction_id:
+            raise UserError(_('Only the aggregate payout fee row can be repaired.'))
+        self.payout_id._check_payout_reimport_period()
+        statements = self.env['account.bank.statement.line'].search([('payout_line_id', '=', self.id)])
+        currency = self.payout_id.currency_id
+        if len(statements) > 1 or any(currency.compare_amounts(row.amount, amount) for row in statements):
+            raise UserError(_('The payout fee statement must agree with its corrected fee total.'))
+        return super().write({'amount': amount, 'fee': 0.0, 'net_amount': amount,
+                              'currency_id': currency.id})
+
     def unlink(self):
         if self.env['account.bank.statement.line'].search_count([('payout_line_id', 'in', self.ids)]):
             raise UserError(_('Remove the eligible unreconciled statement lines explicitly before deleting their payout transactions.'))

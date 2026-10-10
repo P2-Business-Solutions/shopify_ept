@@ -7,7 +7,7 @@ receiving bank journal. The settlement entry does not book sales, refunds or fee
 
 ## Setup
 
-Upgrade `shopify_ept` to version `18.0.3.26`. On the Shopify instance's **Payout
+Upgrade `shopify_ept` to version `18.0.3.27`. On the Shopify instance's **Payout
 Configurations** tab, configure:
 
 1. **Payout Report Journal:** the separate Shopify settlement bank journal.
@@ -158,6 +158,16 @@ atomic: if matching fails, the original posting is restored. Correct payment mat
 fees and existing settlement transfers are preserved; no duplicate statement lines or
 Shop Cash payments are created. Lines with linked manual accounting or nonstandard
 postings remain for review. The payout shows the reason when reprocessing needs review.
+
+Version `18.0.3.27` also refreshes transaction fee/net metadata and corrects an older
+aggregate fee deduction when it omitted adjustment fees. Shop Cash payments still
+match at their gross amount; processing and adjustment fees are deducted once using
+the existing **Fees** account mapping. A payout with $667.38 in processing fees and
+$1.80 in Shop Cash adjustment fees therefore books a $669.18 fee deduction. A plain
+fee posting can be corrected even after it was validated, preserving existing card,
+grouped Shop Cash and refund payment matches. Repeating reimport does not add fees
+again. Fee corrections respect accounting locks and roll back if rebooking fails;
+linked manual accounting or nonstandard fee postings remain for review.
 
 Global and hard accounting locks are respected, including the original statement and
 settlement entry dates. Temporary user lock exceptions do not allow automatic repair

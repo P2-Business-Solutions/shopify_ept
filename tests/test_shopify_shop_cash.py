@@ -394,6 +394,168 @@ class TestShopCashSettlement(PayoutTestCase):
         payout.generate_bank_statement()
         self.assertEqual(self._statement_lines(payout).move_id, original_moves)
 
+    def _legacy_adjustment_fee_payout(self, *, cash_fee=1.80, imported_cash_fee=None):
+        entries, cash_payments = [], self.env['account.payment']
+        for reference in ('fee-first', 'fee-second'):
+            order, invoice = self._order(reference, 40)
+            cash_payments |= self._payment(order, 40, reference + '-cash', invoice=invoice)
+            entries.append({'order_transaction_id': reference + '-cash', 'amount': '40',
+                            'fees': str(cash_fee / 2), 'net': str(40 - cash_fee / 2)})
+        payout = self._cash_payout('140819824866', entries, fee=cash_fee)
+        cash_line = payout.payout_transaction_ids.filtered('shop_cash_kind')
+        if imported_cash_fee is not None:
+            cash_line.write({'fee': imported_cash_fee, 'net_amount': 80 - imported_cash_fee})
+        order, invoice = self._order('fee-card', 100)
+        card = self._payment(order, 100, 'fee-card', gateway='shopify_payments', invoice=invoice)
+        payout.write({'amount': 180 - cash_fee - 3, 'payout_transaction_ids': [Command.create({
+            'transaction_id': 'fee-card-balance', 'transaction_type': 'charge',
+            'source_order_transaction_id': 'fee-card', 'source_order_id': order.shopify_order_id,
+            'order_id': order.id, 'amount': 100, 'fee': 3, 'net_amount': 97,
+            'currency_id': payout.currency_id.id, 'is_remaining_statement': True})]})
+        # Older imports omitted adjustment fees and also stored a positive net
+        # on this synthetic negative fee deduction.
+        fees = payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'fees')
+        fees.write({'amount': -3, 'net_amount': 3})
+        payout.generate_bank_statement()
+        statements = self._statement_lines(payout)
+        self._ledger_reconcile(payout, statements.filtered(lambda row: row.payout_line_id == cash_line).id,
+            cash_payments.move_id.line_ids.filtered(lambda row: row.account_id == self.outstanding).ids)
+        self._ledger_reconcile(payout, statements.filtered(lambda row: row.shopify_transaction_type == 'charge').id,
+            card._seek_for_lines()[0].ids)
+        fee_statement = statements.filtered(lambda row: row.shopify_transaction_type == 'fees')
+        self._book_counterpart(fee_statement, self.instance.transaction_line_ids.filtered(
+            lambda row: row.transaction_type == 'fees').account_id)
+        payout.state = 'partially_processed'
+        return payout, fee_statement, cash_payments | card
+
+    def test_reimport_refreshes_adjustment_fee_and_preserves_grouped_payment_matches(self):
+        payout, fee_statement, payments = self._legacy_adjustment_fee_payout(imported_cash_fee=0)
+        statements = self._statement_lines(payout)
+        gross_items = (statements - fee_statement).line_ids
+        partials = gross_items.matched_debit_ids | gross_items.matched_credit_ids
+        transactions = [{
+            'id': '140819824866-balance', 'type': 'credit', 'adjustment_reason': 'shop_cash',
+            'currency': payout.currency_id.name, 'amount': '80', 'fee': '1.80', 'net': '78.20',
+            'adjustment_order_transactions': [
+                {'order_transaction_id': ref + '-cash', 'amount': '40', 'fees': '.90', 'net': '39.10'}
+                for ref in ('fee-first', 'fee-second')]}, {
+            'id': 'fee-card-balance', 'type': 'charge', 'source_order_id': 'fee-card',
+            'source_order_transaction_id': 'fee-card', 'currency': payout.currency_id.name,
+            'amount': '100', 'fee': '3', 'net': '97'}]
+        with patch.object(shopify.Transactions, 'find', return_value=[
+                SimpleNamespace(to_dict=lambda data=data: data) for data in transactions]):
+            payout.refresh_payout_transaction_links()
+        self.assertEqual(payout.payout_transaction_ids.filtered('shop_cash_kind').fee, 1.80)
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(payout.state, 'validated')
+        self.assertAlmostEqual(fee_statement.amount, -4.80)
+        self.assertAlmostEqual(fee_statement.payout_line_id.net_amount, -4.80)
+        self.assertEqual(self._statement_lines(payout), statements)
+        self.assertEqual((statements - fee_statement).line_ids, gross_items)
+        self.assertEqual(gross_items.matched_debit_ids | gross_items.matched_credit_ids, partials)
+        self.assertTrue(all(payments.move_id.line_ids.filtered(
+            lambda row: row.account_id == self.outstanding).mapped('reconciled')))
+        self.assertFalse(payout.reimport_reconciliation_issue)
+        items = statements.line_ids
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(statements.line_ids, items)
+
+    def test_adjustment_fee_correction_respects_closed_period(self):
+        payout, fees, _payments = self._legacy_adjustment_fee_payout()
+        items = self._statement_lines(payout).line_ids
+        self.env.company.fiscalyear_lock_date = fields.Date.today()
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(fees.amount, -3)
+        self.assertEqual(fees.payout_line_id.amount, -3)
+        self.assertEqual(self._statement_lines(payout).line_ids, items)
+        self.assertIn('closed accounting period', payout.reimport_reconciliation_issue)
+
+    def test_validated_fee_correction_preserves_settlement_and_bank_match(self):
+        payout, fees, _payments = self._legacy_adjustment_fee_payout()
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        transit = self.outstanding.copy({'name': 'Fee Repair Transit', 'code': 'SCFTRANS'})
+        bank = self.journal.copy({'name': 'Fee Repair Receiving Bank', 'code': 'SCFB',
+            'default_account_id': self.journal.default_account_id.copy({'code': 'SCFBANK'}).id})
+        bank.inbound_payment_method_line_ids.payment_account_id = transit
+        self.instance.write({'shopify_payout_bank_journal_id': bank.id,
+            'shopify_payout_transit_account_id': transit.id,
+            'shopify_payout_transfer_journal_id': self.env['account.journal'].create({
+                'name': 'Fee Repair Transfers', 'type': 'general', 'code': 'SCFT'}).id})
+        payout.action_create_settlement_transfer()
+        bank_line = self.env['account.bank.statement.line'].create({'journal_id': bank.id,
+            'date': fields.Date.today(), 'payment_ref': 'Fee Repair Bank Deposit', 'amount': payout.amount,
+            'counterpart_account_id': transit.id})
+        (payout.settlement_line_id | bank_line.line_ids.filtered(lambda row: row.account_id == transit)).reconcile()
+        transfer, items = payout.settlement_move_id, payout.settlement_move_id.line_ids
+        partials = payout.settlement_line_id.matched_credit_ids
+        # Recreate the historical stale deduction without changing gross
+        # payment matches or the already correct net settlement amount.
+        fees.action_undo_reconciliation()
+        fees.write({'amount': -3})
+        self._book_counterpart(fees, self.instance.transaction_line_ids.filtered(
+            lambda row: row.transaction_type == 'fees').account_id)
+        fees.payout_line_id._set_reimported_fee_total(-3)
+        self.assertEqual(payout.state, 'validated')
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(payout.state, 'validated')
+        self.assertAlmostEqual(fees.amount, -4.80)
+        self.assertEqual(payout.settlement_move_id, transfer)
+        self.assertEqual(transfer.line_ids, items)
+        self.assertEqual(payout.settlement_line_id.matched_credit_ids, partials)
+        self.assertEqual(payout.settlement_bank_line_ids, bank_line)
+        self.assertEqual(payout.settlement_status, 'matched')
+
+    def test_fee_correction_preserves_linked_manual_accounting_for_review(self):
+        payout, fees, _payments = self._legacy_adjustment_fee_payout()
+        fees.action_undo_reconciliation()
+        self._book_counterpart(fees, self.outstanding)
+        offset = self.env['account.move'].create({'journal_id': self.sales_journal.id,
+            'line_ids': [Command.create({'account_id': self.outstanding.id, 'credit': 3}),
+                         Command.create({'account_id': self.revenue.id, 'debit': 3})]})
+        offset.action_post()
+        (fees.line_ids | offset.line_ids).filtered(lambda row: row.account_id == self.outstanding).reconcile()
+        items = fees.line_ids
+        partials = items.matched_debit_ids | items.matched_credit_ids
+        self.assertFalse(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(fees.amount, -3)
+        self.assertEqual(fees.payout_line_id.amount, -3)
+        self.assertEqual(fees.line_ids, items)
+        self.assertEqual(items.matched_debit_ids | items.matched_credit_ids, partials)
+        self.assertIn('linked accounting', payout.reimport_reconciliation_issue)
+
+    def test_failed_fee_rebooking_restores_original_fee_posting(self):
+        payout, fees, _payments = self._legacy_adjustment_fee_payout()
+        items = fees.line_ids
+        # Stop after the reset and amount update, proving the savepoint covers
+        # both the accounting and synthetic source row.
+        with patch.object(type(payout), 'shopify_reconcile_other_bank_statement_line_ept',
+                          side_effect=UserError('Fee booking failed')):
+            self.assertFalse(payout._reprocess_imported_bank_statement())
+        self.assertEqual(fees.amount, -3)
+        self.assertEqual(fees.payout_line_id.amount, -3)
+        self.assertEqual(fees.line_ids, items)
+        self.assertTrue(fees.is_reconciled)
+        self.assertIn('Fee booking failed', payout.reimport_reconciliation_issue)
+
+    def test_grouped_refund_fee_credit_is_booked_once(self):
+        entries = []
+        for ref in ('fee-refund-first', 'fee-refund-second'):
+            order, _invoice = self._order(ref, 10)
+            self._payment(order, 10, ref + '-refund', kind='refund')
+            entries.append({'order_transaction_id': ref + '-refund', 'amount': '10',
+                            'fees': '-.30', 'net': '-9.70'})
+        payout = self._cash_payout('fee-refunds', entries, amount=-20, fee=-.60, reason='shop_cash_refund')
+        fees = payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'fees')
+        fees.write({'amount': 0, 'net_amount': 0})
+        payout.generate_bank_statement()
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(payout.state, 'validated')
+        self.assertAlmostEqual(fees.amount, .60)
+        self.assertAlmostEqual(sum(self._statement_lines(payout).mapped('amount')), -19.40)
+        statements = self._statement_lines(payout)
+        self.assertTrue(self._process(payout, payout._reprocess_imported_bank_statement))
+        self.assertEqual(self._statement_lines(payout), statements)
+
     def test_grouped_credit_then_grouped_partial_refunds_are_independent(self):
         payments = self.env['account.payment']
         refund_payments = self.env['account.payment']

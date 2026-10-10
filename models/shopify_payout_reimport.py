@@ -59,6 +59,48 @@ class ShopifyPayoutReimport(models.Model):
             raise UserError(_('Shop Cash transaction %s already has linked accounting or a nonstandard posting. Review its match manually.', statement.shopify_transaction_id))
         statement.action_undo_reconciliation()
 
+    def _sync_imported_payout_fees(self):
+        """Include all transaction fees, repairing only plain fee postings."""
+        self.ensure_one()
+        self._check_payout_reimport_period()
+        fees = self.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'fees')
+        expected = -sum((self.payout_transaction_ids - fees).mapped('fee'))
+        if len(fees) > 1:
+            raise UserError(_('The payout has multiple aggregate fee rows. Review them manually.'))
+        if not fees:
+            fees = self.env['shopify.payout.report.line.ept'].create({
+                'payout_id': self.id, 'transaction_type': 'fees',
+                'amount': expected, 'net_amount': expected,
+                'currency_id': self.currency_id.id, 'is_remaining_statement': True})
+            self._create_bank_statement_lines_for_payout_report()
+            return True
+        statements = self.payout_statement_line_ids.filtered(lambda row: row.payout_line_id == fees)
+        if len(statements) > 1:
+            raise UserError(_('The payout fee row has multiple statement lines. Review them manually.'))
+        changed = bool(self.currency_id.compare_amounts(fees.amount, expected))
+        for statement in statements:
+            if not self.currency_id.compare_amounts(statement.amount, expected):
+                continue
+            changed = True
+            account = self.instance_id.transaction_line_ids.filtered(
+                lambda row: row.transaction_type == 'fees').account_id
+            liquidity, suspense, counterpart = statement._seek_for_lines()
+            if (len(account) != 1 or statement.payment_ids or len(statement.line_ids) != 2
+                    or len(liquidity) != 1 or len(suspense | counterpart) != 1
+                    or (counterpart and counterpart.account_id != account)
+                    or statement.line_ids.matched_debit_ids or statement.line_ids.matched_credit_ids
+                    or statement.line_ids.tax_ids or statement.line_ids.tax_line_id):
+                raise UserError(_('The payout fee statement has linked accounting or a nonstandard posting. Review the fee correction manually.'))
+            statement.action_undo_reconciliation()
+            statement.write({'amount': expected})
+            if not self.currency_id.is_zero(expected) and not statement.is_reconciled:
+                self.shopify_reconcile_other_bank_statement_line_ept(statement, False)
+        fees._set_reimported_fee_total(expected)
+        if not statements and not self.currency_id.is_zero(expected):
+            self._create_bank_statement_lines_for_payout_report()
+            changed = True
+        return changed
+
     def _reprocess_imported_bank_statement(self):
         """Preserve proven matches; atomically reset/rematch legacy Shop Cash rows."""
         self.ensure_one()
@@ -68,6 +110,16 @@ class ShopifyPayoutReimport(models.Model):
         except UserError as error:
             self.reimport_reconciliation_issue = str(error)
             return False
+        issues, repaired = [], []
+        fees_repaired = False
+        try:
+            with self.env.cr.savepoint():
+                fees_repaired = self._sync_imported_payout_fees()
+        except OperationalError:
+            raise
+        except Exception as error:
+            _logger.warning('Payout %s fee correction needs review: %s', self.payout_reference_id, error)
+            issues.append(str(error))
         self._generate_imported_bank_statements()
         if self.state in ('draft', 'partially_generated'):
             if not self.reimport_reconciliation_issue:
@@ -76,7 +128,6 @@ class ShopifyPayoutReimport(models.Model):
         statements = self.payout_statement_line_ids
         if not statements:
             return False
-        issues, repaired = [], []
         for statement in statements.filtered(lambda row: row.payout_line_id.shop_cash_kind and row.is_reconciled):
             repaired_transaction = False
             try:
@@ -102,7 +153,7 @@ class ShopifyPayoutReimport(models.Model):
             except Exception as error:
                 _logger.exception('Shop Cash transaction %s needs review after reimport', statement.shopify_transaction_id)
                 issues.append(str(error))
-        if repaired or issues or statements.filtered(lambda row: not row.is_reconciled):
+        if fees_repaired or repaired or issues or statements.filtered(lambda row: not row.is_reconciled):
             self.state = 'partially_processed'
         if self.state in ('generated', 'partially_processed', 'processed'):
             try:
@@ -124,4 +175,6 @@ class ShopifyPayoutReimport(models.Model):
         self.reimport_reconciliation_issue = '\n'.join(dict.fromkeys(issues)) or False
         if repaired:
             self.message_post(body=_('Payout reimport reset the generic Shop Cash posting and matched the existing payments for transaction(s): %s.', ', '.join(repaired)))
+        if fees_repaired:
+            self.message_post(body=_('Payout reimport corrected the fee deduction to include all Shopify transaction fees, including adjustment fees.'))
         return not issues

@@ -61,6 +61,31 @@ class TestSpecificPayoutImport(PayoutTestCase):
         self.assertEqual(payouts.mapped('state'), ['generated', 'generated'])
         self.assertEqual(str(self.instance.payout_last_import_date), '2026-01-01')
 
+    def test_new_import_includes_processing_and_shop_cash_adjustment_fees(self):
+        currency = self.env.company.currency_id.name
+        transactions = [
+            {'id': 'charges', 'type': 'charge', 'source_order_id': 'missing',
+             'amount': '25208.71', 'fee': '667.38', 'net': '24541.33'},
+            {'id': 'refunds', 'type': 'refund', 'source_order_id': 'missing',
+             'amount': '-558.77', 'fee': '0', 'net': '-558.77'},
+            {'id': 'cash', 'type': 'credit', 'adjustment_reason': 'shop_cash',
+             'amount': '80.00', 'fee': '1.80', 'net': '78.20',
+             'adjustment_order_transactions': [{'order_transaction_id': 'cash-payment', 'amount': '80.00',
+                                                'fees': '1.80', 'net': '78.20'}]},
+            {'id': 'tax', 'type': 'debit', 'adjustment_reason': 'tax_adjustment',
+             'amount': '-23.75', 'fee': '0', 'net': '-23.75'}]
+        for data in transactions:
+            data['currency'] = currency
+        with patch.object(type(self.instance), 'connect_in_shopify'), \
+                patch.object(shopify.Payouts, 'find', return_value=self._report('140819824866', amount='24037.01')), \
+                patch.object(shopify.Transactions, 'find', return_value=[
+                    SimpleNamespace(to_dict=lambda data=data: data) for data in transactions]):
+            payout = self.env['shopify.payout.report.ept'].get_payout_report_by_ids('140819824866', self.instance)
+        fees = payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'fees')
+        self.assertAlmostEqual(fees.amount, -669.18)
+        self.assertAlmostEqual(sum(self._statement_lines(payout).mapped('amount')), 24037.01)
+        self.assertEqual(payout.payout_transaction_ids.filtered('shop_cash_kind').amount, 80)
+
     def test_invalid_or_unpaid_response_creates_no_partial_reports(self):
         for response in (self._report('999'), self._report('456', status='in_transit'), RuntimeError('Not found')):
             with self.subTest(response=response), patch.object(type(self.instance), 'connect_in_shopify'), \

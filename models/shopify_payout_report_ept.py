@@ -181,8 +181,9 @@ class ShopifyPaymentReportEpt(models.Model):
         return True
 
     def refresh_payout_transaction_links(self):
-        """Backfill Shopify source IDs on a previously imported payout."""
+        """Refresh source links and fee metadata on a previously imported payout."""
         self.ensure_one()
+        self._lock_settlement_payouts()
         transactions = shopify.Transactions().find(
             payout_id=self.payout_reference_id, limit=250
         )
@@ -212,6 +213,12 @@ class ShopifyPaymentReportEpt(models.Model):
                 "shop_cash_detail_error": values.get("shop_cash_detail_error"),
             }
             payout_line.write(link_values)
+            # Fee/net metadata may have been imported before Shop Cash fees
+            # were included. Gross statements and payment matches stay intact.
+            if (not self.currency_id.compare_amounts(payout_line.amount, float(values['amount']))
+                    and payout_line.currency_id == self.env['res.currency'].browse(values.get('currency_id'))
+                    and payout_line.transaction_type == values['transaction_type']):
+                payout_line._refresh_imported_fee_values(values['fee'], values['net_amount'])
             statement_line_obj.search([
                 ("payout_line_id", "=", payout_line.id)
             ]).write({
