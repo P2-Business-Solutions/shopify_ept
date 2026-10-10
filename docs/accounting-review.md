@@ -99,10 +99,10 @@ Enterprise widget behavior is tested separately.
 ## Canceled-order import verification — October 10, 2026
 
 Version 18.0.3.24 was installed and upgraded in an isolated Odoo 18 Community /
-PostgreSQL 16 database with Payment Payout Reconciliation 18.0.1.18.0 and the
+PostgreSQL 16 database with Manufacturing, Payment Payout Reconciliation 18.0.1.18.0 and the
 connector's dependencies. The final connector test run reported **zero failures and
-zero errors across 96 database tests: 93 passed and 3 Enterprise widget checks skipped**.
-The standalone suite passed **85 tests**; its 96 database tests were executed separately.
+zero errors across 97 database tests: 94 passed and 3 Enterprise widget checks skipped**.
+The standalone suite passed **85 tests**; its 97 database tests were executed separately.
 Python syntax, edited XML parsing and `git diff --check` passed.
 
 The canceled-order cases verify an original 242.10 receipt and next-day 242.10
@@ -114,6 +114,13 @@ lines, using the paid gateway workflow when no refunded workflow is configured,
 requesting canceled orders without a fulfillment filter, processing subsequent pages,
 skipping fulfillment requests, reviewed cash-only repair, preserving a posted original
 invoice with only the confirmed partial refund, and refusing allocations to another order.
+
+Silent-import checks use a storable product with manufacture and make-to-order routes
+and a BOM. Creating and processing the canceled order creates no MO or delivery,
+adds no followers and sends no emails or notifications. A second check subscribes a
+customer and an internal email follower to an existing order: both a successful cash
+import and a failed retry retain internal audit/review notes without sending notifications
+or creating canceled-order review activities.
 
 The PayPal integration test uses the actual payout app's reference-backfill wizard and
 activity importer/matcher/poster. It verifies separate capture/refund references,

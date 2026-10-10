@@ -186,6 +186,8 @@ class ShopifyOrderDataQueueEpt(models.Model):
         order_queues = []
         instance.connect_in_shopify()
         if order_type == 'cancelled':
+            order_data_queue_line_obj = order_data_queue_line_obj.with_context(
+                tracking_disable=True, mail_create_nosubscribe=True, queue_created_by=False)
             orders = self.shopify_order_request(instance, from_date, to_date, order_type)
             if orders:
                 page_size = len(orders)
@@ -436,7 +438,7 @@ class ShopifyOrderDataQueueEpt(models.Model):
             datetime.now() + timedelta(days=int(queue_id.shopify_instance_id.shopify_date_deadline)), "%Y-%m-%d")
         if queue_id:
             shopify_order_id_list = queue_id.order_data_queue_line_ids.filtered(
-                lambda line: line.state == 'failed').mapped('shopify_order_id')
+                lambda line: line.state == 'failed' and not line._is_shopify_cancelled_import()).mapped('shopify_order_id')
             if len(shopify_order_id_list) > 0:
                 note = 'Your order has not been imported for Shopify Order Reference : %s' % str(
                     shopify_order_id_list)[1:-1]

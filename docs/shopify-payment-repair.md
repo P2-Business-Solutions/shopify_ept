@@ -93,6 +93,13 @@ its original amount, date, parent ID and order link. A matching refunded workflo
 is used when configured; otherwise a refunded cancellation can use the gateway's
 paid workflow for its payment journal configuration.
 
+Canceled-order imports also suppress follower subscriptions, tracked-change
+notifications, emails and canceled-order review activities. Accounting audits and
+failure reasons remain as internal log notes without sending notifications. The
+import never confirms the sale or launches stock rules, so it creates no delivery
+or manufacturing orders, including for products with manufacture and make-to-order
+routes. Existing completed deliveries remain a manual-review case.
+
 When there is no invoice or credit note and both Shopify and the complete cash
 history prove a full refund with no fulfillment, the payments clear each other's
 customer receivable entries. No revenue invoice or credit note is created. Each

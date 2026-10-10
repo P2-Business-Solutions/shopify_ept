@@ -244,10 +244,19 @@ class TestShopifyCashSync(PayoutTestCase):
             'auto_workflow_id': self.workflow.id,
         })
         self.product.default_code = 'CANCELLED-TEST'
+        if 'mrp.production' in self.env:
+            self.product.write({'type': 'consu', 'is_storable': True})
+            routes = self.env.ref('mrp.route_warehouse0_manufacture') | self.env.ref('stock.route_warehouse0_mto')
+            routes.active = True
+            self.product.route_ids = routes
+            self.env['mrp.bom'].create({'product_tmpl_id': self.product.product_tmpl_id.id, 'product_qty': 1})
         payload.update(currency=self.env.company.currency_id.name, source_name='web', tags='',
                        payment_gateway_names=['shopify_payments'], transaction=events, total_discounts=0,
                        line_items=[dict(id='original', sku='CANCELLED-TEST', quantity=1, current_quantity=0,
                                         price=242.10, requires_shipping=False, name='Original cancelled item')])
+        notification_count = self.env['mail.notification'].search_count([])
+        email_count = self.env['mail.mail'].search_count([])
+        manufacturing_count = self.env['mrp.production'].search_count([]) if 'mrp.production' in self.env else 0
         order = self.env['sale.order'].shopify_create_order(
             self.instance, self.partner, self.partner, self.partner, queue_line, payload, payload['line_items'], 123)
         self.assertTrue(order)
@@ -257,6 +266,43 @@ class TestShopifyCashSync(PayoutTestCase):
         self.assertEqual(order.state, 'draft')
         self.assertFalse(order.invoice_ids)
         self.assertFalse(order.picking_ids)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+        self.assertEqual(order.state, 'cancel')
+        self.assertFalse(order.picking_ids)
+        self.assertFalse(order.message_follower_ids)
+        self.assertEqual(self.env['mail.notification'].search_count([]), notification_count)
+        self.assertEqual(self.env['mail.mail'].search_count([]), email_count)
+        if 'mrp.production' in self.env:
+            self.assertEqual(self.env['mrp.production'].search_count([]), manufacturing_count)
+
+    def test_cancelled_import_audit_and_failures_do_not_notify_followers(self):
+        order, payload, events, queue_line = self._cancelled_fixture()
+        follower = self.env['res.users'].with_context(no_reset_password=True).create({
+            'name': 'Cancellation Notification Test', 'login': 'cancelled-import-follower',
+            'email': 'cancelled-import-follower@example.invalid', 'notification_type': 'email',
+            'groups_id': [Command.set(self.env.ref('base.group_system').ids)],
+        })
+        order.message_subscribe(partner_ids=(self.partner | follower.partner_id).ids,
+                                subtype_ids=self.env.ref('mail.mt_note').ids)
+        notification_count = self.env['mail.notification'].search_count([])
+        email_count = self.env['mail.mail'].search_count([])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+        self.assertTrue(order.message_ids.filtered(lambda message: 'Shopify cash transactions synchronized' in str(message.body)))
+        self.assertEqual(self.env['mail.notification'].search_count([]), notification_count)
+        self.assertEqual(self.env['mail.mail'].search_count([]), email_count)
+        events[1]['amount'] = '45.00'
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertFalse(order._process_shopify_cancelled_import(payload, queue_line))
+        queue = queue_line.shopify_order_data_queue_id
+        queue.shopify_instance_id.shopify_user_ids = follower
+        activity_count = self.env['mail.activity'].search_count([])
+        queue.create_schedule_activity(queue)
+        self.assertEqual(self.env['mail.activity'].search_count([]), activity_count)
+        self.assertTrue(order.message_ids.filtered(lambda message: 'needs financial review' in str(message.body)))
+        self.assertEqual(self.env['mail.notification'].search_count([]), notification_count)
+        self.assertEqual(self.env['mail.mail'].search_count([]), email_count)
 
     def test_cancelled_request_uses_status_filter_without_fulfillment_filter(self):
         from .. import shopify

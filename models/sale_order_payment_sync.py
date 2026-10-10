@@ -453,8 +453,9 @@ class SaleOrderPaymentSync(models.Model):
             'order_id': self.id, 'plan': plan, 'payment_ids': [Command.set(payments.ids)],
             'replaced_payment_ids': [Command.set(replaced.ids)], 'credit_note_ids': [Command.set(credits.ids)],
         })
-        self.message_post(body=_('Shopify cash transactions synchronized. Audit %s; %s payment(s), %s replacement(s).',
-                                 audit.id, len(payments), len(replaced)))
+        post = self._message_log if self.env.context.get('shopify_silent_cancelled_import') else self.message_post
+        post(body=_('Shopify cash transactions synchronized. Audit %s; %s payment(s), %s replacement(s).',
+                    audit.id, len(payments), len(replaced)))
         return payments
 
     def _sync_shopify_cash(self):
@@ -514,6 +515,10 @@ class SaleOrderPaymentSync(models.Model):
     def _process_shopify_cancelled_import(self, payload, queue_line):
         """Cancel without fulfillment; keep failed cash recording retryable."""
         self.ensure_one()
+        self.check_access('write')
+        self = self.with_context(tracking_disable=True, mail_create_nosubscribe=True,
+                                 shopify_silent_cancelled_import=True)
+        queue_line = queue_line.with_env(self.env)
         try:
             with self.env.cr.savepoint():
                 if not self.with_context(shopify_cancel_cash_only=True).cancel_shopify_order():
@@ -529,7 +534,7 @@ class SaleOrderPaymentSync(models.Model):
         except Exception as error:
             message = _('Cancelled Shopify order %(order)s needs financial review: %(reason)s',
                         order=self.name, reason=str(error))
-            self.message_post(body=message)
+            self._message_log(body=message)
             self.env['common.log.lines.ept'].create_common_log_line_ept(
                 shopify_instance_id=self.shopify_instance_id.id, module='shopify_ept', message=message,
                 model_name=self._name, res_id=self.id, order_ref=self.name,

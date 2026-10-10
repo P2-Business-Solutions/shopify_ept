@@ -38,6 +38,17 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
                                                          help="Log lines created against which line.")
     name = fields.Char(help="Order Name")
 
+    def _is_shopify_cancelled_import(self):
+        """Retained source identifies failures even before an order was created."""
+        self.ensure_one()
+        if self.sale_order_id.canceled_in_shopify:
+            return True
+        try:
+            source = json.loads(self.order_data or '{}')
+        except (TypeError, ValueError):
+            return False
+        return isinstance(source, dict) and is_cancelled_shopify_order(source)
+
     def create_order_queue_line(
             self, order_dict, instance, order_data, customer_name, customer_email,
             order_queue_id, created_by="import"):
@@ -139,7 +150,7 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
                 order_queue = self.shopify_create_order_queue(instance, queue_type, created_by)
                 order_queue_list.append(order_queue.id)
                 message = "Order Queue Created %s" % ', '.join(order_queue.mapped('name'))
-                if self.env.context.get('queue_created_by'):
+                if self.env.context.get('queue_created_by') and not cancelled:
                     self.generate_simple_notification(message)
                 self._cr.commit()
                 need_to_create_queue = False
@@ -285,8 +296,11 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
                 queue.is_action_require = True
                 note = "<p>Need to process this order queue manually.There are 5 attempts been made by " \
                        "automated action to process this queue,<br/>- Ignore, if this queue is already processed.</p>"
-                queue.message_post(body=note)
-                if queue.shopify_instance_id.is_shopify_create_schedule:
+                cancelled_only = bool(queue.order_data_queue_line_ids) and all(
+                    line._is_shopify_cancelled_import() for line in queue.order_data_queue_line_ids)
+                post = queue._message_log if cancelled_only else queue.message_post
+                post(body=note)
+                if queue.shopify_instance_id.is_shopify_create_schedule and not cancelled_only:
                     common_log_line_obj.create_crash_queue_schedule_activity(queue, "shopify.order.data.queue.ept",
                                                                              note)
                 continue
@@ -305,6 +319,9 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
             @author: Haresh Mori @Emipro Technologies Pvt.Ltd on date 07/10/2019.
             Task Id : 157350
         """
+        if self and all(line._is_shopify_cancelled_import() for line in self):
+            self = self.with_context(tracking_disable=True, mail_create_nosubscribe=True,
+                                     shopify_silent_cancelled_import=True)
         sale_order_obj = self.env["sale.order"]
 
         queue_id = self.shopify_order_data_queue_id if len(self.shopify_order_data_queue_id) == 1 else False

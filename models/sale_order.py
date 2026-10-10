@@ -1091,7 +1091,11 @@ class SaleOrder(models.Model):
                     _logger.info(f"No payment vals Found Order transaction for Shopify Order({order_number}) for "
                                  f"multipel payment. Payment might be pending or fully refunded.")
                 order_vals.update({'shopify_payment_ids': payment_vals, 'is_shopify_multi_payment': True})
-        order = self.create(order_vals)
+        order_model = self
+        if is_cancelled_shopify_order(order_response):
+            order_model = self.with_context(tracking_disable=True, mail_create_nosubscribe=True,
+                                           shopify_silent_cancelled_import=True)
+        order = order_model.create(order_vals)
 
         _logger.info("Creating order lines for Odoo order(%s) and Shopify order is (%s).", order.name, order_number)
         order.create_shopify_order_lines(lines, order_response, instance)
@@ -2788,7 +2792,8 @@ class SaleOrder(models.Model):
                                       f"the New Records such as product or product category.") % (
                                       self.env.ref('base.public_user').name, odoo_bot.name)
                         _logger.info(message)
-                        order.message_post(body=message)
+                        post = order._message_log if is_cancelled_shopify_order(order_data) else order.message_post
+                        post(body=message)
                         for env in self.env.transaction.envs:
                             if env.uid == self.env.user.id:
                                 env.uid = odoo_bot.id
@@ -3487,7 +3492,8 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         if "done" in self.picking_ids.mapped("state"):
             for picking_id in self.picking_ids:
                 picking_id.write({'updated_in_shopify': True})
-                picking_id.message_post(
+                post = picking_id._message_log if self.env.context.get('shopify_silent_cancelled_import') else picking_id.message_post
+                post(
                     body=_("Order %s has been canceled in the Shopify store.", self.shopify_order_number))
             return False
         self.with_context(disable_cancel_warning=True).action_cancel()
@@ -3495,7 +3501,8 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         self.write({'shopify_order_status': 'Canceled'})
         if "draft" in self.invoice_ids.mapped("state"):
             for invoice_id in self.invoice_ids.filtered(lambda move: move.state == 'draft'):
-                invoice_id.message_post(
+                post = invoice_id._message_log if self.env.context.get('shopify_silent_cancelled_import') else invoice_id.message_post
+                post(
                     body=_("Order %s has been canceled in the Shopify store.", self.shopify_order_number))
                 invoice_id.button_cancel()
 
