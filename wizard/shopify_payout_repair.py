@@ -86,6 +86,11 @@ class ShopifyPayoutRepair(models.Model):
             raise UserError(_('The repair contains transactions outside the selected payouts.'))
         for payout in transactions.payout_id:
             payout._check_payout_reimport_period()
+        references = self.env['shopify.refund.reference.ept']
+        for transaction in transactions:
+            references |= transaction._refund_credit_reference()
+        if references and len(references) == len(transactions):
+            return dict(kind='credit_link', credit_ids=references.credit_note_id.ids, transaction_ids=transactions.ids)
         if historical:
             return transactions.sorted('id')[:1]._historical_refund_plan(
                 self.cutover_date, self.timezone, self.sales_journal_id, self.post_historical,
@@ -124,7 +129,9 @@ class ShopifyPayoutRepair(models.Model):
             try:
                 orders = (transaction.payout_id._shop_cash_orders_for_preview(transaction)
                           if transaction.shop_cash_kind else transaction._repair_order())
-                if transaction.shop_cash_kind:
+                if transaction._refund_credit_reference():
+                    groups[('credit_link', transaction.id)] = [transaction, orders, self._plan(transaction, orders)]
+                elif transaction.shop_cash_kind:
                     for order in orders:
                         key = ('order', order.id)
                         if key not in groups:
@@ -200,6 +207,9 @@ class ShopifyPayoutRepair(models.Model):
         return self._reopen()
 
     def _summary(self, plan):
+        if plan['kind'] == 'credit_link':
+            return _('Reuse the reviewed refund credit %s and match its existing payout statement.',
+                     ', '.join(self.env['account.move'].browse(plan['credit_ids']).mapped('display_name')))
         if plan['kind'] in ('collection', 'opening_refund'):
             account = self.env['account.account'].browse(plan['account_id'])
             if plan['kind'] == 'opening_refund':
@@ -247,7 +257,9 @@ class ShopifyPayoutRepair(models.Model):
                         raise UserError(_('Settings changed for this case. Refresh it before applying.'))
                     if fingerprint(fresh) != fingerprint(line.plan):
                         raise UserError(_('Source data or accounting changed after preview. Refresh this case before applying.'))
-                    if fresh['kind'] == 'historical':
+                    if fresh['kind'] == 'credit_link':
+                        line.write({'credit_ids': [Command.set(fresh['credit_ids'])]})
+                    elif fresh['kind'] == 'historical':
                         credit, payments = line.transaction_ids.sorted('id')[:1]._apply_historical_refund_plan(
                             fresh, payouts=line.transaction_ids.payout_id)
                         line.write({'credit_ids': [Command.set(credit.ids)], 'payment_ids': [Command.set(payments.ids)]})
@@ -289,7 +301,7 @@ class ShopifyPayoutRepair(models.Model):
                     with self.env.cr.savepoint():
                         payout._check_payout_reimport_period()
                         reviewed = selected.filtered(lambda row: row.status == 'done' and (
-                            row.payment_ids or row.collection_move_ids)).transaction_ids.filtered(
+                            row.payment_ids or row.collection_move_ids or row.kind == 'credit_link')).transaction_ids.filtered(
                             lambda transaction: transaction.payout_id == payout)
                         scoped_payout = payout.with_context(shopify_bulk_repaired_line_ids=reviewed.ids, cron_process=True)
                         if payout.state in ('draft', 'partially_generated'):
@@ -340,6 +352,7 @@ class ShopifyPayoutRepairLine(models.Model):
     selected = fields.Boolean()
     kind = fields.Selection([('order', 'Order Cash Repair'), ('historical', 'Historical Refund'),
                              ('collection', 'Historical Collection'), ('opening_refund', 'Opening-Balance Refund'),
+                             ('credit_link', 'Existing Refund Credit'),
                              ('review', 'Needs Review')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
     detail = fields.Text(readonly=True)
@@ -350,6 +363,13 @@ class ShopifyPayoutRepairLine(models.Model):
     last_error = fields.Text(string='Latest Processing Issue', readonly=True)
     history_ids = fields.One2many('shopify.payout.repair.history.ept', 'case_id', readonly=True)
     review_html = fields.Html(compute='_compute_review_html', string='Accounting Preview')
+
+    def action_link_refund_credit_note(self):
+        self.ensure_one()
+        refunds = self.transaction_ids.filtered(lambda tx: tx.transaction_type in ('refund', 'payment_refund') and not tx.shop_cash_kind)
+        if len(refunds) != 1:
+            raise UserError(_('Open the individual payout refund to link its credit note.'))
+        return refunds.action_link_refund_credit_note()
     credit_ids = fields.Many2many('account.move', readonly=True)
     payment_ids = fields.Many2many('account.payment', readonly=True)
     collection_move_ids = fields.Many2many('account.move', 'shopify_collection_repair_move_rel',
@@ -413,7 +433,12 @@ class ShopifyPayoutRepairLine(models.Model):
         for line in self:
             plan = line.plan or {}
             sections = []
-            if plan.get('kind') == 'historical':
+            if plan.get('kind') == 'credit_link':
+                notes = self.env['account.move'].browse(plan['credit_ids'])
+                sections.append(Markup('<p>Reuse reviewed credit: %s. Match the exact payout refund; retain its posted accounts and taxes.</p>') %
+                                escape(', '.join(notes.mapped('display_name'))))
+                events = []
+            elif plan.get('kind') == 'historical':
                 values = plan['values']
                 journal = self.env['account.journal'].browse(values['journal_id'])
                 partner = self.env['res.partner'].browse(values['partner_id'])

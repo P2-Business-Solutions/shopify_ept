@@ -60,3 +60,6 @@ access_shopify_payout_repair_audit_user,Shopify payout repair audit,model_shopif
 access_shopify_payout_repair_read_user,Shopify payout repair workspace read,model_shopify_payout_repair_ept,account.group_account_user,1,0,0,0
 access_shopify_payout_repair_line_read_user,Shopify payout repair progress read,model_shopify_payout_repair_line_ept,account.group_account_user,1,0,0,0
 access_shopify_payout_repair_history_user,Shopify payout repair history read,model_shopify_payout_repair_history_ept,account.group_account_user,1,0,0,0
+access_shopify_refund_reference_user,Shopify refund credit reference read,model_shopify_refund_reference_ept,account.group_account_user,1,0,0,0
+access_shopify_refund_reference_connector,Shopify refund credit connector read,model_shopify_refund_reference_ept,shopify_ept.group_shopify_ept,1,0,0,0
+access_shopify_refund_credit_link_manager,Shopify refund credit link,model_shopify_refund_credit_link_ept,account.group_account_manager,1,1,1,1

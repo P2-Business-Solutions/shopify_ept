@@ -76,6 +76,41 @@ previously posted accounting and its existing audits are retained.
 
 ## Historical fulfilled orders
 
+### Existing reviewed credit notes (18.0.3.34)
+
+If Accounting has already posted the refund credit (including a standalone Loop
+return), use **Link Credit Note** on its saved repair case, or open the individual
+payout refund and click **Link Refund Credit Note**. Select the existing credit,
+record the accounting review, **Preview / Refresh**, then **Link and Reconcile**.
+Loop Returns 18.0.1.13.0 also provides **Link Shopify Refund Credit** directly on
+the return and its posted credit. The action suggests a source-linked credit when
+there is one candidate; amounts alone never select an accounting document.
+
+This workflow reads the exact successful Shopify Payments refund and its original
+charge, checks the source order, customer, currency, full refund-document cash
+total, current credit ledger and open periods. A missing Shopify customer mapping
+can be proven by a unique existing customer email from Shopify. It reuses the
+reviewed credit's accounts and taxes without reconstructing the historical sale,
+requiring an imported SO, or generating another credit/payment. Only a source
+refund that actually succeeded can close a credit; receiving returned goods alone
+does not prove a cash refund.
+
+One credit can cover several successful cash transactions in the same Shopify
+refund document, even across payouts. Existing exact outgoing payments are reused
+and their outstanding cash is matched; otherwise the statement settles the open
+credit receivable directly. Other allocations, competing processor references,
+changed source/ledger, ambiguous customer identity and closed periods remain for
+review. Order cash repair stops for orders with these direct payout refund links
+to prevent creating the same refund cash again; retry their matching from the payout.
+
+The exact source links, reviewer, credit and transaction IDs are permanent and
+appear in **Shopify Refund Matches** on the credit and **Bulk Repair Audit** on
+the payout. Existing repair cases retain their credit links and matching errors.
+Reprocessing or refreshing/applying the saved case reuses those links. Statement
+matching failures retain the link for retry and leave the credit open; the result
+explains what remains. A payout validates when all its statement lines reconcile.
+The final bank-deposit match follows the existing settlement workflow.
+
 A historical refund requires complete successful fulfillment **before** the
 selected cutover, original successful collections before cutover, and the exact
 successful refund transaction **on/after** cutover. Source order creation or delivery
@@ -228,6 +263,17 @@ supports Shopify Payments; PayPal uses Payment Payout Reconciliation's separate
 historical activity/credit linking actions.
 
 ## Validation
+
+Version **18.0.3.34** adds 12 existing-credit accounting tests and three Loop
+integration tests. They cover standalone credits without an SO, split refunds
+across payouts, exact allocated/unallocated payment reuse, source/customer proof,
+repeat runs, matching failures/retries, persistent audit links and conflicts with
+opening-balance cash. Shopify/Loop regressions and the unchanged Stripe/PayPal
+reconciliation app suite passed. The 101 standalone checks also passed. The local
+Odoo runtime lacks Enterprise's bank widget: these new tests reconcile real move
+lines through a replacement adapter, and the three existing Enterprise-only tests
+remain skipped. Verify the production widget path in staging after upgrading both
+Shopify and Loop. Live accounting was inspected without posting or reconciling.
 
 The 18 bulk refund repair tests cover one refund document split across
 two payouts, category-inherited Readers accounts distinct from the generic

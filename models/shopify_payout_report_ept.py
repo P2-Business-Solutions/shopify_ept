@@ -436,7 +436,7 @@ class ShopifyPaymentReportEpt(models.Model):
 							   "Action Items:\n"
 							   "- Import the missing order before processing the payout report.\n"
 							   "- You can import orders using the operation wizard.") % transaction.source_order_id
-                    if not transaction._historical_collection_entry():
+                    if not transaction._historical_collection_entry() and not transaction._refund_credit_reference():
                         log_lines.append({'message': message,
                                           'shopify_payout_report_line_id': transaction.id})
                     # We can not use shopify order reference here because it may create duplicate name,
@@ -611,6 +611,11 @@ class ShopifyPaymentReportEpt(models.Model):
         invoice_ids = self.env["account.move"]
         domain = []
         order_id = transaction.order_id
+
+        reference = transaction._refund_credit_reference()
+        if reference:
+            invoice_ids = reference.credit_note_id
+            return [('payment_type', '=', 'outbound'), ('amount', '=', abs(transaction.amount))], invoice_ids, log_lines
 
         if transaction.transaction_type == 'charge':
             invoice_ids = order_id.invoice_ids.filtered(lambda x:
@@ -914,6 +919,11 @@ class ShopifyPaymentReportEpt(models.Model):
                         else False)
                     if opening_cash:
                         self._reconcile_historical_collection_statement(statement_line, opening_cash)
+                        continue
+                    reference = (statement_line.payout_line_id._refund_credit_reference()
+                                 if statement_line.payout_line_id else False)
+                    if reference:
+                        self._reconcile_linked_refund_credit(statement_line, reference)
                         continue
                     if getattr(getattr(statement_line, 'payout_line_id', False), 'shop_cash_kind', False):
                         self._reconcile_shop_cash_statement(statement_line)

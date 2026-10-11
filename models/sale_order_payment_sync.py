@@ -277,6 +277,10 @@ class SaleOrderPaymentSync(models.Model):
 
     def _build_shopify_cash_plan(self, repair=False):
         self.ensure_one()
+        if self.env['shopify.refund.reference.ept'].search_count([
+                ('instance_id', '=', self.shopify_instance_id.id), ('source_order_id', '=', self.shopify_order_id)]):
+            raise UserError(_('This order has reviewed refunds linked directly to payout statements. '
+                              'Reconcile those from the payout; do not create another refund payment through order cash repair.'))
         if self.env['account.move'].search_count([
                 ('shopify_instance_id', '=', self.shopify_instance_id.id),
                 ('shopify_source_order_id', '=', self.shopify_order_id),

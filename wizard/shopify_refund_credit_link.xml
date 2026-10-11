@@ -1,0 +1,42 @@
+<odoo>
+    <record id="view_shopify_refund_credit_link" model="ir.ui.view">
+        <field name="name">shopify.refund.credit.link.form</field>
+        <field name="model">shopify.refund.credit.link.ept</field>
+        <field name="arch" type="xml">
+            <form create="false" delete="false">
+                <field name="state" invisible="1"/>
+                <field name="company_id" invisible="1"/><field name="currency_id" invisible="1"/>
+                <div class="alert alert-info">Link an existing posted credit to the exact successful Shopify refund and reconcile its payout. This works for Loop and historical orders without an Odoo sales order. Review the credit first; its accounts and taxes are retained.</div>
+                <group>
+                    <field name="transaction_id" readonly="state == 'done'" options="{'no_create': True}"/>
+                    <field name="amount"/>
+                    <field name="credit_note_id" required="1" readonly="state == 'done'" options="{'no_create': True}"/>
+                    <field name="review_note" required="1" readonly="state == 'done'"/>
+                </group>
+                <field name="preview_text" nolabel="1"/><field name="result" nolabel="1" invisible="not result"/>
+                <footer>
+                    <button name="action_preview" type="object" string="Preview / Refresh" class="btn-primary" invisible="state == 'done'"/>
+                    <button name="action_apply" type="object" string="Link and Reconcile" invisible="state == 'done' or not preview_text"/>
+                    <button string="Close" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+    <record id="view_move_shopify_refund_references" model="ir.ui.view">
+        <field name="name">account.move.shopify.refund.references</field>
+        <field name="model">account.move</field><field name="inherit_id" ref="account.view_move_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//notebook" position="inside">
+                <page string="Shopify Refund Matches" invisible="not shopify_refund_reference_ids">
+                    <field name="shopify_refund_reference_ids" readonly="1">
+                        <list create="false" edit="false" delete="false">
+                            <field name="instance_id"/><field name="source_order_id"/><field name="refund_id"/>
+                            <field name="transaction_id"/><field name="amount"/><field name="currency_id"/>
+                            <field name="create_date"/><field name="create_uid"/><field name="review_note"/>
+                        </list>
+                    </field>
+                </page>
+            </xpath>
+        </field>
+    </record>
+</odoo>

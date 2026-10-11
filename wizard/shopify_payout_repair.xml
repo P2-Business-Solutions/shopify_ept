@@ -57,6 +57,7 @@
                         <field name="transaction_ids" widget="many2many_tags" optional="hide"/>
                         <field name="detail"/>
                         <button name="action_open_details" string="Details" type="object"/>
+                        <button name="action_link_refund_credit_note" string="Link Credit Note" type="object"/>
                         <button name="action_open_order" string="Open Order" type="object" invisible="not current_order_id"/>
                         <button name="action_open_shopify_order" string="Shopify" type="object"/>
                         <button name="action_refresh_case" string="Refresh Case" type="object"/>
@@ -88,6 +89,7 @@
                     </list>
                 </field>
                 <footer><button name="action_open_order" type="object" string="Open Order" invisible="not current_order_id"/>
+                    <button name="action_link_refund_credit_note" type="object" string="Link Refund Credit Note" groups="account.group_account_manager"/>
                     <button name="action_open_shopify_order" type="object" string="Open Shopify Order"/>
                     <button name="action_refresh_case" type="object" string="Refresh Case" groups="account.group_account_manager"/>
                     <button name="action_back_to_bulk_repair" type="object" string="Back to Bulk Repair" class="btn-primary"/>

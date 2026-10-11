@@ -43,7 +43,7 @@ class TestShopifyPayoutProcessing(unittest.TestCase):
         self.env.cr.savepoint.return_value = self.savepoint
         self.payout.env = self.env
         self.statement = SimpleNamespace(id=2, is_reconciled=False, amount=97,
-                                         shopify_transaction_type='adjustment')
+                                         shopify_transaction_type='adjustment', payout_line_id=False)
         self.env.__getitem__.return_value.search.return_value = Records([self.statement])
         self.payout.currency_id = SimpleNamespace(compare_amounts=lambda a, b: a - b)
 
@@ -57,7 +57,8 @@ class TestShopifyPayoutProcessing(unittest.TestCase):
 
     def test_refund_created_during_processing_is_matched_without_second_click(self):
         self.statement.shopify_transaction_type = 'refund'
-        self.statement.payout_line_id = SimpleNamespace(_historical_collection_entry=Mock(return_value=False))
+        self.statement.payout_line_id = SimpleNamespace(_historical_collection_entry=Mock(return_value=False),
+                                                        _refund_credit_reference=Mock(return_value=False))
         self.statement.amount = -45
         payment, move_line = SimpleNamespace(move_id=True), object()
         self.payout.find_payment_for_payout_transaction = Mock(side_effect=[False, payment])
