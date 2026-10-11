@@ -57,7 +57,7 @@ class TestShopifyPayoutProcessing(unittest.TestCase):
 
     def test_refund_created_during_processing_is_matched_without_second_click(self):
         self.statement.shopify_transaction_type = 'refund'
-        self.statement.payout_line_id = object()
+        self.statement.payout_line_id = SimpleNamespace(_historical_collection_entry=Mock(return_value=False))
         self.statement.amount = -45
         payment, move_line = SimpleNamespace(move_id=True), object()
         self.payout.find_payment_for_payout_transaction = Mock(side_effect=[False, payment])

@@ -890,6 +890,7 @@ class ShopifyPaymentReportEpt(models.Model):
         self.ensure_one()
         self._lock_settlement_payouts()
         log_lines = []
+        matching_errors = []
         _logger.info("Processing Bank Statement line of payout : %s.", self.name)
         statement_lines = statement_line_obj.search([('payout_id', '=', self.id)])
         remaining = statement_lines.filtered(lambda x: not x.is_reconciled)
@@ -907,11 +908,12 @@ class ShopifyPaymentReportEpt(models.Model):
             paid_move_lines = []
             try:
                 with self.env.cr.savepoint():
-                    historical_collection = (statement_line.payout_line_id._historical_collection_entry()
-                        if statement_line.shopify_transaction_type == 'charge' and statement_line.payout_line_id
+                    opening_cash = (statement_line.payout_line_id._historical_collection_entry()
+                        if statement_line.shopify_transaction_type in ('charge', 'refund', 'payment_refund')
+                        and statement_line.payout_line_id
                         else False)
-                    if historical_collection:
-                        self._reconcile_historical_collection_statement(statement_line, historical_collection)
+                    if opening_cash:
+                        self._reconcile_historical_collection_statement(statement_line, opening_cash)
                         continue
                     if getattr(getattr(statement_line, 'payout_line_id', False), 'shop_cash_kind', False):
                         self._reconcile_shop_cash_statement(statement_line)
@@ -959,6 +961,8 @@ class ShopifyPaymentReportEpt(models.Model):
             except OperationalError:
                 raise
             except Exception as error:
+                if reviewed_ids is not None:
+                    matching_errors.append('%s: %s' % (statement_line.payment_ref, error))
                 if self._context.get("cron_process"):
                     message = ("System tried to automatically reconcile but encountered an error while processing the statement line: %s \n"
 								"Action Items:\n"
@@ -984,9 +988,28 @@ class ShopifyPaymentReportEpt(models.Model):
 
         if statement_lines.filtered(lambda x: not x.is_reconciled):
             self.write({'state': 'partially_processed'})
+        elif reviewed_ids is not None:
+            try:
+                # Preserve exact transaction matches when only the final payout
+                # totals/settlement configuration need review.
+                with self.env.cr.savepoint():
+                    self.write({'state': 'processed'})
+                    self.validate_statement()
+            except OperationalError:
+                raise
+            except UserError as error:
+                self.write({'state': 'partially_processed'})
+                matching_errors.append(str(error))
         else:
             self.write({'state': 'processed'})
             self.validate_statement()
+
+        if reviewed_ids is not None:
+            reviewed = statement_lines.filtered(lambda line: line.payout_line_id.id in reviewed_ids)
+            pending = reviewed.filtered(lambda line: not line.is_reconciled)
+            if pending:
+                matching_errors.append(_('%s reviewed payout transaction(s) still need reconciliation.', len(pending)))
+            self.reimport_reconciliation_issue = '\n'.join(matching_errors) or False
 
         return True
 

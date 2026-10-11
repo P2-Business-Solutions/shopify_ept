@@ -16,22 +16,25 @@
                     <group><field name="cutover_date"/><field name="timezone"/><field name="sales_journal_id"/></group>
                     <group><field name="post_historical"/><field name="open_only"/><field name="rematch_payouts"/></group>
                 </group>
-                <group string="Historical Collections">
+                <group string="Cash Included in Opening Balances">
                     <field name="clear_historical_collections"/>
                     <field name="historical_collection_account_id"/>
                 </group>
                 <div class="alert alert-info" role="alert">
-                    Historical refunds record returns and cash already refunded in Shopify, using the configured income/adjustment and exact tax accounts.
-                    Historical collections can clear cash included in the selected opening-balance account and match its payout receipt.
-                    Enable that option only when the original collections are included in that balance and their clearing entries are missing.
+                    Refunds on or after cutover record proven returns and refund payments using the configured accounts.
+                    Collections and refunds before cutover can clear unsettled cash included in the selected opening-balance account.
+                    Enable that option only when their original sales, returns and taxes are already included in migration balances.
+                    Apply creates or reuses the reviewed accounting and reconciles the payout in the same run by default.
                     Review the accounts and adjustments in Details before applying.
                     Inventory returns are handled separately. This action never sends money or customer notifications.
                 </div>
                 <field name="result" nolabel="1"/>
                 <field name="line_ids" nolabel="1" readonly="0">
-                    <list editable="bottom" create="false" delete="false" decoration-danger="status == 'review'" decoration-success="status == 'done'">
+                    <list editable="bottom" create="false" delete="false" decoration-danger="status == 'review'"
+                          decoration-success="status == 'done' and reconciliation_status == 'matched'"
+                          decoration-warning="status == 'done' and reconciliation_status == 'pending'">
                         <field name="selected" readonly="status != 'ready'"/>
-                        <field name="status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
+                        <field name="status"/><field name="reconciliation_status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
                         <field name="transaction_ids" widget="many2many_tags" optional="hide"/>
                         <field name="detail"/>
                         <button name="action_open_details" string="Details" type="object"/>
@@ -52,7 +55,7 @@
         <field name="model">shopify.payout.repair.line.ept</field>
         <field name="arch" type="xml">
             <form create="false" edit="false">
-                <group><field name="status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
+                <group><field name="status"/><field name="reconciliation_status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
                     <field name="transaction_ids" widget="many2many_tags"/>
                     <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
                     <field name="collection_move_ids" widget="many2many_tags"/></group>

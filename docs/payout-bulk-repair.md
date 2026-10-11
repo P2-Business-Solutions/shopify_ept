@@ -10,12 +10,13 @@ issue a new Shopify refund.
    journal for historical refund credits. Posting proven historical credits and
    their outgoing payments is enabled by default. It can be disabled to prepare
    draft credits for review instead.
-   Version **18.0.3.31** also supports historical collections for orders absent
-   from Odoo. Select **Opening-Balance Collection Account** (110010 WEB CC for
-   this migration) and enable **Clear Collections Included in Opening Balances**
-   only for receipts carried in that account with no existing settlement clearing
-   entry/customer payment. This option authorizes posting their clearing entries;
-   the historical refund draft/post option controls refund credits separately.
+   Version **18.0.3.32** supports both pre-cutover collections and refunds settling
+   in later payouts. Select **Opening-Balance Cash Account** (110010 WEB CC for
+   this migration) and enable **Clear Cash Included in Opening Balances** when
+   their original sales, returns and taxes are already included in migration
+   balances and the unsettled net cash is carried in that account. This option
+   authorizes missing balance-sheet clearing entries. The historical refund
+   draft/post option controls new post-cutover credits separately.
 2. Click **Preview / Refresh**. This reads complete order/transaction history and
    existing accounting, without posting. Ready cases are selected; each exception
    remains in the same list with its source order and explanation. **Details**
@@ -32,9 +33,15 @@ issue a new Shopify refund.
    rechecks the source and ledger under locks. A changed or failed case remains
    for review without preventing other ready cases from completing. Failure rolls
    back that case's credits, payments, reversals and audit together.
-5. Existing payout statements are reconciled after repair by default. Correct
+5. **Reconcile Payout Statements in This Run** is enabled by default, so Apply
+   creates/reuses the accounting and matches the payout together. Correct
    existing matches are retained. A payout validates only when all its statement
    lines reconcile; remaining exceptions continue to keep it partially processed.
+   Each case shows **Matched** or **Awaiting Match**, separately from whether its
+   accounting was applied. Matching failures retain posted accounting, do not
+   undo successful matches on other cases, and appear in the result and payout
+   warning. Refresh/Apply retries reuse the same entries. Disabling reconciliation
+   explicitly reports that only accounting was applied and matching remains pending.
    Creating a settlement transfer and matching the actual bank deposit remain the
    existing separate workflow.
 
@@ -78,8 +85,42 @@ Historical credit lines contain account, description and quantity rather than st
 product links. Inventory returns and any required inventory/COGS adjustments must
 be accounted for separately; this action does not infer a physical stock return.
 Any return/credit already included in opening balances must not be posted again.
-Identify/link the existing credit instead of creating a second one. Refunds before
-cutover remain opening-balance review cases.
+Refunds before cutover use the opening-balance cash treatment below. Existing Odoo
+credits/payments must be reviewed/linked rather than recording the same cash twice.
+
+## Pre-cutover refunds settling after cutover
+
+Version **18.0.3.32** classifies individual Shopify Payments refunds automatically
+in the same bulk preview. A successful refund before the selected cutover, on an
+order collected and completely fulfilled before cutover, is **Opening-Balance
+Refund** when its payout is on/after cutover. The shared opening-balance checkbox
+confirms that its original return and tax have already been accounted for in
+migration. Product/tax mappings for a new return are not needed because this path
+creates no new return document.
+
+For a 283.30 refund included in WEB CC's net opening balance, the clearing entry
+on the payout date **debits 110010 WEB CC 283.30 and credits the Shopify journal's
+Manual outstanding payments account 283.30**. Matching its negative statement
+line debits that same outstanding account and credits WEB CC. The temporary
+outstanding amount clears; no new revenue/returns, tax, customer receivable,
+credit note or customer refund payment is recorded. The actual payout/fee postings
+continue their normal treatment. Pre-cutover source periods may remain closed;
+the payout posting period must be open.
+
+This requires the exact successful refund transaction, its original capture and
+gateway, one source refund document, matching amount/currency and proven historical
+fulfillment. Multiple pre-cutover cash refunds in one source document are cleared
+individually against their exact payout rows. A document mixing pre/post-cutover
+refunds, duplicate payout references, existing Odoo credit/refund payments,
+changed/reversed entries or allocations outside the exact payout remain for review.
+The existing source transaction uniqueness constraint and immutable audit are
+shared with historical receipt clearing, so retries never create a second entry.
+
+For production payout **PTR00062 / 140602114274** (August 2, 2026), the four
+pre-cutover refund deductions total 1089.06: 283.30, 279.80, 277.24 and 248.72.
+Shopify shows order **#132642** refunded on July 31 and deducted from this payout.
+This fixes the previous blanket “This refund predates cutover” review message.
+Production was inspected without posting or matching those transactions.
 
 ## Historical collections settling after cutover
 
@@ -92,7 +133,7 @@ do not prove that the sale/fulfillment belongs to the old system.
 
 After explicit opening-balance confirmation, the repair posts one balance-sheet
 entry per original receipt on the payout date: **debit Shopify outstanding
-receipts; credit the selected opening-balance collection account**. It uses the
+receipts; credit the selected opening-balance cash account**. It uses the
 configured Shopify clearing journal and its dedicated Manual outstanding receipt
 account. The outstanding debit matches the exact gross payout statement line.
 No customer payment, receivable, invoice, sales order, delivery or manufacturing
@@ -170,7 +211,14 @@ changed/reversed entries, other-statement allocations and leaving unreviewed
 transactions open. They verify real Odoo journal entries and reconciled move
 lines. When Enterprise's bank widget is unavailable, only that adapter is replaced
 with account.move.line reconciliation; the production widget runs when present.
-Enterprise widget behavior still needs validation in staging.
-The Odoo 18 upgrade and full suite completed with **171 passing tests and three
+The 13 opening-refund tests cover payout-date clearing, no duplicate return/cash,
+all four deductions applied together while retaining an existing receipt match,
+reuse after post-only processing, partial match failures visible in the result,
+regular reprocessing without order import, confirmation/account setup, source
+identity, duplicate credits/payments, time-zone boundaries, mixed-period documents
+closed source versus payout periods, and retaining exact matches when only final
+payout validation fails. Enterprise widget behavior still needs
+validation in staging.
+The Odoo 18 upgrade and full suite completed with **184 passing tests and three
 existing Enterprise-widget skips**. All **101 standalone checks** passed.
 Production payouts were inspected without changing their accounting.

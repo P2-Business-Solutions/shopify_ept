@@ -23,16 +23,19 @@ class ShopifyPayoutRepair(models.TransientModel):
                                           ('company_id', '=', self.env.company.id), ('type', '=', 'sale')], limit=1))
     post_historical = fields.Boolean(string='Post Proven Historical Credits and Refund Payments', default=True)
     clear_historical_collections = fields.Boolean(
-        string='Clear Collections Included in Opening Balances',
-        help='Confirm that the selected historical collections are included in the opening balance of the account below, '
-             'and that no clearing entries or customer payments have already recorded their settlement.')
+        string='Clear Cash Included in Opening Balances',
+        help='Confirm that the selected pre-cutover collections and refunds, including their original sales/returns '
+             'and taxes, are already included in migration balances. Their unsettled net cash is held in the account '
+             'below. Only missing balance-sheet clearing entries are created; no sales or returns are repeated.')
     historical_collection_account_id = fields.Many2one(
-        'account.account', string='Opening-Balance Collection Account', check_company=True,
+        'account.account', string='Opening-Balance Cash Account', check_company=True,
         domain="[('account_type', 'in', ('asset_current', 'asset_cash')), ('deprecated', '=', False)]",
         default=lambda self: self.env['account.account'].search([
             ('company_ids', 'in', self.env.company.ids), ('code', '=', '110010'), ('deprecated', '=', False)], limit=1))
     open_only = fields.Boolean(string='Unmatched Transactions Only', default=True)
-    rematch_payouts = fields.Boolean(string='Reconcile Existing Payout Statements After Repair', default=True)
+    rematch_payouts = fields.Boolean(string='Reconcile Payout Statements in This Run', default=True,
+        help='Create/reuse reviewed accounting and match it to the payout in the same run. '
+             'Disable only to post accounting without matching; those cases remain awaiting reconciliation.')
     line_ids = fields.One2many('shopify.payout.repair.line.ept', 'wizard_id', readonly=True)
     preview_settings = fields.Char(readonly=True)
     result = fields.Text(readonly=True)
@@ -60,7 +63,9 @@ class ShopifyPayoutRepair(models.TransientModel):
             payout._check_payout_reimport_period()
         if historical:
             return transactions.sorted('id')[:1]._historical_refund_plan(
-                self.cutover_date, self.timezone, self.sales_journal_id, self.post_historical)
+                self.cutover_date, self.timezone, self.sales_journal_id, self.post_historical,
+                opening_account=self.historical_collection_account_id,
+                opening_confirmed=self.clear_historical_collections)
         if collection:
             if len(transactions) != 1:
                 raise UserError(_('Review each historical collection against its exact payout transaction.'))
@@ -101,6 +106,9 @@ class ShopifyPayoutRepair(models.TransientModel):
                 elif transaction.transaction_type in ('refund', 'payment_refund'):
                     # Multiple captures/refunds in one document produce one credit.
                     plan = self._plan(transaction, orders, historical=True)
+                    if plan['kind'] == 'opening_refund':
+                        groups[('opening_refund', transaction.id)] = [transaction, orders, plan]
+                        continue
                     key = ('historical', transaction.payout_id.instance_id.id, plan['values']['shopify_refund_id'])
                     if key not in groups:
                         groups[key] = [self.env['shopify.payout.report.line.ept'], orders, plan]
@@ -143,8 +151,13 @@ class ShopifyPayoutRepair(models.TransientModel):
         return self._reopen()
 
     def _summary(self, plan):
-        if plan['kind'] == 'collection':
+        if plan['kind'] in ('collection', 'opening_refund'):
             account = self.env['account.account'].browse(plan['account_id'])
+            if plan['kind'] == 'opening_refund':
+                return _('%(order)s: clear the pre-cutover refund %(amount)s through %(account)s on %(date)s and match its payout deduction. '
+                         'The original return and tax remain in migration balances; no new credit note or customer refund payment.',
+                         order=plan['source_name'], amount=abs(plan['amount']), account=account.display_name,
+                         date=plan['values']['date'])
             return _('%(order)s: clear %(amount)s from %(account)s on %(date)s and match the payout receipt. '
                      'Original sales and fulfillment remain in the old system.',
                      order=plan['source_name'], amount=plan['amount'], account=account.display_name,
@@ -180,14 +193,14 @@ class ShopifyPayoutRepair(models.TransientModel):
             try:
                 with self.env.cr.savepoint():
                     fresh = self._plan(line.transaction_ids, line.order_id, line.kind == 'historical',
-                                       line.kind == 'collection')
+                                       line.kind in ('collection', 'opening_refund'))
                     if fingerprint(fresh) != fingerprint(line.plan):
                         raise UserError(_('Source data or accounting changed after preview. Refresh this case before applying.'))
                     if fresh['kind'] == 'historical':
                         credit, payments = line.transaction_ids.sorted('id')[:1]._apply_historical_refund_plan(
                             fresh, payouts=line.transaction_ids.payout_id)
                         line.write({'credit_ids': [Command.set(credit.ids)], 'payment_ids': [Command.set(payments.ids)]})
-                    elif fresh['kind'] == 'collection':
+                    elif fresh['kind'] in ('collection', 'opening_refund'):
                         move = line.transaction_ids._apply_historical_collection_plan(fresh)
                         line.write({'collection_move_ids': [Command.set(move.ids)]})
                     else:
@@ -204,6 +217,7 @@ class ShopifyPayoutRepair(models.TransientModel):
             except UserError as error:
                 line.write({'status': 'review', 'selected': False, 'detail': str(error)})
                 failed += 1
+        matching_issues = []
         if self.rematch_payouts:
             for payout in selected.filtered(lambda row: row.status == 'done').transaction_ids.payout_id:
                 try:
@@ -212,15 +226,27 @@ class ShopifyPayoutRepair(models.TransientModel):
                         reviewed = selected.filtered(lambda row: row.status == 'done' and (
                             row.payment_ids or row.collection_move_ids)).transaction_ids.filtered(
                             lambda transaction: transaction.payout_id == payout)
-                        scoped_payout = payout.with_context(shopify_bulk_repaired_line_ids=reviewed.ids)
+                        scoped_payout = payout.with_context(shopify_bulk_repaired_line_ids=reviewed.ids, cron_process=True)
                         if payout.state in ('draft', 'partially_generated'):
                             scoped_payout.generate_bank_statement()
                         scoped_payout.process_bank_statement()
+                        if payout.reimport_reconciliation_issue:
+                            matching_issues.append('%s: %s' % (payout.display_name, payout.reimport_reconciliation_issue))
                 except OperationalError:
                     raise
                 except UserError as error:
                     payout.reimport_reconciliation_issue = str(error)
-        self.result = _('%s case(s) applied; %s case(s) changed or failed and remain for review. Existing payout matches are preserved.', applied, failed)
+                    matching_issues.append('%s: %s' % (payout.display_name, error))
+        done = selected.filtered(lambda row: row.status == 'done')
+        matched = done.filtered(lambda row: row.reconciliation_status == 'matched')
+        pending = done - matched
+        result = [_('%s case(s) applied; %s case(s) changed or failed and remain for review.', applied, failed),
+                  _('%s applied case(s) fully matched to their payout; %s still awaiting reconciliation.', len(matched), len(pending))]
+        if pending and not self.rematch_payouts:
+            result.append(_('Payout matching was disabled for this run. Enable Reconcile Payout Statements in This Run and apply a refreshed preview to reuse the existing accounting and finish matching.'))
+        if matching_issues:
+            result.append(_('Accounting was retained. Payout reconciliation/validation needs review: %s', '\n'.join(matching_issues)))
+        self.result = '\n'.join(result)
         return self._reopen()
 
     def _reopen(self):
@@ -239,7 +265,8 @@ class ShopifyPayoutRepairLine(models.TransientModel):
     source_reference = fields.Char(string='Source Order', readonly=True)
     selected = fields.Boolean()
     kind = fields.Selection([('order', 'Order Cash Repair'), ('historical', 'Historical Refund'),
-                             ('collection', 'Historical Collection'), ('review', 'Needs Review')], readonly=True)
+                             ('collection', 'Historical Collection'), ('opening_refund', 'Opening-Balance Refund'),
+                             ('review', 'Needs Review')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
     detail = fields.Text(readonly=True)
     plan = fields.Json(readonly=True)
@@ -247,7 +274,26 @@ class ShopifyPayoutRepairLine(models.TransientModel):
     credit_ids = fields.Many2many('account.move', readonly=True)
     payment_ids = fields.Many2many('account.payment', readonly=True)
     collection_move_ids = fields.Many2many('account.move', 'shopify_collection_repair_move_rel',
-                                          'case_id', 'move_id', readonly=True, string='Collection Clearing Entries')
+                                          'case_id', 'move_id', readonly=True, string='Opening-Balance Clearing Entries')
+    reconciliation_status = fields.Selection([('matched', 'Matched'), ('pending', 'Awaiting Match')],
+        compute='_compute_reconciliation_status', string='Payout Match')
+
+    @api.depends('transaction_ids', 'transaction_ids.payout_id.payout_statement_line_ids.is_reconciled',
+                 'transaction_ids.payout_id.payout_statement_line_ids.move_id.checked',
+                 'transaction_ids.payout_id.payout_statement_line_ids.move_id.state')
+    def _compute_reconciliation_status(self):
+        for line in self:
+            transactions = line.transaction_ids.filtered(lambda transaction:
+                not transaction.payout_id.currency_id.is_zero(transaction.amount))
+            matched = bool(transactions)
+            for transaction in transactions:
+                statements = transaction.payout_id.payout_statement_line_ids.filtered(
+                    lambda statement: statement.payout_line_id == transaction)
+                if (len(statements) != 1 or not statements.is_reconciled
+                        or statements.move_id.state != 'posted' or not statements.move_id.checked):
+                    matched = False
+                    break
+            line.reconciliation_status = 'matched' if matched else 'pending'
 
     @api.depends('plan')
     def _compute_review_html(self):
@@ -272,11 +318,12 @@ class ShopifyPayoutRepairLine(models.TransientModel):
                                      escape(str(item['price_unit']))))
                 sections.append(Markup('</tbody></table>'))
                 events = plan['events']
-            elif plan.get('kind') == 'collection':
+            elif plan.get('kind') in ('collection', 'opening_refund'):
                 currency = self.env['res.currency'].browse(plan['values']['currency_id'])
                 journal = self.env['account.journal'].browse(plan['values']['journal_id'])
-                sections.append(Markup('<p>Original Shopify collection: %s on %s. Clearing entry: %s in %s.</p>') %
-                                (escape(plan['event']['id']), escape(plan['event']['timestamp']),
+                sections.append(Markup('<p>Original Shopify %s: %s on %s. Clearing entry: %s in %s.</p>') %
+                                (escape('refund' if plan['kind'] == 'opening_refund' else 'collection'),
+                                 escape(plan['event']['id']), escape(plan['event']['timestamp']),
                                  escape(plan['values']['date']), escape(journal.display_name)))
                 sections.append(Markup('<table class="table"><thead><tr><th>Account</th><th>Debit</th><th>Credit</th></tr></thead><tbody>'))
                 for command in plan['values']['line_ids']:
@@ -285,8 +332,9 @@ class ShopifyPayoutRepairLine(models.TransientModel):
                     sections.append(Markup('<tr><td>%s</td><td>%s %s</td><td>%s %s</td></tr>') %
                                     (escape(account.display_name), escape(str(item['debit'])), escape(currency.name),
                                      escape(str(item['credit'])), escape(currency.name)))
-                sections.append(Markup('</tbody></table><p>The outstanding debit matches the payout receipt. '
-                                       'No sales invoice, customer payment, delivery or manufacturing order is created.</p>'))
+                sections.append(Markup('</tbody></table><p>The outstanding entry matches this exact payout receipt/refund. '
+                                       'Sales, returns and taxes already included in migration balances are retained. '
+                                       'No invoice, credit note, customer payment, delivery or manufacturing order is created.</p>'))
                 events = []
             else:
                 cash = plan.get('cash', {})

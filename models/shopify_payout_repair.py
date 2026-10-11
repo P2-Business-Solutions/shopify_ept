@@ -97,13 +97,16 @@ class ShopifyPayoutRepairLine(models.Model):
             raise UserError(_('Shopify returned a different order.'))
         return payload, transactions
 
-    def _historical_refund_plan(self, cutover, timezone, sales_journal, post, source=None):
+    def _historical_refund_plan(self, cutover, timezone, sales_journal, post, source=None,
+                                opening_account=None, opening_confirmed=False):
         self.ensure_one()
         payout, instance = self.payout_id, self.payout_id.instance_id
         company, currency = instance.shopify_company_id, payout.currency_id
         payout._check_payout_reimport_period()
         if self.shop_cash_kind or self.transaction_type not in ('refund', 'payment_refund'):
             raise UserError(_('Historical refund preparation requires an individual refund transaction.'))
+        if not self.source_order_id or not self.source_order_transaction_id:
+            raise UserError(_('The payout refund is missing its Shopify order or exact transaction ID. Reimport the payout to refresh its source links, then preview again.'))
         order = self._repair_order()
         if order and order.invoice_ids.filtered(lambda move: move.state != 'cancel'):
             raise UserError(_('This order has accounting documents. Use its normal payment-repair workflow.'))
@@ -122,7 +125,8 @@ class ShopifyPayoutRepairLine(models.Model):
             if event['gateway'] != 'shopify_payments':
                 raise UserError(_('Use the processor-specific workflow for this historical refund gateway.'))
             if source_date(event['timestamp'], timezone) < cutover:
-                raise UserError(_('This refund predates cutover and needs opening-balance treatment.'))
+                return self._historical_collection_plan(cutover, timezone, opening_account,
+                                                        opening_confirmed, source=(payload, transactions))
             refunds = [refund for refund in payload.get('refunds', [])
                        if event['id'] in {str(row.get('id')) for row in refund.get('transactions', [])}]
             if len(refunds) != 1:
