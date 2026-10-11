@@ -10,6 +10,12 @@ issue a new Shopify refund.
    journal for historical refund credits. Posting proven historical credits and
    their outgoing payments is enabled by default. It can be disabled to prepare
    draft credits for review instead.
+   Version **18.0.3.31** also supports historical collections for orders absent
+   from Odoo. Select **Opening-Balance Collection Account** (110010 WEB CC for
+   this migration) and enable **Clear Collections Included in Opening Balances**
+   only for receipts carried in that account with no existing settlement clearing
+   entry/customer payment. This option authorizes posting their clearing entries;
+   the historical refund draft/post option controls refund credits separately.
 2. Click **Preview / Refresh**. This reads complete order/transaction history and
    existing accounting, without posting. Ready cases are selected; each exception
    remains in the same list with its source order and explanation. **Details**
@@ -73,8 +79,46 @@ product links. Inventory returns and any required inventory/COGS adjustments mus
 be accounted for separately; this action does not infer a physical stock return.
 Any return/credit already included in opening balances must not be posted again.
 Identify/link the existing credit instead of creating a second one. Refunds before
-cutover and collections awaiting historical settlement remain opening-balance review
-cases; this action does not book historical collections.
+cutover remain opening-balance review cases.
+
+## Historical collections settling after cutover
+
+In version **18.0.3.31**, a missing-order collection is checked against the exact
+successful Shopify Payments transaction and complete fulfillment before cutover.
+The collection must predate cutover in the selected business time zone and settle
+in a payout on/after cutover. Current-period collections instead explain how to
+import the specific order and refresh. Pre-cutover creation/payment dates alone
+do not prove that the sale/fulfillment belongs to the old system.
+
+After explicit opening-balance confirmation, the repair posts one balance-sheet
+entry per original receipt on the payout date: **debit Shopify outstanding
+receipts; credit the selected opening-balance collection account**. It uses the
+configured Shopify clearing journal and its dedicated Manual outstanding receipt
+account. The outstanding debit matches the exact gross payout statement line.
+No customer payment, receivable, invoice, sales order, delivery or manufacturing
+order is created. Existing fees, taxes and bank-deposit settlement follow the
+payout's existing workflow.
+
+For this migration, WEB CC also serves as the Shopify clearing journal's cash
+account. Its debit on the imported gross statement line offsets the historical
+entry's credit to WEB CC. This prevents those imported receipts from increasing
+cash a second time. The payout withdrawal, fees and any marketplace-tax entries
+then reduce the original clearing balance through the normal settlement process.
+
+Details shows both clearing accounts, debit/credit amounts, source collection
+timestamp and posting date. **Bulk Repair Audit** retains immutable source
+evidence and links to the exact payout row and clearing entry. Repeated runs reuse
+that entry, including when a previous run posted it but could not finish matching.
+Ordinary payout reprocessing can also match reviewed clearing entries. A later
+order import cannot create duplicate customer cash through transaction cash sync.
+
+Existing or unidentified customer receipts, duplicate source transaction rows,
+changed/reversed clearing entries, allocations to another statement, nonstandard
+statement accounting, mixed cutover collections and closed periods remain for
+review. This path requires the payout currency to equal the company currency;
+historical foreign-currency conversion needs a reviewed allocation. Missing-order
+Shop Cash activity still uses its separate grouped-credit workflow and remains
+for review when the original Odoo order/payment or source breakdown is absent.
 
 ## Retroactive discounts and order edits
 
@@ -102,7 +146,7 @@ remain for review. Repeated previews/applies do not create duplicate cash paymen
 
 Historical repairs retain immutable records on the payout's **Bulk Repair Audit**
 tab, including reviewer/time, source order/refund identities, fulfillment evidence,
-component amounts, posting choices and links to credits/payments. Normal order
+component amounts, posting choices and links to credits/payments/collection clearing entries. Normal order
 repairs retain the existing **Shopify Payment Audit**. Only accounting managers can
 apply the bulk action. Internal notes/audits are retained without sending customer
 notifications.
@@ -115,11 +159,18 @@ historical activity/credit linking actions.
 
 ## Validation
 
-The local Odoo 18 module upgrade and suite completed with 152 passing tests and
-three skipped Enterprise bank-reconciliation-widget tests. All 101 standalone
-checks passed. The 18 bulk repair tests cover one refund document split across
+The 18 bulk refund repair tests cover one refund document split across
 two payouts, category-inherited Readers accounts distinct from the generic
 adjustment account, offsetting pending adjustments, current-period credits,
 mixed-account review and existing historical credits with incorrect GLs.
+The 19 historical collection tests cover exact source proof, missing source links, cutover/time-zone
+boundaries, opening-balance confirmation, missing/current orders, existing receipts,
+duplicate prevention, statement reuse, atomic posting failures, closed periods,
+changed/reversed entries, other-statement allocations and leaving unreviewed
+transactions open. They verify real Odoo journal entries and reconciled move
+lines. When Enterprise's bank widget is unavailable, only that adapter is replaced
+with account.move.line reconciliation; the production widget runs when present.
 Enterprise widget behavior still needs validation in staging.
+The Odoo 18 upgrade and full suite completed with **171 passing tests and three
+existing Enterprise-widget skips**. All **101 standalone checks** passed.
 Production payouts were inspected without changing their accounting.

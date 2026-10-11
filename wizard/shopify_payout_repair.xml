@@ -16,9 +16,15 @@
                     <group><field name="cutover_date"/><field name="timezone"/><field name="sales_journal_id"/></group>
                     <group><field name="post_historical"/><field name="open_only"/><field name="rematch_payouts"/></group>
                 </group>
+                <group string="Historical Collections">
+                    <field name="clear_historical_collections"/>
+                    <field name="historical_collection_account_id"/>
+                </group>
                 <div class="alert alert-info" role="alert">
                     Historical refunds record returns and cash already refunded in Shopify, using the configured income/adjustment and exact tax accounts.
-                    Original collections remain in opening balances. Review the accounts and adjustments in Details before applying.
+                    Historical collections can clear cash included in the selected opening-balance account and match its payout receipt.
+                    Enable that option only when the original collections are included in that balance and their clearing entries are missing.
+                    Review the accounts and adjustments in Details before applying.
                     Inventory returns are handled separately. This action never sends money or customer notifications.
                 </div>
                 <field name="result" nolabel="1"/>
@@ -48,7 +54,8 @@
             <form create="false" edit="false">
                 <group><field name="status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
                     <field name="transaction_ids" widget="many2many_tags"/>
-                    <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/></group>
+                    <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
+                    <field name="collection_move_ids" widget="many2many_tags"/></group>
                 <field name="detail"/><field name="review_html" nolabel="1"/>
                 <footer><button name="action_open_order" type="object" string="Open Order" invisible="not order_id"/>
                     <button name="action_open_shopify_order" type="object" string="Open Shopify Order"/>
@@ -71,10 +78,12 @@
                         <list create="false" edit="false" delete="false">
                             <field name="create_date"/><field name="create_uid"/><field name="source_order_id"/>
                             <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
+                            <field name="collection_move_ids" widget="many2many_tags"/>
                         </list>
                         <form create="false" edit="false" delete="false">
                             <group><field name="create_date"/><field name="create_uid"/><field name="source_order_id"/>
-                                <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/></group>
+                                <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
+                                <field name="collection_move_ids" widget="many2many_tags"/><field name="transaction_ids" widget="many2many_tags"/></group>
                             <field name="plan" widget="jsonb"/>
                         </form>
                     </field>

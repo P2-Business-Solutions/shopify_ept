@@ -33,6 +33,11 @@ class ShopifyPayoutRepairAudit(models.Model):
     plan = fields.Json(readonly=True)
     credit_ids = fields.Many2many('account.move', readonly=True)
     payment_ids = fields.Many2many('account.payment', readonly=True)
+    collection_move_ids = fields.Many2many('account.move', 'shopify_collection_audit_move_rel',
+                                          'audit_id', 'move_id', readonly=True)
+    transaction_ids = fields.Many2many('shopify.payout.report.line.ept',
+                                      'shopify_collection_audit_transaction_rel',
+                                      'audit_id', 'transaction_id', readonly=True)
 
     @api.model_create_multi
     def create(self, vals_list):

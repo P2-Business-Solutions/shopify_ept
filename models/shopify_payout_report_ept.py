@@ -436,8 +436,9 @@ class ShopifyPaymentReportEpt(models.Model):
 							   "Action Items:\n"
 							   "- Import the missing order before processing the payout report.\n"
 							   "- You can import orders using the operation wizard.") % transaction.source_order_id
-                    log_lines.append({'message': message,
-                                      'shopify_payout_report_line_id': transaction.id})
+                    if not transaction._historical_collection_entry():
+                        log_lines.append({'message': message,
+                                          'shopify_payout_report_line_id': transaction.id})
                     # We can not use shopify order reference here because it may create duplicate name,
                     # and name of journal entry should be unique per company. So here I have used transaction Id
                     bank_line_vals = {
@@ -906,6 +907,12 @@ class ShopifyPaymentReportEpt(models.Model):
             paid_move_lines = []
             try:
                 with self.env.cr.savepoint():
+                    historical_collection = (statement_line.payout_line_id._historical_collection_entry()
+                        if statement_line.shopify_transaction_type == 'charge' and statement_line.payout_line_id
+                        else False)
+                    if historical_collection:
+                        self._reconcile_historical_collection_statement(statement_line, historical_collection)
+                        continue
                     if getattr(getattr(statement_line, 'payout_line_id', False), 'shop_cash_kind', False):
                         self._reconcile_shop_cash_statement(statement_line)
                     elif statement_line.shopify_transaction_type in ["charge", "refund", "payment_refund"]:

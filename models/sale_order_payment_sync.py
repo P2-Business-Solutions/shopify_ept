@@ -277,6 +277,12 @@ class SaleOrderPaymentSync(models.Model):
 
     def _build_shopify_cash_plan(self, repair=False):
         self.ensure_one()
+        if self.env['account.move'].search_count([
+                ('shopify_instance_id', '=', self.shopify_instance_id.id),
+                ('shopify_source_order_id', '=', self.shopify_order_id),
+                ('shopify_legacy_collection_transaction_id', '!=', False)]):
+            raise UserError(_('This order has a historical collection cleared from opening balances. '
+                              'Review that entry before creating customer payments or repairing current-period cash.'))
         payload, transactions = self._shopify_cash_source()
         try:
             events = cash_events(transactions, self.shopify_order_id, self.currency_id.name)

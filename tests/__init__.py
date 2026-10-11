@@ -18,3 +18,4 @@ from . import test_shopify_shop_cash
 from . import test_shopify_payout_specific_import
 from . import test_shopify_refund_plan
 from . import test_shopify_payout_repair
+from . import test_shopify_historical_collection

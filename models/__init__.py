@@ -51,3 +51,4 @@ from . import shopify_order_type_mapping
 from . import shopify_payment_audit
 from . import sale_order_payment_sync
 from . import shopify_payout_repair
+from . import shopify_historical_collection

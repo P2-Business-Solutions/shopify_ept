@@ -22,6 +22,15 @@ class ShopifyPayoutRepair(models.TransientModel):
                                       default=lambda self: self.env['account.journal'].search([
                                           ('company_id', '=', self.env.company.id), ('type', '=', 'sale')], limit=1))
     post_historical = fields.Boolean(string='Post Proven Historical Credits and Refund Payments', default=True)
+    clear_historical_collections = fields.Boolean(
+        string='Clear Collections Included in Opening Balances',
+        help='Confirm that the selected historical collections are included in the opening balance of the account below, '
+             'and that no clearing entries or customer payments have already recorded their settlement.')
+    historical_collection_account_id = fields.Many2one(
+        'account.account', string='Opening-Balance Collection Account', check_company=True,
+        domain="[('account_type', 'in', ('asset_current', 'asset_cash')), ('deprecated', '=', False)]",
+        default=lambda self: self.env['account.account'].search([
+            ('company_ids', 'in', self.env.company.ids), ('code', '=', '110010'), ('deprecated', '=', False)], limit=1))
     open_only = fields.Boolean(string='Unmatched Transactions Only', default=True)
     rematch_payouts = fields.Boolean(string='Reconcile Existing Payout Statements After Repair', default=True)
     line_ids = fields.One2many('shopify.payout.repair.line.ept', 'wizard_id', readonly=True)
@@ -40,9 +49,11 @@ class ShopifyPayoutRepair(models.TransientModel):
     def _settings(self):
         return fingerprint(dict(payouts=sorted(self.payout_ids.ids), cutover=str(self.cutover_date), timezone=self.timezone,
                                 journal=self.sales_journal_id.id, post=self.post_historical,
+                                collections=self.clear_historical_collections,
+                                collection_account=self.historical_collection_account_id.id,
                                 open_only=self.open_only, rematch=self.rematch_payouts))
 
-    def _plan(self, transactions, order, historical=False):
+    def _plan(self, transactions, order, historical=False, collection=False):
         if transactions.payout_id - self.payout_ids:
             raise UserError(_('The repair contains transactions outside the selected payouts.'))
         for payout in transactions.payout_id:
@@ -50,6 +61,12 @@ class ShopifyPayoutRepair(models.TransientModel):
         if historical:
             return transactions.sorted('id')[:1]._historical_refund_plan(
                 self.cutover_date, self.timezone, self.sales_journal_id, self.post_historical)
+        if collection:
+            if len(transactions) != 1:
+                raise UserError(_('Review each historical collection against its exact payout transaction.'))
+            return transactions._historical_collection_plan(
+                self.cutover_date, self.timezone, self.historical_collection_account_id,
+                self.clear_historical_collections)
         if len(order) != 1:
             raise UserError(_('Import or correct the order before repairing its current-period accounting.'))
         order.check_access('write')
@@ -94,7 +111,8 @@ class ShopifyPayoutRepair(models.TransientModel):
                         groups[key] = [self.env['shopify.payout.report.line.ept'], orders, False]
                     groups[key][0] |= transaction
                 else:
-                    raise UserError(_('No Odoo order exists for this collection. Review its opening-balance treatment or import the current-period order.'))
+                    plan = self._plan(transaction, orders, collection=True)
+                    groups[('collection', transaction.id)] = [transaction, orders, plan]
             except UserError as error:
                 exceptions.append((transaction, str(error)))
         values = []
@@ -106,7 +124,7 @@ class ShopifyPayoutRepair(models.TransientModel):
                 error = str(problem)
             summary = error or self._summary(plan)
             values.append(dict(wizard_id=self.id, transaction_ids=[Command.set(transactions.ids)],
-                               order_id=order.id, kind='historical' if historic_plan else 'order',
+                               order_id=order.id, kind=historic_plan['kind'] if historic_plan else 'order',
                                source_reference=order.display_name if order else (historic_plan or {}).get(
                                    'source_name', transactions[:1].source_order_id),
                                status='review' if error else 'ready', selected=not error,
@@ -125,6 +143,12 @@ class ShopifyPayoutRepair(models.TransientModel):
         return self._reopen()
 
     def _summary(self, plan):
+        if plan['kind'] == 'collection':
+            account = self.env['account.account'].browse(plan['account_id'])
+            return _('%(order)s: clear %(amount)s from %(account)s on %(date)s and match the payout receipt. '
+                     'Original sales and fulfillment remain in the old system.',
+                     order=plan['source_name'], amount=plan['amount'], account=account.display_name,
+                     date=plan['values']['date'])
         if plan['kind'] == 'historical':
             lines = plan['values']['invoice_line_ids']
             accounts = self.env['account.account'].browse(sorted({command[2]['account_id'] for command in lines}))
@@ -155,13 +179,17 @@ class ShopifyPayoutRepair(models.TransientModel):
         for line in selected.sorted('id'):
             try:
                 with self.env.cr.savepoint():
-                    fresh = self._plan(line.transaction_ids, line.order_id, line.kind == 'historical')
+                    fresh = self._plan(line.transaction_ids, line.order_id, line.kind == 'historical',
+                                       line.kind == 'collection')
                     if fingerprint(fresh) != fingerprint(line.plan):
                         raise UserError(_('Source data or accounting changed after preview. Refresh this case before applying.'))
                     if fresh['kind'] == 'historical':
                         credit, payments = line.transaction_ids.sorted('id')[:1]._apply_historical_refund_plan(
                             fresh, payouts=line.transaction_ids.payout_id)
                         line.write({'credit_ids': [Command.set(credit.ids)], 'payment_ids': [Command.set(payments.ids)]})
+                    elif fresh['kind'] == 'collection':
+                        move = line.transaction_ids._apply_historical_collection_plan(fresh)
+                        line.write({'collection_move_ids': [Command.set(move.ids)]})
                     else:
                         payments = line.order_id.with_context(tracking_disable=True, mail_create_nosubscribe=True,
                             shopify_silent_cancelled_import=True)._apply_shopify_cash_plan(fresh['cash'])
@@ -181,7 +209,8 @@ class ShopifyPayoutRepair(models.TransientModel):
                 try:
                     with self.env.cr.savepoint():
                         payout._check_payout_reimport_period()
-                        reviewed = selected.filtered(lambda row: row.status == 'done' and row.payment_ids).transaction_ids.filtered(
+                        reviewed = selected.filtered(lambda row: row.status == 'done' and (
+                            row.payment_ids or row.collection_move_ids)).transaction_ids.filtered(
                             lambda transaction: transaction.payout_id == payout)
                         scoped_payout = payout.with_context(shopify_bulk_repaired_line_ids=reviewed.ids)
                         if payout.state in ('draft', 'partially_generated'):
@@ -209,13 +238,16 @@ class ShopifyPayoutRepairLine(models.TransientModel):
     order_id = fields.Many2one('sale.order', readonly=True)
     source_reference = fields.Char(string='Source Order', readonly=True)
     selected = fields.Boolean()
-    kind = fields.Selection([('order', 'Order Cash Repair'), ('historical', 'Historical Refund'), ('review', 'Needs Review')], readonly=True)
+    kind = fields.Selection([('order', 'Order Cash Repair'), ('historical', 'Historical Refund'),
+                             ('collection', 'Historical Collection'), ('review', 'Needs Review')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
     detail = fields.Text(readonly=True)
     plan = fields.Json(readonly=True)
     review_html = fields.Html(compute='_compute_review_html', string='Accounting Preview')
     credit_ids = fields.Many2many('account.move', readonly=True)
     payment_ids = fields.Many2many('account.payment', readonly=True)
+    collection_move_ids = fields.Many2many('account.move', 'shopify_collection_repair_move_rel',
+                                          'case_id', 'move_id', readonly=True, string='Collection Clearing Entries')
 
     @api.depends('plan')
     def _compute_review_html(self):
@@ -240,6 +272,22 @@ class ShopifyPayoutRepairLine(models.TransientModel):
                                      escape(str(item['price_unit']))))
                 sections.append(Markup('</tbody></table>'))
                 events = plan['events']
+            elif plan.get('kind') == 'collection':
+                currency = self.env['res.currency'].browse(plan['values']['currency_id'])
+                journal = self.env['account.journal'].browse(plan['values']['journal_id'])
+                sections.append(Markup('<p>Original Shopify collection: %s on %s. Clearing entry: %s in %s.</p>') %
+                                (escape(plan['event']['id']), escape(plan['event']['timestamp']),
+                                 escape(plan['values']['date']), escape(journal.display_name)))
+                sections.append(Markup('<table class="table"><thead><tr><th>Account</th><th>Debit</th><th>Credit</th></tr></thead><tbody>'))
+                for command in plan['values']['line_ids']:
+                    item = command[2]
+                    account = self.env['account.account'].browse(item['account_id'])
+                    sections.append(Markup('<tr><td>%s</td><td>%s %s</td><td>%s %s</td></tr>') %
+                                    (escape(account.display_name), escape(str(item['debit'])), escape(currency.name),
+                                     escape(str(item['credit'])), escape(currency.name)))
+                sections.append(Markup('</tbody></table><p>The outstanding debit matches the payout receipt. '
+                                       'No sales invoice, customer payment, delivery or manufacturing order is created.</p>'))
+                events = []
             else:
                 cash = plan.get('cash', {})
                 events = cash.get('events', [])
