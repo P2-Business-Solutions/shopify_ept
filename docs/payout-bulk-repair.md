@@ -1,5 +1,30 @@
 # Bulk payout exception processing
 
+### Import the customer for a blocked historical refund (18.0.3.35)
+
+When a missing-order refund says **Import or correct the Shopify customer mapping**,
+use **Import Customer** on its saved case in the bulk workspace, **Details**, or
+the payout's **Bulk Repair Audit → Current Repair Progress**. This reads the exact
+Shopify customer named by that order and reuses the existing customer importer.
+It creates/reuses the customer mapping and refreshes only this case; the normal
+customer import checkpoint stays unchanged. It avoids importing the old sales order.
+
+The action requires an accounting manager with the existing connector/customer
+permissions, including contact creation rights when the customer is new. A unique
+existing email can identify the customer; a name alone cannot. Conflicting or
+duplicate mappings, ambiguous email identities, inactive customers, other-company
+candidates, missing email and a different returned customer stay for manual review.
+An existing valid mapping is reused without rewriting that customer's details.
+New mappings use the normal importer's tags and customer-channel handling.
+
+Customer import creates no invoice, credit, payment, delivery or manufacturing order,
+and never applies the accounting preview. The permanent repair history records the
+source customer, Odoo customer and initiating user. Read the refreshed **Details**,
+review accounts/taxes, then use **Apply Selected Ready Cases**. Any remaining source,
+document or period blocker stays visible. Other cases and successful matches remain
+available in the same saved workspace. Settlement and bank matching follow the
+existing steps below.
+
 Version **18.0.3.28** adds **Bulk Repair Transactions** on a Shopify payout and
 **Actions → Bulk Repair Payout Transactions** on selected payouts. These actions
 record money already charged/refunded in Shopify; they never charge a customer or

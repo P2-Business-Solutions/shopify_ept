@@ -1,5 +1,42 @@
 # Accounting review — 18.0.3.18
 
+## Customer import from a blocked payout case — 18.0.3.35
+
+Validated October 11, 2026 in a disposable Odoo 18 Community / PostgreSQL 16
+database with the actual connector, common connector library, sale order type,
+delivery hold, Manufacturing, Payment Payout Reconciliation and Loop Returns.
+Fresh module installation and subsequent upgrades loaded the action, history
+selection and all three existing views. Production inspection was read-only;
+no live customer imports, credits, payments, settlement or bank matches were applied.
+
+- **218 database tests passed; 3 Enterprise widget tests skipped.** The final
+  Odoo runner reported **0 failures and 0 errors across 221 tests**. Nine focused
+  customer-import tests passed, including a real manager with standard connector
+  and contact-creation permissions, and an accountant denied before reading source.
+- **101 standalone tests passed.** Standalone discovery reported 396 tests with
+  295 database/fixture cases skipped outside Odoo; actual database validation ran
+  separately above. Ruff's F checks on changed Python files, compilation, edited
+  XML parsing, manifest file/version checks and `git diff --check` passed.
+- A missing customer mapping became a Ready historical refund preview without
+  creating a sales order, invoice, credit, payment, delivery or manufacturing order.
+  Repeating the action reused the same customer/mapping and left the ordinary
+  customer-import checkpoint unchanged. The history retained the initiating user.
+- A unique existing email reused the customer. The unchanged Apply workflow then
+  posted a synthetic **215.35** credit and outgoing payment, reconciled the exact
+  refund statement, created its negative settlement, and matched one synthetic
+  bank withdrawal. Credit and transit residuals were zero, and repeated settlement
+  creation reused the same move. Community matching used ledger reconciliation
+  in place of the Enterprise widget; it is not an Enterprise UI validation.
+- Ambiguous/inactive email candidates, conflicting customer mappings, missing
+  email and a different returned customer stayed in review. A remaining accounting
+  lock after customer import retained its own blocker and created no accounting.
+
+The action reuses the existing customer importer and case refresh; accounting
+eligibility and approval stay in the existing preview/apply flow. Existing importer
+tag/customer-channel behavior and access controls remain in force. Check the new
+button and complete one new/reused customer case through the actual Enterprise
+bank widget in staging before production use. No production payout is claimed closed.
+
 ## Order-scoped standalone refund credits — 18.0.3.22
 
 Reviewed October 9, 2026 in a disposable Odoo 18 Community/PostgreSQL database with

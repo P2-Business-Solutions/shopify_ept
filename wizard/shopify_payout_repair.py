@@ -394,14 +394,14 @@ class ShopifyPayoutRepairLine(models.Model):
                     order = self.env['sale.order']
             line.current_order_id = order
 
-    def _record_history(self, operation):
+    def _record_history(self, operation, detail=None):
         self.ensure_one()
         return self.env['shopify.payout.repair.history.ept']._record_event({
             'workspace_id': self.wizard_id.id, 'case_id': self.id, 'company_id': self.company_id.id,
             'payout_ids': [Command.set(self.payout_ids.ids)], 'operation': operation,
             'status': self.status, 'reconciliation_status': self.reconciliation_status,
             'source_reference': self.source_reference, 'source_order_id': self.transaction_ids[:1].source_order_id,
-            'order_id': self.current_order_id.id, 'detail': self.last_error or self.detail,
+            'order_id': self.current_order_id.id, 'detail': detail if detail is not None else self.last_error or self.detail,
             'plan': self.plan, 'payment_ids': [Command.set(self.payment_ids.ids)],
             'credit_ids': [Command.set(self.credit_ids.ids)],
             'collection_move_ids': [Command.set(self.collection_move_ids.ids)],
@@ -410,6 +410,25 @@ class ShopifyPayoutRepairLine(models.Model):
     def action_refresh_case(self):
         self.ensure_one()
         return self.wizard_id._refresh_preview(case=self)
+
+    def action_import_customer(self):
+        self.ensure_one()
+        self.check_access('write')
+        self.wizard_id._check_manager()
+        if self.transaction_ids.payout_id - self.wizard_id.payout_ids:
+            raise UserError(_('The repair contains transactions outside the selected payouts.'))
+        refunds = self.transaction_ids.filtered(lambda tx:
+            tx.transaction_type in ('refund', 'payment_refund') and not tx.shop_cash_kind)
+        if (not refunds or refunds != self.transaction_ids
+                or len(set(refunds.mapped('source_order_id'))) != 1
+                or not refunds[:1].source_order_id or len(refunds.payout_id.instance_id) != 1
+                or self.current_order_id or self.reconciliation_status == 'matched'
+                or refunds[:1]._repair_order()):
+            raise UserError(_('Import a customer only for an unmatched refund case with one missing source order.'))
+        customer_id, partner = refunds.sorted('id')[:1]._import_repair_customer()
+        self._record_history('customer', detail=_('Shopify customer %s mapped to %s (customer %s). Customer import only; review the refreshed accounting preview before applying.',
+            customer_id, partner.display_name, partner.id))
+        return self.action_refresh_case()
 
     @api.depends('transaction_ids', 'transaction_ids.payout_id.payout_statement_line_ids.is_reconciled',
                  'transaction_ids.payout_id.payout_statement_line_ids.move_id.checked',

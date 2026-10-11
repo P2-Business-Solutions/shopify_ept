@@ -58,6 +58,8 @@
                         <field name="detail"/>
                         <button name="action_open_details" string="Details" type="object"/>
                         <button name="action_link_refund_credit_note" string="Link Credit Note" type="object"/>
+                        <button name="action_import_customer" string="Import Customer" type="object" groups="account.group_account_manager"
+                                invisible="kind != 'review' or current_order_id or reconciliation_status == 'matched'"/>
                         <button name="action_open_order" string="Open Order" type="object" invisible="not current_order_id"/>
                         <button name="action_open_shopify_order" string="Shopify" type="object"/>
                         <button name="action_refresh_case" string="Refresh Case" type="object"/>
@@ -90,6 +92,8 @@
                 </field>
                 <footer><button name="action_open_order" type="object" string="Open Order" invisible="not current_order_id"/>
                     <button name="action_link_refund_credit_note" type="object" string="Link Refund Credit Note" groups="account.group_account_manager"/>
+                    <button name="action_import_customer" type="object" string="Import Customer" groups="account.group_account_manager"
+                            invisible="kind != 'review' or current_order_id or reconciliation_status == 'matched'"/>
                     <button name="action_open_shopify_order" type="object" string="Open Shopify Order"/>
                     <button name="action_refresh_case" type="object" string="Refresh Case" groups="account.group_account_manager"/>
                     <button name="action_back_to_bulk_repair" type="object" string="Back to Bulk Repair" class="btn-primary"/>
@@ -117,6 +121,8 @@
                                 <field name="last_preview_at" optional="hide"/><field name="last_apply_at" optional="hide"/>
                                 <field name="detail"/><field name="last_error" optional="show"/>
                                 <button name="action_open_details" string="Details" type="object"/>
+                                <button name="action_import_customer" string="Import Customer" type="object" groups="account.group_account_manager"
+                                        invisible="kind != 'review' or current_order_id or reconciliation_status == 'matched'"/>
                                 <button name="action_open_order" string="Open Order" type="object" invisible="not current_order_id"/>
                                 <button name="action_open_shopify_order" string="Shopify" type="object"/>
                                 <button name="action_refresh_case" string="Refresh Case" type="object" groups="account.group_account_manager"/>

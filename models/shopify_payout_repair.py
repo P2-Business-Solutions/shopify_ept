@@ -105,6 +105,57 @@ class ShopifyPayoutRepairLine(models.Model):
             raise UserError(_('Shopify returned a different order.'))
         return payload, transactions
 
+    def _import_repair_customer(self):
+        """Reuse the customer importer without importing an old sales order."""
+        self.ensure_one()
+        instance = self.payout_id.instance_id
+        company = instance.shopify_company_id
+        payload, _transactions = self._repair_source()
+        customer_id = str((payload.get('customer') or {}).get('id') or '')
+        if not customer_id:
+            raise UserError(_('The source order has no Shopify customer ID. Review its customer identity manually.'))
+        try:
+            customer = shopify.Customer.find(customer_id).to_dict()
+        except ShopifyError as error:
+            raise UserError(_('Could not read the exact Shopify customer.')) from error
+        if str(customer.get('id') or '') != customer_id:
+            raise UserError(_('Shopify returned a different customer.'))
+        self.env.cr.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',
+                            ['shopify-customer:%s:%s' % (instance.id, customer_id)])
+        mappings = self.env['shopify.res.partner.ept'].with_context(active_test=False)
+        existing = mappings.search([('shopify_instance_id', '=', instance.id),
+                                    ('shopify_customer_id', '=', customer_id)])
+        if existing:
+            partners = existing.partner_id
+            if (len(existing) != 1 or len(partners) != 1 or not partners.active
+                    or (partners.company_id and partners.company_id != company)
+                    or not partners.commercial_partner_id.active
+                    or (partners.commercial_partner_id.company_id
+                        and partners.commercial_partner_id.company_id != company)):
+                raise UserError(_('The existing Shopify customer mapping is ambiguous, inactive or belongs to another company. Correct it before retrying.'))
+            return customer_id, partners
+        email = str(customer.get('email') or '').strip()
+        if not email:
+            raise UserError(_('The Shopify customer has no email. Review the mapping manually instead of matching by name.'))
+        candidates = self.env['res.partner'].with_context(active_test=False).search([('email', '=ilike', email)])
+        if (len(candidates.commercial_partner_id) > 1
+                or candidates.filtered(lambda partner: not partner.active
+                    or not partner.commercial_partner_id.active
+                    or (partner.company_id and partner.company_id != company)
+                    or (partner.commercial_partner_id.company_id
+                        and partner.commercial_partner_id.company_id != company))):
+            raise UserError(_('The Shopify email identifies ambiguous, inactive or other-company customers. Correct the customer mapping manually.'))
+        # This is the same entry point used by customer queues. Keep the regular
+        # customer's tags/channel handling; suppress import notifications only.
+        customer = dict(customer, email=email)
+        partner = mappings.with_company(company).with_context(
+            tracking_disable=True, mail_create_nosubscribe=True, mail_create_nolog=True,
+            order_data_queue=False, customer_data_queue=False,
+        ).shopify_create_contact_partner(customer, instance, self.env['shopify.customer.data.queue.line.ept'])
+        if not partner:
+            raise UserError(_('The customer importer did not create a customer mapping. Review the source customer details.'))
+        return customer_id, partner
+
     def _historical_refund_plan(self, cutover, timezone, sales_journal, post, source=None,
                                 opening_account=None, opening_confirmed=False):
         self.ensure_one()
@@ -437,6 +488,7 @@ class ShopifyPayoutRepairHistory(models.Model):
     payout_ids = fields.Many2many('shopify.payout.report.ept', 'shopify_payout_repair_history_rel',
                                  'history_id', 'payout_id', readonly=True)
     operation = fields.Selection([('preview', 'Preview / Refresh'), ('apply', 'Accounting Applied'),
+                                  ('customer', 'Customer Imported / Reused'),
                                   ('failure', 'Apply Failed'), ('match', 'Matching Result'),
                                   ('post_only', 'Posted Without Matching')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
