@@ -9,11 +9,13 @@ from psycopg2 import OperationalError
 from ..models.shopify_payment_plan import fingerprint
 
 
-class ShopifyPayoutRepair(models.TransientModel):
+class ShopifyPayoutRepair(models.Model):
     _name = 'shopify.payout.repair.ept'
     _description = 'Bulk Shopify Payout Repairs'
 
     payout_ids = fields.Many2many('shopify.payout.report.ept', required=True, readonly=True)
+    company_id = fields.Many2one('res.company', compute='_compute_company_id', store=True, precompute=True,
+                                required=True, readonly=True, index=True)
     cutover_date = fields.Date(string='Fulfillment Cutover', default='2026-08-01', required=True)
     timezone = fields.Selection(selection=lambda self: [(tz, tz) for tz in pytz.all_timezones],
                                 default=lambda self: self.env.user.tz or 'America/New_York', required=True)
@@ -38,7 +40,30 @@ class ShopifyPayoutRepair(models.TransientModel):
              'Disable only to post accounting without matching; those cases remain awaiting reconciliation.')
     line_ids = fields.One2many('shopify.payout.repair.line.ept', 'wizard_id', readonly=True)
     preview_settings = fields.Char(readonly=True)
-    result = fields.Text(readonly=True)
+    result = fields.Text(string='Last Run Result', readonly=True)
+    progress_summary = fields.Char(compute='_compute_progress_summary', string='Current Progress')
+    history_ids = fields.One2many('shopify.payout.repair.history.ept', 'workspace_id', readonly=True)
+
+    @api.depends('payout_ids.instance_id.shopify_company_id')
+    def _compute_company_id(self):
+        for workspace in self:
+            workspace.company_id = workspace.payout_ids[:1].instance_id.shopify_company_id
+
+    @api.constrains('payout_ids', 'company_id')
+    def _check_payout_company(self):
+        for workspace in self:
+            if workspace.payout_ids.instance_id.shopify_company_id != workspace.company_id:
+                raise UserError(_('A saved repair workspace must contain payouts from one company.'))
+
+    @api.depends('line_ids.status', 'line_ids.reconciliation_status', 'line_ids.active')
+    def _compute_progress_summary(self):
+        for workspace in self:
+            matched = workspace.line_ids.filtered(lambda line: line.reconciliation_status == 'matched')
+            pending = workspace.line_ids - matched
+            workspace.progress_summary = _('%s matched; %s ready; %s need review; %s applied and awaiting match.',
+                len(matched), len(pending.filtered(lambda line: line.status == 'ready')),
+                len(pending.filtered(lambda line: line.status == 'review')),
+                len(pending.filtered(lambda line: line.status == 'done')))
 
     def _check_manager(self):
         self.ensure_one()
@@ -79,16 +104,23 @@ class ShopifyPayoutRepair(models.TransientModel):
         return dict(kind='order', order_id=order.id, cash=plan)
 
     def action_preview(self):
+        return self._refresh_preview()
+
+    def _refresh_preview(self, case=None):
         self._check_manager()
-        self.line_ids.unlink()
+        self.env.cr.execute('SELECT id FROM shopify_payout_repair_ept WHERE id = %s FOR UPDATE', [self.id])
+        self.invalidate_recordset()
         groups, exceptions = {}, []
-        transactions = self.payout_ids.payout_transaction_ids.filtered(
+        transactions = (case.transaction_ids if case else self.payout_ids.payout_transaction_ids).filtered(
             lambda row: row.transaction_type in ('charge', 'refund', 'payment_refund') or row.shop_cash_kind)
+        refreshed = self.env['shopify.payout.report.line.ept']
         for transaction in transactions.sorted('id'):
             statements = transaction.payout_id.payout_statement_line_ids.filtered(
                 lambda row: row.payout_line_id == transaction)
             if self.open_only and statements and all(statements.mapped('is_reconciled')):
                 continue
+            refreshed |= transaction
+            orders = self.env['sale.order']
             try:
                 orders = (transaction.payout_id._shop_cash_orders_for_preview(transaction)
                           if transaction.shop_cash_kind else transaction._repair_order())
@@ -122,7 +154,7 @@ class ShopifyPayoutRepair(models.TransientModel):
                     plan = self._plan(transaction, orders, collection=True)
                     groups[('collection', transaction.id)] = [transaction, orders, plan]
             except UserError as error:
-                exceptions.append((transaction, str(error)))
+                exceptions.append((transaction, orders if len(orders) == 1 else self.env['sale.order'], str(error)))
         values = []
         for transactions, order, historic_plan in groups.values():
             plan, error = None, ''
@@ -139,11 +171,28 @@ class ShopifyPayoutRepair(models.TransientModel):
                                plan=json.loads(json.dumps(plan, default=str)) if plan else False,
                                detail=summary))
         values.extend(dict(wizard_id=self.id, transaction_ids=[Command.set(transaction.ids)],
+                           order_id=order.id,
                            source_reference=transaction.source_order_id or transaction.transaction_id,
                            kind='review', status='review', selected=False, detail=error)
-                      for transaction, error in exceptions)
-        if values:
-            self.env['shopify.payout.repair.line.ept'].create(values)
+                      for transaction, order, error in exceptions)
+        retained = self.env['shopify.payout.repair.line.ept']
+        previous = self.line_ids.filtered(lambda line: bool(line.transaction_ids & refreshed))
+        for value in values:
+            ids = set(value['transaction_ids'][0][2])
+            existing = previous.filtered(lambda line: set(line.transaction_ids.ids) == ids)[:1]
+            value.update(settings_fingerprint=self._settings(), last_preview_at=fields.Datetime.now(),
+                         last_error=False, plan=value.get('plan') or False)
+            if existing:
+                existing.write(value)
+                line = existing
+            else:
+                line = self.env['shopify.payout.repair.line.ept'].create(value)
+            retained |= line
+            line._record_history('preview')
+        # Keep completed results and archive superseded groupings with their history.
+        (previous - retained).write({'active': False, 'selected': False})
+        self.invalidate_recordset(['line_ids'])
+        self.payout_ids.invalidate_recordset(['repair_case_ids'])
         self.write({'preview_settings': self._settings(),
                     'result': _('%s ready; %s need review. Select the ready cases to apply.',
                                 len(self.line_ids.filtered(lambda row: row.status == 'ready')),
@@ -194,6 +243,8 @@ class ShopifyPayoutRepair(models.TransientModel):
                 with self.env.cr.savepoint():
                     fresh = self._plan(line.transaction_ids, line.order_id, line.kind == 'historical',
                                        line.kind in ('collection', 'opening_refund'))
+                    if line.settings_fingerprint != self._settings():
+                        raise UserError(_('Settings changed for this case. Refresh it before applying.'))
                     if fingerprint(fresh) != fingerprint(line.plan):
                         raise UserError(_('Source data or accounting changed after preview. Refresh this case before applying.'))
                     if fresh['kind'] == 'historical':
@@ -206,16 +257,30 @@ class ShopifyPayoutRepair(models.TransientModel):
                     else:
                         payments = line.order_id.with_context(tracking_disable=True, mail_create_nosubscribe=True,
                             shopify_silent_cancelled_import=True)._apply_shopify_cash_plan(fresh['cash'])
-                        line.write({'payment_ids': [Command.set(payments.ids)]})
+                        payment_audit = line.order_id.shopify_payment_audit_ids.sorted('id', reverse=True)[:1]
+                        line.write({'payment_ids': [Command.set(payments.ids)],
+                                    'credit_ids': [Command.set(payment_audit.credit_note_ids.ids)]})
+                        self.env['shopify.payout.repair.audit.ept']._record_repair({
+                            'payout_ids': [Command.set(line.transaction_ids.payout_id.ids)],
+                            'company_id': line.order_id.company_id.id, 'order_id': line.order_id.id,
+                            'source_order_id': line.order_id.shopify_order_id, 'plan': fresh,
+                            'transaction_ids': [Command.set(line.transaction_ids.ids)],
+                            'payment_audit_id': payment_audit.id,
+                            'credit_ids': [Command.set(line.credit_ids.ids)],
+                            'payment_ids': [Command.set(payments.ids)],
+                        })
                     for payout in line.transaction_ids.payout_id:
                         payout._message_log(body=_('Reviewed bulk repair: %s. Source/ledger fingerprint: %s.',
                                                   line.detail, fingerprint(fresh)))
-                    line.status = 'done'
+                    line.write({'status': 'done', 'selected': False, 'last_error': False,
+                                'last_apply_at': fields.Datetime.now()})
+                    line._record_history('apply')
                 applied += 1
             except OperationalError:
                 raise
             except UserError as error:
-                line.write({'status': 'review', 'selected': False, 'detail': str(error)})
+                line.write({'status': 'review', 'selected': False, 'detail': str(error), 'last_error': str(error)})
+                line._record_history('failure')
                 failed += 1
         matching_issues = []
         if self.rematch_payouts:
@@ -240,6 +305,10 @@ class ShopifyPayoutRepair(models.TransientModel):
         done = selected.filtered(lambda row: row.status == 'done')
         matched = done.filtered(lambda row: row.reconciliation_status == 'matched')
         pending = done - matched
+        for line in done:
+            issue = '\n'.join(filter(None, line.transaction_ids.payout_id.mapped('reimport_reconciliation_issue')))
+            line.last_error = issue if self.rematch_payouts and line.reconciliation_status == 'pending' else False
+            line._record_history('match' if self.rematch_payouts else 'post_only')
         result = [_('%s case(s) applied; %s case(s) changed or failed and remain for review.', applied, failed),
                   _('%s applied case(s) fully matched to their payout; %s still awaiting reconciliation.', len(matched), len(pending))]
         if pending and not self.rematch_payouts:
@@ -254,14 +323,19 @@ class ShopifyPayoutRepair(models.TransientModel):
                 'view_mode': 'form', 'target': 'new', 'name': _('Bulk Repair Payout Transactions')}
 
 
-class ShopifyPayoutRepairLine(models.TransientModel):
+class ShopifyPayoutRepairLine(models.Model):
     _name = 'shopify.payout.repair.line.ept'
     _description = 'Reviewed Shopify Payout Repair Case'
 
     wizard_id = fields.Many2one('shopify.payout.repair.ept', required=True, ondelete='cascade')
+    company_id = fields.Many2one(related='wizard_id.company_id', store=True, index=True)
+    active = fields.Boolean(default=True, readonly=True)
+    payout_ids = fields.Many2many('shopify.payout.report.ept', 'shopify_payout_repair_case_rel',
+                                 'case_id', 'payout_id', compute='_compute_payout_ids', store=True)
     transaction_ids = fields.Many2many('shopify.payout.report.line.ept', 'shopify_bulk_repair_transaction_rel',
                                       'case_id', 'transaction_id', readonly=True)
     order_id = fields.Many2one('sale.order', readonly=True)
+    current_order_id = fields.Many2one('sale.order', compute='_compute_current_order_id', string='Order')
     source_reference = fields.Char(string='Source Order', readonly=True)
     selected = fields.Boolean()
     kind = fields.Selection([('order', 'Order Cash Repair'), ('historical', 'Historical Refund'),
@@ -270,6 +344,11 @@ class ShopifyPayoutRepairLine(models.TransientModel):
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
     detail = fields.Text(readonly=True)
     plan = fields.Json(readonly=True)
+    settings_fingerprint = fields.Char(readonly=True)
+    last_preview_at = fields.Datetime(string='Last Preview', readonly=True)
+    last_apply_at = fields.Datetime(string='Last Applied', readonly=True)
+    last_error = fields.Text(string='Latest Processing Issue', readonly=True)
+    history_ids = fields.One2many('shopify.payout.repair.history.ept', 'case_id', readonly=True)
     review_html = fields.Html(compute='_compute_review_html', string='Accounting Preview')
     credit_ids = fields.Many2many('account.move', readonly=True)
     payment_ids = fields.Many2many('account.payment', readonly=True)
@@ -277,6 +356,40 @@ class ShopifyPayoutRepairLine(models.TransientModel):
                                           'case_id', 'move_id', readonly=True, string='Opening-Balance Clearing Entries')
     reconciliation_status = fields.Selection([('matched', 'Matched'), ('pending', 'Awaiting Match')],
         compute='_compute_reconciliation_status', string='Payout Match')
+
+    @api.depends('transaction_ids.payout_id')
+    def _compute_payout_ids(self):
+        for line in self:
+            line.payout_ids = line.transaction_ids.payout_id
+
+    @api.depends('order_id', 'transaction_ids.source_order_id', 'transaction_ids.order_id')
+    def _compute_current_order_id(self):
+        for line in self:
+            order = line.order_id.exists()
+            if not order:
+                try:
+                    orders = line.transaction_ids._repair_orders_for_progress()
+                    order = orders if len(orders) == 1 else self.env['sale.order']
+                except UserError:
+                    order = self.env['sale.order']
+            line.current_order_id = order
+
+    def _record_history(self, operation):
+        self.ensure_one()
+        return self.env['shopify.payout.repair.history.ept']._record_event({
+            'workspace_id': self.wizard_id.id, 'case_id': self.id, 'company_id': self.company_id.id,
+            'payout_ids': [Command.set(self.payout_ids.ids)], 'operation': operation,
+            'status': self.status, 'reconciliation_status': self.reconciliation_status,
+            'source_reference': self.source_reference, 'source_order_id': self.transaction_ids[:1].source_order_id,
+            'order_id': self.current_order_id.id, 'detail': self.last_error or self.detail,
+            'plan': self.plan, 'payment_ids': [Command.set(self.payment_ids.ids)],
+            'credit_ids': [Command.set(self.credit_ids.ids)],
+            'collection_move_ids': [Command.set(self.collection_move_ids.ids)],
+        })
+
+    def action_refresh_case(self):
+        self.ensure_one()
+        return self.wizard_id._refresh_preview(case=self)
 
     @api.depends('transaction_ids', 'transaction_ids.payout_id.payout_statement_line_ids.is_reconciled',
                  'transaction_ids.payout_id.payout_statement_line_ids.move_id.checked',
@@ -365,8 +478,9 @@ class ShopifyPayoutRepairLine(models.TransientModel):
 
     def action_open_order(self):
         self.ensure_one()
-        if self.order_id:
-            return {'type': 'ir.actions.act_window', 'res_model': 'sale.order', 'res_id': self.order_id.id,
+        self.invalidate_recordset(['current_order_id'])
+        if self.current_order_id:
+            return {'type': 'ir.actions.act_window', 'res_model': 'sale.order', 'res_id': self.current_order_id.id,
                     'view_mode': 'form', 'target': 'current'}
         return self.transaction_ids[:1].action_open_order()
 

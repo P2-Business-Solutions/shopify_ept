@@ -5,6 +5,35 @@ Version **18.0.3.28** adds **Bulk Repair Transactions** on a Shopify payout and
 record money already charged/refunded in Shopify; they never charge a customer or
 issue a new Shopify refund.
 
+Version **18.0.3.33** saves the repair workspace and its cases permanently. Leaving
+to edit an order, closing the dialog, or returning another day retains the results,
+settings, selections and document links. **Bulk Repair Transactions** resumes the
+saved workspace without reading Shopify again. A payout processed with several
+others can resume that existing shared workspace; its payout tags show the scope.
+
+The payout's **Bulk Repair Audit** tab now contains:
+
+- **Current Repair Progress:** ready, unresolved and applied cases, live payout
+  matching status, order/Shopify links, document Details and **Refresh Case**.
+- **Repair History:** permanent snapshots of previews, errors, applications and
+  matching results, with user/date, explanations and accounting links.
+- **Applied Accounting:** the existing immutable accounting trail, now including
+  order-payment repairs and their underlying order audit, as well as historical
+  credits and opening-balance entries.
+
+After fixing an order, use **Refresh Case** on its saved row to review only that
+case. A full **Preview / Refresh** updates outstanding cases while retaining
+completed results; changed groupings archive their older rows and preserve their
+history. Importing a previously missing order makes its link available on return,
+without another preview. The current progress counts and matching status reflect
+the statement; the last run result and history describe their recorded runs.
+Apply still rechecks source/ledger fingerprints and period locks. An old preview
+cannot authorize changed accounting, even when only another case was refreshed.
+
+Upgrading preserves any temporary workspaces/cases still present in the database
+and makes them permanent. Previews already deleted by Odoo cannot be recovered;
+previously posted accounting and its existing audits are retained.
+
 1. Select the payouts and open the bulk action. Set **Fulfillment Cutover** (August
    1, 2026 for this migration), the business time zone and the customer invoice
    journal for historical refund credits. Posting proven historical credits and
@@ -22,7 +51,7 @@ issue a new Shopify refund.
    remains in the same list with its source order and explanation. **Details**
    shows exact cash amounts, dates, invoice/credit treatment and account IDs.
    In version **18.0.3.29**, **Back to Bulk Repair** returns from Details to the
-   same preview and selected cases. **Apply Selected Ready Cases** is on that
+   same saved preview and selected cases. **Apply Selected Ready Cases** is on that
    main dialog; Details alone does not create accounting entries. On 18.0.3.28,
    closing Details dismisses the dialog, so reopen the bulk action and preview
    again to reach Apply.
@@ -219,6 +248,13 @@ identity, duplicate credits/payments, time-zone boundaries, mixed-period documen
 closed source versus payout periods, and retaining exact matches when only final
 payout validation fails. Enterprise widget behavior still needs
 validation in staging.
-The Odoo 18 upgrade and full suite completed with **184 passing tests and three
+The 13 saved-progress tests cover reopening without Shopify reads, permanent
+preview/error history, retained completed cases and document links, one-case
+refresh, imported-order navigation, order-payment accounting audits and normal
+payout matching, rollback/failure history, immutable history, accountant read-only
+access, shared workspaces, latest-run display, regrouping and stale-case settings.
+An upgrade from 18.0.3.32 with an existing temporary workspace/case preserved its
+settings, result, issue, selection and payout links and made both records permanent.
+The Odoo 18 upgrade and full suite completed with **197 passing tests and three
 existing Enterprise-widget skips**. All **101 standalone checks** passed.
 Production payouts were inspected without changing their accounting.

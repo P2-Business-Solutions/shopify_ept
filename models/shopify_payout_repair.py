@@ -30,6 +30,8 @@ class ShopifyPayoutRepairAudit(models.Model):
                                  'audit_id', 'payout_id', readonly=True)
     company_id = fields.Many2one('res.company', required=True, readonly=True, index=True)
     source_order_id = fields.Char(readonly=True)
+    order_id = fields.Many2one('sale.order', readonly=True)
+    payment_audit_id = fields.Many2one('shopify.payment.audit.ept', readonly=True)
     plan = fields.Json(readonly=True)
     credit_ids = fields.Many2many('account.move', readonly=True)
     payment_ids = fields.Many2many('account.payment', readonly=True)
@@ -66,6 +68,12 @@ class ShopifyPayoutRepairLine(models.Model):
         if len(order) > 1 or (self.order_id and order != self.order_id):
             raise UserError(_('The payout order reference is ambiguous or inconsistent.'))
         return order
+
+    def _repair_orders_for_progress(self):
+        orders = self.env['sale.order']
+        for transaction in self:
+            orders |= transaction._repair_order()
+        return orders
 
     def action_open_order(self):
         self.ensure_one()
@@ -379,10 +387,87 @@ class ShopifyPayoutRepair(models.Model):
 
     repair_audit_ids = fields.Many2many('shopify.payout.repair.audit.ept', 'shopify_payout_repair_audit_rel',
                                       'payout_id', 'audit_id', readonly=True, copy=False)
+    repair_case_ids = fields.Many2many('shopify.payout.repair.line.ept', compute='_compute_repair_case_ids',
+                                     readonly=True, copy=False)
+    repair_history_ids = fields.Many2many('shopify.payout.repair.history.ept', 'shopify_payout_repair_history_rel',
+                                        'payout_id', 'history_id', readonly=True, copy=False)
+
+    def _compute_repair_case_ids(self):
+        for payout in self:
+            cases = self.env['shopify.payout.repair.line.ept'].search([
+                ('payout_ids', 'in', payout.ids)], order='write_date desc, id desc')
+            current, seen = self.env['shopify.payout.repair.line.ept'], set()
+            for case in cases:
+                ids = set(case.transaction_ids.filtered(lambda row: row.payout_id == payout).ids)
+                if not ids.intersection(seen):
+                    current |= case
+                    seen.update(ids)
+            payout.repair_case_ids = current
 
     def action_bulk_repair_transactions(self):
         if not self.env.user.has_group('account.group_account_manager'):
             raise UserError(_('Only accounting managers can prepare payout repairs.'))
         self.check_access('write')
-        wizard = self.env['shopify.payout.repair.ept'].create({'payout_ids': [Command.set(self.ids)]})
+        if len(self.instance_id.shopify_company_id) != 1:
+            raise UserError(_('Select payouts from one company for a saved repair workspace.'))
+        # Serialize creation so opening the same payout in two tabs resumes one workspace.
+        key = 'shopify-repair-workspace:' + ','.join(map(str, sorted(self.ids)))
+        self.env.cr.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', [key])
+        workspaces = self.env['shopify.payout.repair.ept'].search([
+            ('payout_ids', 'in', self.ids)], order='write_date desc, id desc')
+        wizard = (workspaces[:1] if len(self) == 1 else
+                  workspaces.filtered(lambda row: set(row.payout_ids.ids) == set(self.ids))[:1])
+        if not wizard:
+            company = self.instance_id.shopify_company_id
+            wizard = self.env['shopify.payout.repair.ept'].with_company(company).create({
+                'payout_ids': [Command.set(self.ids)]})
+        wizard.line_ids.invalidate_recordset(['current_order_id', 'reconciliation_status'])
         return wizard._reopen()
+
+
+class ShopifyPayoutRepairHistory(models.Model):
+    _name = 'shopify.payout.repair.history.ept'
+    _description = 'Shopify Payout Repair History'
+    _order = 'id desc'
+    _rec_name = 'source_reference'
+
+    workspace_id = fields.Many2one('shopify.payout.repair.ept', required=True, ondelete='restrict', readonly=True)
+    case_id = fields.Many2one('shopify.payout.repair.line.ept', required=True, ondelete='restrict', readonly=True)
+    company_id = fields.Many2one('res.company', required=True, readonly=True, index=True)
+    payout_ids = fields.Many2many('shopify.payout.report.ept', 'shopify_payout_repair_history_rel',
+                                 'history_id', 'payout_id', readonly=True)
+    operation = fields.Selection([('preview', 'Preview / Refresh'), ('apply', 'Accounting Applied'),
+                                  ('failure', 'Apply Failed'), ('match', 'Matching Result'),
+                                  ('post_only', 'Posted Without Matching')], readonly=True)
+    status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
+    reconciliation_status = fields.Selection([('matched', 'Matched'), ('pending', 'Awaiting Match')], readonly=True)
+    source_reference = fields.Char(string='Source Order', readonly=True)
+    source_order_id = fields.Char(readonly=True)
+    order_id = fields.Many2one('sale.order', readonly=True)
+    detail = fields.Text(readonly=True)
+    plan = fields.Json(readonly=True)
+    credit_ids = fields.Many2many('account.move', readonly=True)
+    payment_ids = fields.Many2many('account.payment', readonly=True)
+    collection_move_ids = fields.Many2many('account.move', 'shopify_repair_history_move_rel',
+                                          'history_id', 'move_id', readonly=True)
+
+    @api.model_create_multi
+    def create(self, values):
+        raise UserError(_('Repair history is recorded only by the reviewed repair workflow.'))
+
+    def _record_event(self, values):
+        return super(ShopifyPayoutRepairHistory, self.sudo()).create([values])
+
+    def write(self, values):
+        raise UserError(_('Repair history cannot be edited.'))
+
+    def unlink(self):
+        raise UserError(_('Repair history cannot be deleted.'))
+
+    def action_open_order(self):
+        self.ensure_one()
+        return self.case_id.action_open_order()
+
+    def action_open_shopify_order(self):
+        self.ensure_one()
+        return self.case_id.action_open_shopify_order()

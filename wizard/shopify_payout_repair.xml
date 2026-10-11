@@ -5,12 +5,28 @@
         <field name="model_id" ref="model_shopify_payout_repair_audit_ept"/>
         <field name="domain_force">[('company_id', 'in', company_ids)]</field>
     </record>
+    <record id="shopify_payout_repair_workspace_company_rule" model="ir.rule">
+        <field name="name">Shopify payout repair workspace company</field>
+        <field name="model_id" ref="model_shopify_payout_repair_ept"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+    <record id="shopify_payout_repair_case_company_rule" model="ir.rule">
+        <field name="name">Shopify payout repair progress company</field>
+        <field name="model_id" ref="model_shopify_payout_repair_line_ept"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+    <record id="shopify_payout_repair_history_company_rule" model="ir.rule">
+        <field name="name">Shopify payout repair history company</field>
+        <field name="model_id" ref="model_shopify_payout_repair_history_ept"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
     <record id="view_shopify_payout_bulk_repair" model="ir.ui.view">
         <field name="name">shopify.payout.bulk.repair.form</field>
         <field name="model">shopify.payout.repair.ept</field>
         <field name="arch" type="xml">
-            <form string="Bulk Repair Payout Transactions" create="false">
+            <form string="Bulk Repair Payout Transactions" create="false" delete="false">
                 <field name="preview_settings" invisible="1"/>
+                <field name="company_id" invisible="1"/>
                 <field name="payout_ids" widget="many2many_tags"/>
                 <group>
                     <group><field name="cutover_date"/><field name="timezone"/><field name="sales_journal_id"/></group>
@@ -29,17 +45,21 @@
                     Inventory returns are handled separately. This action never sends money or customer notifications.
                 </div>
                 <field name="result" nolabel="1"/>
+                <field name="progress_summary" nolabel="1"/>
                 <field name="line_ids" nolabel="1" readonly="0">
-                    <list editable="bottom" create="false" delete="false" decoration-danger="status == 'review'"
-                          decoration-success="status == 'done' and reconciliation_status == 'matched'"
+                    <list editable="bottom" create="false" delete="false" decoration-danger="status == 'review' and reconciliation_status != 'matched'"
+                          decoration-success="reconciliation_status == 'matched'"
                           decoration-warning="status == 'done' and reconciliation_status == 'pending'">
                         <field name="selected" readonly="status != 'ready'"/>
-                        <field name="status"/><field name="reconciliation_status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
+                        <field name="status"/><field name="reconciliation_status"/><field name="kind"/><field name="source_reference"/><field name="current_order_id"/>
+                        <field name="last_preview_at" optional="hide"/><field name="last_apply_at" optional="hide"/>
+                        <field name="last_error" optional="show"/>
                         <field name="transaction_ids" widget="many2many_tags" optional="hide"/>
                         <field name="detail"/>
                         <button name="action_open_details" string="Details" type="object"/>
-                        <button name="action_open_order" string="Open Order" type="object" invisible="not order_id"/>
+                        <button name="action_open_order" string="Open Order" type="object" invisible="not current_order_id"/>
                         <button name="action_open_shopify_order" string="Shopify" type="object"/>
+                        <button name="action_refresh_case" string="Refresh Case" type="object"/>
                     </list>
                 </field>
                 <footer>
@@ -54,14 +74,22 @@
         <field name="name">shopify.payout.repair.case.form</field>
         <field name="model">shopify.payout.repair.line.ept</field>
         <field name="arch" type="xml">
-            <form create="false" edit="false">
-                <group><field name="status"/><field name="reconciliation_status"/><field name="kind"/><field name="source_reference"/><field name="order_id"/>
+            <form create="false" edit="false" delete="false">
+                <group><field name="status"/><field name="reconciliation_status"/><field name="kind"/><field name="source_reference"/><field name="current_order_id"/>
+                    <field name="last_preview_at"/><field name="last_apply_at"/><field name="last_error"/>
                     <field name="transaction_ids" widget="many2many_tags"/>
                     <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
                     <field name="collection_move_ids" widget="many2many_tags"/></group>
                 <field name="detail"/><field name="review_html" nolabel="1"/>
-                <footer><button name="action_open_order" type="object" string="Open Order" invisible="not order_id"/>
+                <field name="history_ids" readonly="1">
+                    <list create="false" edit="false" delete="false" default_order="id desc">
+                        <field name="create_date"/><field name="create_uid"/><field name="operation"/>
+                        <field name="status"/><field name="reconciliation_status"/><field name="detail"/>
+                    </list>
+                </field>
+                <footer><button name="action_open_order" type="object" string="Open Order" invisible="not current_order_id"/>
                     <button name="action_open_shopify_order" type="object" string="Open Shopify Order"/>
+                    <button name="action_refresh_case" type="object" string="Refresh Case" groups="account.group_account_manager"/>
                     <button name="action_back_to_bulk_repair" type="object" string="Back to Bulk Repair" class="btn-primary"/>
                     <button string="Close" special="cancel"/></footer>
             </form>
@@ -77,19 +105,58 @@
             </xpath>
             <xpath expr="//notebook" position="inside">
                 <page string="Bulk Repair Audit" groups="account.group_account_user">
+                    <group string="Current Repair Progress">
+                        <field name="repair_case_ids" readonly="1" nolabel="1">
+                            <list create="false" edit="false" delete="false"
+                                  decoration-danger="status == 'review' and reconciliation_status != 'matched'"
+                                  decoration-success="reconciliation_status == 'matched'">
+                                <field name="status"/><field name="reconciliation_status"/><field name="kind"/>
+                                <field name="source_reference"/><field name="current_order_id"/>
+                                <field name="last_preview_at" optional="hide"/><field name="last_apply_at" optional="hide"/>
+                                <field name="detail"/><field name="last_error" optional="show"/>
+                                <button name="action_open_details" string="Details" type="object"/>
+                                <button name="action_open_order" string="Open Order" type="object" invisible="not current_order_id"/>
+                                <button name="action_open_shopify_order" string="Shopify" type="object"/>
+                                <button name="action_refresh_case" string="Refresh Case" type="object" groups="account.group_account_manager"/>
+                            </list>
+                        </field>
+                    </group>
+                    <group string="Repair History">
+                        <field name="repair_history_ids" readonly="1" nolabel="1">
+                            <list create="false" edit="false" delete="false" default_order="id desc">
+                                <field name="create_date"/><field name="create_uid"/><field name="source_reference"/>
+                                <field name="operation"/><field name="status"/><field name="reconciliation_status"/>
+                                <field name="detail"/>
+                                <button name="action_open_order" string="Open Order" type="object"/>
+                                <button name="action_open_shopify_order" string="Shopify" type="object"/>
+                            </list>
+                            <form create="false" edit="false" delete="false">
+                                <group><field name="create_date"/><field name="create_uid"/><field name="source_reference"/>
+                                    <field name="operation"/><field name="status"/><field name="reconciliation_status"/>
+                                    <field name="order_id"/><field name="payment_ids" widget="many2many_tags"/>
+                                    <field name="credit_ids" widget="many2many_tags"/>
+                                    <field name="collection_move_ids" widget="many2many_tags"/></group>
+                                <field name="detail"/><field name="plan" widget="jsonb"/>
+                            </form>
+                        </field>
+                    </group>
+                    <group string="Applied Accounting">
                     <field name="repair_audit_ids" readonly="1">
                         <list create="false" edit="false" delete="false">
                             <field name="create_date"/><field name="create_uid"/><field name="source_order_id"/>
+                            <field name="order_id"/>
                             <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
                             <field name="collection_move_ids" widget="many2many_tags"/>
                         </list>
                         <form create="false" edit="false" delete="false">
                             <group><field name="create_date"/><field name="create_uid"/><field name="source_order_id"/>
+                                <field name="order_id"/><field name="payment_audit_id"/>
                                 <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
                                 <field name="collection_move_ids" widget="many2many_tags"/><field name="transaction_ids" widget="many2many_tags"/></group>
                             <field name="plan" widget="jsonb"/>
                         </form>
                     </field>
+                    </group>
                 </page>
             </xpath>
             <xpath expr="//field[@name='payout_transaction_ids']/list" position="inside">

@@ -233,7 +233,9 @@ class TestShopifyOpeningRefund(PayoutTestCase):
             original_lines = original_entry.line_ids
             original_matches = original_lines.matched_debit_ids | original_lines.matched_credit_ids
             wizard.action_preview()
-            self.assertEqual(len(wizard.line_ids), 4)
+            self.assertEqual(len(wizard.line_ids), 5)
+            self.assertEqual(len(wizard.line_ids.filtered(lambda line: line.status == 'ready')), 4)
+            self.assertEqual(wizard.line_ids.filtered(lambda line: line.kind == 'collection').reconciliation_status, 'matched')
             wizard.action_apply()
         self.assertTrue(all(statements.mapped('is_reconciled')))
         self.assertEqual(payout.payout_statement_line_ids, statements)

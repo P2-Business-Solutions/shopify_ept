@@ -20,6 +20,10 @@ class TestShopifyPayoutRepair(PayoutTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        cls._setup_repair_data()
+
+    @classmethod
+    def _setup_repair_data(cls):
         cls.env.user.groups_id |= cls.env.ref('account.group_account_manager')
         cls.instance.shopify_transaction_payment_sync = True
         cls.outstanding, cls.receivable, cls.revenue, cls.adjustment_revenue = cls.env['account.account'].create([

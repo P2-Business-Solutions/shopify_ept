@@ -32,7 +32,8 @@ class ShopifyHistoricalCollectionLine(models.Model):
     def _historical_collection_entry(self):
         """Resolve either opening receipt/refund; retain the existing receipt API."""
         self.ensure_one()
-        audits = self.env['shopify.payout.repair.audit.ept'].search([('transaction_ids', 'in', self.ids)])
+        audits = self.env['shopify.payout.repair.audit.ept'].search([('transaction_ids', 'in', self.ids)]).filtered(
+            lambda audit: (audit.plan or {}).get('kind') in ('collection', 'opening_refund'))
         moves = self.env['account.move'].search([
             ('shopify_instance_id', '=', self.payout_id.instance_id.id),
             ('shopify_legacy_collection_transaction_id', '=', self.source_order_transaction_id),
@@ -260,7 +261,8 @@ class ShopifyHistoricalCollectionPayout(models.Model):
         transaction = statement.payout_line_id
         if transaction._historical_collection_entry() != move:
             raise UserError(_('The clearing entry does not belong to this payout cash transaction.'))
-        audit = self.env['shopify.payout.repair.audit.ept'].search([('transaction_ids', 'in', transaction.ids)])
+        audit = self.env['shopify.payout.repair.audit.ept'].search([
+            ('transaction_ids', 'in', transaction.ids), ('collection_move_ids', 'in', move.ids)])
         outstanding = move.line_ids.filtered(lambda line: line.account_id.id == audit.plan['outstanding_id'])
         liquidity, suspense, counterpart = statement._seek_for_lines()
         if (statement.payout_id != self or statement.journal_id != move.journal_id
