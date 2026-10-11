@@ -1,5 +1,51 @@
 # Accounting review — 18.0.3.18
 
+## Guided closeout and invoice receipt correction — 18.0.3.36
+
+Validated October 11, 2026 in a disposable Odoo **18.0-20260908 Community** /
+PostgreSQL 16 database with the actual Shopify connector, common connector library,
+sale order type, delivery hold, Manufacturing, Payment Payout Reconciliation and
+Loop Returns. Fresh installation and subsequent module upgrades loaded the new
+fields, error routes, history selection and workspace/payment views. Production
+accounting inspection remained read-only; no live repair or closeout was applied.
+
+- **233 database tests passed; 3 existing Enterprise widget tests skipped.** The
+  final module upgrade/full Shopify run reported **0 failures and 0 errors across
+  236 tests**. This includes 15 new tests for guided routes and invoice receipts.
+- **101 standalone tests passed.** Discovery reported 411 tests with 310
+  database/fixture cases skipped outside Odoo. Changed Python compiled, edited XML
+  parsed, manifest/version/data paths validated and `git diff --check` passed.
+- A synthetic single Shopify capture of **240**, two posted invoices of **90**
+  and **150**, and one fully allocated untagged **90** receipt first remained
+  blocked. The separate **Preview Invoice Receipt Correction** changed only the
+  preview. Apply retained the original receipt and reversal, recorded one exact
+  **240** receipt, retained both invoice totals and closed both receivables.
+  Repeating ordinary cash sync created no further move or audit.
+- The complete saved-case flow used **Review Payments**, applied that correction,
+  retained payment history/order audit, refreshed only its original case, matched
+  the payout statement and fee, posted its **237** net settlement and matched one
+  bank receipt. Transit residual was zero; repeat settlement reused the same move.
+  Community matching reconciled actual ledger items through the existing test
+  adapter. This is not verification of the Enterprise bank widget or live UI.
+- Automatic cash sync stayed blocked before the separate review. Multiple
+  captures/receipts, an unreconciled receipt identified only by amount, missing or
+  changed source customer mapping, a bank match added after preview and a settled
+  source-linked payout without an Odoo order link were refused. Changed capture
+  identity invalidated approval. A posting failure rolled back the reversal,
+  payment creation and allocations together.
+- Typed guidance was independent of translated error text. Missing historical
+  fulfillment produced the source-evidence route, unknown issues retained manual
+  review, and existing permission tests denied the new payment shortcut before a
+  source read. Old saved explanations/history remain; their guidance updates on
+  Refresh Case. Invoice/credit navigation creates no accounting document.
+
+In Enterprise staging, verify the new buttons with a normal accounting manager,
+the eligible invoice-receipt case through the actual payout and bank widget, and
+one remaining document/allocation/source blocker. Confirm one source receipt,
+one retained reversal, unchanged invoice totals and one deposit match. No live
+payout is claimed closed; this release adds one narrow accounting route and
+navigation/guidance to existing repair tools. See [workflow](payout-guided-closeout.md).
+
 ## Customer import from a blocked payout case — 18.0.3.35
 
 Validated October 11, 2026 in a disposable Odoo 18 Community / PostgreSQL 16

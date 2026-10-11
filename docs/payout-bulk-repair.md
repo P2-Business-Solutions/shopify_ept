@@ -1,5 +1,22 @@
 # Bulk payout exception processing
 
+### Guided closeout and invoice-sized receipts (18.0.3.36)
+
+Saved cases now show **Next Step** for common customer, payment, document, refund
+allocation and fulfillment errors. **Review Payments** opens the existing payment
+preview for that one order; **Invoices / Credits** opens its accounting documents.
+After a payment repair, **Refresh / Return to Payout Case** takes you back to the
+same saved workspace. Review the ready case and apply it to finish payout matching.
+
+A proven single invoice-sized receipt in a fully invoiced, single-capture sale
+can use **Preview Invoice Receipt Correction** before **Apply Reviewed Repair**.
+The correction retains the original receipt and its reversal, then records the
+exact source capture. Ordinary import/sync and bulk Apply do not authorize this
+additional replacement. See [eligibility and closeout steps](payout-guided-closeout.md).
+Invoice corrections, multi-account/processor credit allocations and missing source
+proof still use their existing review routes; no automatic allocation or write-off
+is introduced.
+
 ### Import the customer for a blocked historical refund (18.0.3.35)
 
 When a missing-order refund says **Import or correct the Shopify customer mapping**,

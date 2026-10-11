@@ -3,6 +3,7 @@ from urllib.parse import quote
 
 from odoo import api, Command, fields, models, _
 from odoo.exceptions import UserError
+from .shopify_repair_error import ShopifyRepairBlocked
 from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
 from .shopify_payment_plan import cash_events, fingerprint, money
@@ -174,6 +175,9 @@ class ShopifyPayoutRepairLine(models.Model):
         payload, transactions = source or self._repair_source()
         try:
             prove_historical_fulfillment(payload, cutover, timezone)
+        except ValueError as error:
+            raise ShopifyRepairBlocked(str(error), 'source') from error
+        try:
             events = cash_events(transactions, self.source_order_id, currency.name)
             if any(source_date(row['timestamp'], timezone) >= cutover for row in events if row['kind'] != 'refund'):
                 raise UserError(_('The original collection is on or after cutover. Review its normal invoice/payment accounting.'))
@@ -199,7 +203,7 @@ class ShopifyPayoutRepairLine(models.Model):
             if source_date(row['timestamp'], timezone) < cutover:
                 raise UserError(_('A refund document mixes cash transactions from before and after cutover.'))
             if row['gateway'] != 'shopify_payments':
-                raise UserError(_('A historical refund document includes another processor; review its separate settlement.'))
+                raise ShopifyRepairBlocked(_('A historical refund document includes another processor; review its separate settlement.'), 'credit')
         successful_refunds = {row['id'] for row in events if row['kind'] == 'refund'}
         quantities = {}
         originals = {str(row['id']): row for row in payload.get('line_items', [])}
@@ -220,7 +224,7 @@ class ShopifyPayoutRepairLine(models.Model):
         ]).partner_id.commercial_partner_id
         partner = order.partner_id.commercial_partner_id if order else partners
         if len(partner) != 1 or (partners and partners != partner):
-            raise UserError(_('Import or correct the Shopify customer mapping before preparing this refund.'))
+            raise ShopifyRepairBlocked(_('Import or correct the Shopify customer mapping before preparing this refund.'), 'customer')
         receivable = partner.with_company(company).property_account_receivable_id
         if (not receivable or not receivable.reconcile or receivable.account_type != 'asset_receivable'
                 or receivable.deprecated or company not in receivable.company_ids):
@@ -352,7 +356,7 @@ class ShopifyPayoutRepairLine(models.Model):
         component_accounts = self.env['account.account'].browse(sorted({account.id for part, _name, account in resolved
             if part['kind'] != 'adjustment' and account}))
         if len(component_accounts) > 1 and any(part['kind'] == 'adjustment' for part in parts):
-            raise UserError(_('The refund adjustment spans multiple revenue accounts. Review and allocate the credit manually before reconciling this refund.'))
+            raise ShopifyRepairBlocked(_('The refund adjustment spans multiple revenue accounts. Review and allocate the credit manually before reconciling this refund.'), 'credit')
         for part, name, account in resolved:
             if part['kind'] == 'adjustment' and component_accounts:
                 # Preserve the returned sale's classification, including Readers.
@@ -489,6 +493,7 @@ class ShopifyPayoutRepairHistory(models.Model):
                                  'history_id', 'payout_id', readonly=True)
     operation = fields.Selection([('preview', 'Preview / Refresh'), ('apply', 'Accounting Applied'),
                                   ('customer', 'Customer Imported / Reused'),
+                                  ('payment', 'Reviewed Payment Repair'),
                                   ('failure', 'Apply Failed'), ('match', 'Matching Result'),
                                   ('post_only', 'Posted Without Matching')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)

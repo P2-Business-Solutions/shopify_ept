@@ -161,14 +161,16 @@ class ShopifyPayoutRepair(models.Model):
                     plan = self._plan(transaction, orders, collection=True)
                     groups[('collection', transaction.id)] = [transaction, orders, plan]
             except UserError as error:
-                exceptions.append((transaction, orders if len(orders) == 1 else self.env['sale.order'], str(error)))
+                exceptions.append((transaction, orders if len(orders) == 1 else self.env['sale.order'],
+                                   str(error), getattr(error, 'repair_route', 'review')))
         values = []
         for transactions, order, historic_plan in groups.values():
-            plan, error = None, ''
+            plan, error, route = None, '', 'review'
             try:
                 plan = historic_plan or self._plan(transactions, order)
             except UserError as problem:
                 error = str(problem)
+                route = getattr(problem, 'repair_route', 'review')
             summary = error or self._summary(plan)
             values.append(dict(wizard_id=self.id, transaction_ids=[Command.set(transactions.ids)],
                                order_id=order.id, kind=historic_plan['kind'] if historic_plan else 'order',
@@ -176,12 +178,12 @@ class ShopifyPayoutRepair(models.Model):
                                    'source_name', transactions[:1].source_order_id),
                                status='review' if error else 'ready', selected=not error,
                                plan=json.loads(json.dumps(plan, default=str)) if plan else False,
-                               detail=summary))
+                               detail=summary, resolution=route))
         values.extend(dict(wizard_id=self.id, transaction_ids=[Command.set(transaction.ids)],
                            order_id=order.id,
                            source_reference=transaction.source_order_id or transaction.transaction_id,
-                           kind='review', status='review', selected=False, detail=error)
-                      for transaction, order, error in exceptions)
+                           kind='review', status='review', selected=False, detail=error, resolution=route)
+                      for transaction, order, error, route in exceptions)
         retained = self.env['shopify.payout.repair.line.ept']
         previous = self.line_ids.filtered(lambda line: bool(line.transaction_ids & refreshed))
         for value in values:
@@ -291,7 +293,8 @@ class ShopifyPayoutRepair(models.Model):
             except OperationalError:
                 raise
             except UserError as error:
-                line.write({'status': 'review', 'selected': False, 'detail': str(error), 'last_error': str(error)})
+                line.write({'status': 'review', 'selected': False, 'detail': str(error), 'last_error': str(error),
+                            'resolution': getattr(error, 'repair_route', 'review')})
                 line._record_history('failure')
                 failed += 1
         matching_issues = []
@@ -356,6 +359,12 @@ class ShopifyPayoutRepairLine(models.Model):
                              ('review', 'Needs Review')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
     detail = fields.Text(readonly=True)
+    resolution = fields.Selection([
+        ('review', 'Accounting Review'), ('customer', 'Customer Mapping'),
+        ('documents', 'Invoices / Credits'), ('credit', 'Refund Allocation'),
+        ('source', 'Source Evidence'), ('payments', 'Payment Identity'),
+        ('invoice_receipt', 'Invoice Receipt Correction')], default='review', readonly=True)
+    next_step = fields.Char(compute='_compute_next_step', string='Next Step')
     plan = fields.Json(readonly=True)
     settings_fingerprint = fields.Char(readonly=True)
     last_preview_at = fields.Datetime(string='Last Preview', readonly=True)
@@ -376,6 +385,62 @@ class ShopifyPayoutRepairLine(models.Model):
                                           'case_id', 'move_id', readonly=True, string='Opening-Balance Clearing Entries')
     reconciliation_status = fields.Selection([('matched', 'Matched'), ('pending', 'Awaiting Match')],
         compute='_compute_reconciliation_status', string='Payout Match')
+
+    @api.depends('resolution', 'status', 'reconciliation_status')
+    def _compute_next_step(self):
+        routes = {
+            'customer': _('Import Customer, then review the refreshed refund plan.'),
+            'documents': _('Open Invoices / Credits or Open Order, correct the documents, then Refresh Case.'),
+            'credit': _('Review the refund allocation and prepare/reuse its credit; Link Credit Note checks the source before matching.'),
+            'source': _('Open Shopify and verify fulfillment, cancellation and processor history, then Refresh Case.'),
+            'payments': _('Review Payments to inspect the exact source transactions and existing receipts.'),
+            'invoice_receipt': _('Review Payments, then Preview Invoice Receipt Correction; inspect the reversal before applying.'),
+            'review': _('Review Details and the recorded issue, correct the evidence/accounting, then Refresh Case.'),
+        }
+        for case in self:
+            if case.reconciliation_status == 'matched':
+                case.next_step = _('Matched. Continue with the next unmatched case.')
+            elif case.status == 'ready':
+                case.next_step = _('Review Details, then Apply Selected Ready Cases.')
+            elif case.status == 'done':
+                case.next_step = _('Accounting applied. Review the matching issue and Refresh Case to retry.')
+            else:
+                case.next_step = routes.get(case.resolution, routes['review'])
+
+    def action_review_payments(self):
+        self.ensure_one()
+        self.check_access('write')
+        self.wizard_id._check_manager()
+        order = self.current_order_id
+        if (not order or self.reconciliation_status == 'matched'
+                or self.transaction_ids.payout_id - self.wizard_id.payout_ids
+                or order.company_id != self.company_id
+                or self.transaction_ids.payout_id.instance_id != order.shopify_instance_id
+                or any(tx.source_order_id != order.shopify_order_id for tx in self.transaction_ids if not tx.shop_cash_kind)):
+            raise UserError(_('Review payments only for an unmatched case belonging to one current Shopify order.'))
+        preview = self.env['shopify.payment.repair.ept'].create({
+            'order_ids': [Command.set(order.ids)], 'repair_case_id': self.id})
+        return preview.action_preview()
+
+    def action_open_accounting_documents(self):
+        self.ensure_one()
+        self.check_access('read')
+        order = self.current_order_id
+        order.check_access('read')
+        documents = order.invoice_ids | self.credit_ids
+        if order:
+            documents |= self.env['account.move'].search([
+                ('shopify_refund_order_id', '=', order.id), ('move_type', '=', 'out_refund')])
+        documents.check_access('read')
+        if not documents:
+            return self.action_open_order()
+        action = {'type': 'ir.actions.act_window', 'res_model': 'account.move',
+                  'name': _('Case Invoices / Credits'), 'view_mode': 'list,form',
+                  'domain': [('id', 'in', documents.ids)], 'target': 'current',
+                  'context': {'create': False}}
+        if len(documents) == 1:
+            action.update(view_mode='form', res_id=documents.id)
+        return action
 
     @api.depends('transaction_ids.payout_id')
     def _compute_payout_ids(self):
