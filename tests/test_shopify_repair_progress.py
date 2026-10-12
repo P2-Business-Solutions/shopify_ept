@@ -45,6 +45,36 @@ class TestShopifyRepairProgress(PayoutTestCase):
         self.assertEqual(payout.repair_case_ids, case)
         self.assertEqual(payout.repair_history_ids.operation, 'preview')
 
+    def test_statement_action_opens_same_proposed_fix_and_preserves_saved_settings(self):
+        payout, workspace, payload, events = self._historical('statement-exceptions')
+        workspace.write({'queue_filter': 'matched', 'issue_filter': 'payments'})
+        settings = workspace._settings()
+        accounting_count = self.env['account.move'].search_count([])
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            action = payout.action_generate_bank_statement()
+        self.assertEqual(action['res_id'], workspace.id)
+        self.assertEqual(workspace._settings(), settings)
+        self.assertEqual(workspace.queue_filter, 'pending')
+        self.assertEqual(workspace.issue_filter, 'all')
+        self.assertEqual(workspace.line_ids.status, 'ready', workspace.line_ids.detail)
+        self.assertEqual(workspace.line_ids.kind, 'historical')
+        self.assertTrue(workspace.line_ids.plan)
+        self.assertFalse(workspace.line_ids.payment_ids)
+        self.assertFalse(workspace.line_ids.credit_ids)
+        # Only the cash statement is created. The proposed credit/payment remains a preview.
+        self.assertEqual(self.env['account.move'].search_count([]), accounting_count + 1)
+        self.assertEqual(payout.repair_case_ids, workspace.line_ids)
+        self.assertIn('retained', workspace.result)
+
+    def test_statement_action_keeps_accounting_if_preview_fails(self):
+        payout, workspace, payload, events = self._historical('preview-failure')
+        with patch.object(type(workspace), 'action_preview', side_effect=UserError('Preview unavailable')):
+            action = payout.action_generate_bank_statement()
+        self.assertEqual(action['tag'], 'display_notification')
+        self.assertEqual(payout.state, 'generated')
+        self.assertEqual(len(payout.payout_statement_line_ids), 1)
+        self.assertIn('Preview unavailable', payout.reimport_reconciliation_issue)
+
     def test_refresh_preserves_case_identity_and_prior_issue_history(self):
         payout, wizard, payload, events = self._historical('issue-history')
         with patch.object(type(payout.payout_transaction_ids), '_repair_source', side_effect=UserError('Missing product mapping')):

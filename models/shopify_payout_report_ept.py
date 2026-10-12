@@ -6,7 +6,7 @@ from psycopg2 import OperationalError
 
 from datetime import datetime, timedelta
 from odoo import models, fields,api, _
-from odoo.exceptions import UserError
+from odoo.exceptions import AccessError, UserError
 from .. import shopify
 from ..shopify.pyactiveresource.connection import ClientError
 import ast
@@ -402,7 +402,6 @@ class ShopifyPaymentReportEpt(models.Model):
         partner_obj = self.env['res.partner']
         bank_statement_line_obj = self.env['account.bank.statement.line']
         log_lines = []
-        account_payment_obj = self.env['account.payment']
         sale_order_obj = self.env["sale.order"]
 
         # The relation is authoritative: flags can be stale after an interrupted
@@ -460,36 +459,7 @@ class ShopifyPaymentReportEpt(models.Model):
                     continue
 
             partner = partner_obj._find_accounting_partner(order_id.partner_id)
-            exact_payment = self.find_payment_for_payout_transaction(transaction)
-            invoice = self.env["account.move"]
-            if exact_payment:
-                reference = exact_payment.name
-                if "reconciled_invoice_ids" in exact_payment._fields:
-                    payment_invoices = exact_payment.reconciled_invoice_ids
-                elif "invoice_ids" in exact_payment._fields:
-                    payment_invoices = exact_payment.invoice_ids
-                else:
-                    payment_invoices = self.env["account.move"]
-                invoice = payment_invoices.filtered(
-                    lambda move: move.state == "posted"
-                )[:1]
-            else:
-                reviewed_ids = self.env.context.get('shopify_bulk_repaired_line_ids')
-                if (reviewed_ids is not None and transaction.transaction_type in ('charge', 'refund', 'payment_refund')):
-                    # Financial documents were reviewed by the bulk planner.
-                    # Generation only creates statement rows, including for the
-                    # cases deliberately left unselected or blocked.
-                    domain = []
-                else:
-                    domain, invoice, log_line = self.check_for_invoice_refund(transaction, log_lines)
-                # An ambiguous invoice is not suitable for statement metadata.
-                if len(invoice) != 1:
-                    invoice = self.env['account.move']
-                if domain:
-                    payment_reference = account_payment_obj.search(domain, limit=1)
-                    reference = payment_reference.name if payment_reference else invoice.name or ''
-                else:
-                    reference = transaction.order_id.name
+            reference, invoice, needs_review = self._payout_statement_metadata(transaction, log_lines)
 
             if transaction.amount:
                 name = False
@@ -505,7 +475,7 @@ class ShopifyPaymentReportEpt(models.Model):
                 counter_part_account_id = self.instance_id.transaction_line_ids.filtered(lambda l: l.transaction_type
                                                                                                    ==
                                                                                                    transaction.transaction_type).account_id
-                if transaction.shop_cash_kind:
+                if transaction.shop_cash_kind or needs_review:
                     # Keep this open for matching actual payments, even if a
                     # generic credit/debit account has been configured.
                     counter_part_account_id = self.env['account.account']
@@ -533,14 +503,62 @@ class ShopifyPaymentReportEpt(models.Model):
 
         if log_lines:
             self.set_payout_log_line(log_lines)
-
-            note = "Bank statement lines are generated but will not reconcile automatically for Transaction IDs : "
-            for log_line in log_lines:
-                note += ',' + log_line.get('message').split()[2] if log_line.get('message') else ''
+            self.reimport_reconciliation_issue = '\n'.join(
+                dict.fromkeys(line['message'] for line in log_lines))
+            note = _('Bank statement lines were generated. Some transactions need review. '
+                     'Use Bulk Repair Transactions to preview their proposed fixes.')
             self.message_post(body=note)
             if self.instance_id.is_shopify_create_schedule:
                 self.common_log_line_ids.create_payout_schedule_activity(note, self)
         return True
+
+    def _payout_transaction_exception(self, transaction, error):
+        """Identify the failed source row and its existing reviewed repair path."""
+        return {
+            'message': _('Payout transaction %(transaction)s (order %(order)s): %(error)s\n'
+                         'Open Bulk Repair Transactions to review the exception and proposed fixes.',
+                         transaction=(transaction.transaction_id or transaction.transaction_type) if transaction else '-',
+                         order=(transaction.order_id.name or transaction.source_order_id or '-') if transaction else '-',
+                         error=str(error)),
+            'shopify_payout_report_line_id': transaction.id if transaction else False,
+        }
+
+    def _payout_statement_metadata(self, transaction, log_lines):
+        """Roll back blocked refund/payment work, then leave its cash row unmatched."""
+        metadata_logs = []
+        try:
+            with self.env.cr.savepoint():
+                invoice = self.env['account.move']
+                payment = self.find_payment_for_payout_transaction(transaction)
+                if payment:
+                    reference = payment.name
+                    if 'reconciled_invoice_ids' in payment._fields:
+                        invoices = payment.reconciled_invoice_ids
+                    elif 'invoice_ids' in payment._fields:
+                        invoices = payment.invoice_ids
+                    else:
+                        invoices = self.env['account.move']
+                    invoice = invoices.filtered(lambda move: move.state == 'posted')[:1]
+                else:
+                    reviewed = self.env.context.get('shopify_bulk_repaired_line_ids')
+                    if reviewed is not None and transaction.transaction_type in ('charge', 'refund', 'payment_refund'):
+                        domain = []
+                    else:
+                        domain, invoice, _logs = self.check_for_invoice_refund(transaction, metadata_logs)
+                    if len(invoice) != 1:
+                        invoice = self.env['account.move']
+                    if domain:
+                        payment = self.env['account.payment'].search(domain, limit=1)
+                        reference = payment.name if payment else invoice.name or ''
+                    else:
+                        reference = transaction.order_id.name
+        except (OperationalError, AccessError):
+            raise
+        except UserError as error:
+            log_lines.append(self._payout_transaction_exception(transaction, error))
+            return transaction.order_id.name, self.env['account.move'], True
+        log_lines.extend(metadata_logs)
+        return reference, invoice, bool(metadata_logs)
 
     def find_payment_for_payout_transaction(self, transaction):
         """Match a charge or refund independently, including across payout dates."""
@@ -809,7 +827,7 @@ class ShopifyPaymentReportEpt(models.Model):
                 if move_line_ids:
                     with self.env.cr.savepoint():
                         self.shopify_reconcile_bank_statement_line_ept(statement_line.id, move_line_ids)
-            except OperationalError:
+            except (OperationalError, AccessError):
                 # Odoo must retry serialization/deadlock failures as a whole request.
                 raise
             except Exception as error:
@@ -951,6 +969,8 @@ class ShopifyPaymentReportEpt(models.Model):
                                     statement_line, refreshed_payment)
                             else:
                                 if not invoices:
+                                    log_lines.append(self._payout_transaction_exception(payout_transaction,
+                                        _('No posted invoice/credit or exact Shopify cash payment is available.')))
                                     continue
                                 paid_invoices = invoices.filtered(lambda x: x.reconciled_payment_ids)
                                 unpaid_invoices = invoices.filtered(
@@ -968,58 +988,47 @@ class ShopifyPaymentReportEpt(models.Model):
                         log_line = self.reconcile_other_transactions(statement_line, move_line_data, log_lines)
                     # if log_line:
                     #     log_lines.append(log_line)
-            except OperationalError:
+            except (OperationalError, AccessError):
                 raise
             except Exception as error:
-                if reviewed_ids is not None:
-                    matching_errors.append('%s: %s' % (statement_line.payment_ref, error))
-                if self._context.get("cron_process"):
-                    message = ("System tried to automatically reconcile but encountered an error while processing the statement line: %s \n"
-								"Action Items:\n"
-								"- Verify the payment details.\n"
-								"- Perform manual reconciliation if needed.") % (statement_line.payment_ref + ".\n" + str(error))
-                    transaction_line = self.payout_transaction_ids.filtered(
-                        lambda x: x.transaction_type == statement_line.shopify_transaction_type and
-                                  x.transaction_id == statement_line.shopify_transaction_id and x.amount ==
-                                  statement_line.amount)
-                    log_lines.append({"message": message,
-                                      "shopify_payout_report_line_id": transaction_line.id})
+                if isinstance(error, UserError) or self._context.get('cron_process'):
+                    log_lines.append(self._payout_transaction_exception(statement_line.payout_line_id, error))
                 else:
-                    raise UserError(error)
+                    raise
         if log_lines:
             self.set_payout_log_line(log_lines)
-            note = ""
-            for log_line in self.common_log_line_ids:
-                note += str(log_line.message) + "<br/>"
+            note = _('Some payout transactions remain unmatched. '
+                     'Open Bulk Repair Transactions to review the exceptions and proposed fixes.')
             self.message_post(body=note)
 
             if self.instance_id.is_shopify_create_schedule:
                 self.common_log_line_ids.create_payout_schedule_activity(note, self)
 
-        if statement_lines.filtered(lambda x: not x.is_reconciled):
+        if not self.check_process_statement():
+            self.write({'state': 'partially_generated'})
+            matching_errors.append(_('Some payout transactions still need bank statement lines.'))
+        elif statement_lines.filtered(lambda x: not x.is_reconciled):
             self.write({'state': 'partially_processed'})
-        elif reviewed_ids is not None:
+        else:
             try:
                 # Preserve exact transaction matches when only the final payout
                 # totals/settlement configuration need review.
                 with self.env.cr.savepoint():
                     self.write({'state': 'processed'})
                     self.validate_statement()
-            except OperationalError:
+            except (OperationalError, AccessError):
                 raise
             except UserError as error:
                 self.write({'state': 'partially_processed'})
                 matching_errors.append(str(error))
-        else:
-            self.write({'state': 'processed'})
-            self.validate_statement()
-
         if reviewed_ids is not None:
             reviewed = statement_lines.filtered(lambda line: line.payout_line_id.id in reviewed_ids)
             pending = reviewed.filtered(lambda line: not line.is_reconciled)
             if pending:
                 matching_errors.append(_('%s reviewed payout transaction(s) still need reconciliation.', len(pending)))
-            self.reimport_reconciliation_issue = '\n'.join(matching_errors) or False
+
+        self.reimport_reconciliation_issue = '\n'.join(dict.fromkeys(
+            [line['message'] for line in log_lines] + matching_errors)) or False
 
         return True
 
@@ -1134,6 +1143,7 @@ class ShopifyPaymentReportEpt(models.Model):
             self.env["common.log.lines.ept"].create_common_log_line_ept(shopify_instance_id=self.instance_id.id,
                                                                         module="shopify_ept",
                                                                         message=log_line.get('message'),
+                                                                        shopify_payout_report_line_id=self.id,
                                                                         model_name=self._name)
 
         return True

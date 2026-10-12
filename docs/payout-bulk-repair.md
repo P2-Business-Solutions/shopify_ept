@@ -1,5 +1,42 @@
 # Bulk payout exception processing
 
+### Statement exceptions and proposed fixes (18.0.3.38)
+
+**Generate Bank Statement** now retains a cash statement row when an automatic
+refund/payment import is blocked. That import's incomplete credit/payment changes
+roll back together; the statement row stays unmatched and the other transactions
+and selected payouts continue. Generation still reports **Generated** when every
+nonzero cash row exists; **Partially Processed** describes reconciliation with
+unmatched rows remaining.
+
+**Reconcile Bank Statement** retains successful matches when another transaction
+has an accounting blocker. The payout warning identifies each failed transaction
+and the original reason. Its log entries are linked to the payout. Retrying skips
+existing statement rows and matches, and clears resolved processing warnings.
+
+For an accounting manager, either button opens the existing saved **Bulk Repair
+Transactions** workspace when exceptions remain and refreshes its preview. It
+retains the saved cutover, journals, opening-balance choices and repair history,
+and shows unmatched cases with the same **Details**, **Next Step**, payment/document
+shortcuts and proposed fixes as a normal bulk preview. Opening it does not apply
+repairs; review the proposals before **Apply Selected Ready Cases**. Use
+**Review Exceptions / Proposed Fixes** on the payout warning to refresh/reopen
+this preview later. Non-manager users retain the statements and receive a warning;
+an accounting manager prepares the repair preview.
+
+Global journal/currency configuration errors, access failures and database retry
+conflicts still propagate. If the follow-up repair preview itself needs review,
+the completed statement work remains saved and the payout warning explains why.
+Scheduled and internal generation/reconciliation callers retain their existing
+return values and do not open a dialog.
+
+Validated in a disposable Odoo 18 Community/PostgreSQL database: all 247 connector
+integration tests passed, including blocked-refund rollback, retained fee matches,
+repeatable generation, saved preview/settings and reimport warnings. All 114
+standalone tests also passed. Community accounting tests use their existing ledger
+matcher in place of the Enterprise reconciliation widget; the production UI was
+not exercised or deployed.
+
 ### Focused backlog controls and evidence (18.0.3.37)
 
 The saved workspace has **Show Cases** and **Issue** filters, **Clear Selection**,

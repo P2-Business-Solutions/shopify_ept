@@ -584,8 +584,8 @@ class TestShopCashSettlement(PayoutTestCase):
         payout = self._cash_payout('incomplete', [{'order': {'id': 'present'}, 'amount': '40'},
             {'order': {'id': 'missing'}, 'amount': '25'}])
         payout.generate_bank_statement()
-        with self.assertRaisesRegex(UserError, 'missing Shop Cash order'):
-            self._process(payout)
+        self._process(payout)
+        self.assertIn('missing Shop Cash order', payout.reimport_reconciliation_issue)
         self.assertFalse(payment._seek_for_lines()[0].reconciled)
         self.assertFalse(self._statement_lines(payout).is_reconciled)
         self.assertNotEqual(payout.state, 'validated')
@@ -631,8 +631,8 @@ class TestShopCashSettlement(PayoutTestCase):
         self._process(first)
         second = self._cash_payout('repeat-second', [{'order_transaction_id': 'repeat-cash', 'amount': '40'}])
         second.generate_bank_statement()
-        with self.assertRaisesRegex(UserError, 'already settled'):
-            self._process(second)
+        self._process(second)
+        self.assertIn('already settled', second.reimport_reconciliation_issue)
         self.assertNotEqual(second.state, 'validated')
 
     def test_graphql_fallback_verifies_exact_balance_and_retains_transaction_ids(self):
@@ -733,12 +733,12 @@ class TestShopCashSettlement(PayoutTestCase):
     def test_missing_details_and_reversal_require_review(self):
         payout = self._cash_payout('missing-details', [], amount=40)
         payout.generate_bank_statement()
-        with self.assertRaisesRegex(UserError, 'Reimport'):
-            self._process(payout)
+        self._process(payout)
+        self.assertIn('Reimport', payout.reimport_reconciliation_issue)
         transaction = payout.payout_transaction_ids.filtered('shop_cash_kind')
         transaction.raw_transaction_type = 'shop_cash_credit_reversal'
-        with self.assertRaisesRegex(UserError, 'reversals require'):
-            self._process(payout)
+        self._process(payout)
+        self.assertIn('reversals require', payout.reimport_reconciliation_issue)
 
     def test_graphql_permission_error_keeps_shop_cash_open_for_review(self):
         payout = self._cash_payout('permissions', [], amount=40)

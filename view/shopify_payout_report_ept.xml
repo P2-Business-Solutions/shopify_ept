@@ -59,11 +59,11 @@
             <form create="false">
                 <header>
 
-                    <button name="generate_bank_statement" string="Generate Bank Statement"
+                    <button name="action_generate_bank_statement" string="Generate Bank Statement"
                             invisible="state not in ['draft','partially_generated']"
                             class="oe_highlight" help="Click Here To Generate Bank Statement"
                             type="object"/>
-                    <button name="process_bank_statement" string="Reconcile Bank Statement"
+                    <button name="action_process_bank_statement" string="Reconcile Bank Statement"
                             invisible="state not in ['generated','partially_processed']"
                             class="oe_highlight" help="Click Here To Process Bank Statement"
                             type="object"/>
@@ -95,6 +95,8 @@
                 </div>
                 <div class="alert alert-warning" role="alert" invisible="not reimport_reconciliation_issue">
                     <field name="reimport_reconciliation_issue" readonly="1" nolabel="1"/>
+                    <button name="action_review_payout_exceptions" type="object" string="Review Exceptions / Proposed Fixes"
+                            groups="account.group_account_manager" class="btn-secondary"/>
                 </div>
                 <sheet>
                     <div class="oe_title" style="width:500px;">
@@ -242,8 +244,7 @@
         <field name="state">code</field>
         <field name="code">
 if records:
-    records.generate_bank_statement()
-    action = {'type': 'ir.actions.client', 'tag': 'reload'}
+    action = records.action_generate_bank_statement()
         </field>
     </record>
 

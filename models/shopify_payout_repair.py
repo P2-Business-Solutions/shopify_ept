@@ -3,6 +3,7 @@ from urllib.parse import quote
 
 from odoo import api, Command, fields, models, _
 from odoo.exceptions import UserError
+from psycopg2 import OperationalError
 from .shopify_repair_error import ShopifyRepairBlocked
 from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
@@ -478,6 +479,53 @@ class ShopifyPayoutRepair(models.Model):
                 'payout_ids': [Command.set(self.ids)]})
         wizard.line_ids.invalidate_recordset(['current_order_id', 'reconciliation_status'])
         return wizard._reopen()
+
+    def action_generate_bank_statement(self):
+        self.generate_bank_statement()
+        return self.action_review_payout_exceptions()
+
+    def action_process_bank_statement(self):
+        self.process_bank_statement()
+        return self.action_review_payout_exceptions()
+
+    def action_review_payout_exceptions(self):
+        """Offer the existing bulk plans after retaining successful statement work."""
+        self.check_access('write')
+        payouts = self.filtered(lambda payout: payout.reimport_reconciliation_issue
+                                or payout.state in ('partially_generated', 'partially_processed'))
+        reload_action = {'type': 'ir.actions.client', 'tag': 'reload'}
+        if not payouts:
+            return reload_action
+        if (self.env.user.has_group('account.group_account_manager')
+                and len(payouts.instance_id.shopify_company_id) == 1):
+            try:
+                # A preview failure must not undo completed accounting or matches.
+                # Reuse the saved cutover/accounts and the same planner as Bulk Repair.
+                with self.env.cr.savepoint():
+                    action = payouts.action_bulk_repair_transactions()
+                    workspace = self.env['shopify.payout.repair.ept'].browse(action['res_id'])
+                    workspace.write({'queue_filter': 'pending', 'issue_filter': 'all'})
+                    action = workspace.action_preview()
+                    workspace.result = '\n'.join(filter(None, [
+                        _('Statement lines and successful matches were retained.'), workspace.result,
+                        *('%s: %s' % (payout.display_name, payout.reimport_reconciliation_issue)
+                          for payout in payouts if payout.reimport_reconciliation_issue)]))
+                return action
+            except OperationalError:
+                raise
+            except UserError as error:
+                for payout in payouts:
+                    payout.reimport_reconciliation_issue = '\n'.join(filter(None, [
+                        payout.reimport_reconciliation_issue,
+                        _('Repair preview needs review: %s', str(error))]))
+        return {
+            'type': 'ir.actions.client', 'tag': 'display_notification',
+            'params': {'title': _('Payout Exceptions'), 'type': 'warning', 'sticky': True,
+                       'message': _('Statement lines and successful matches were retained. '
+                                    'Review the payout warnings. An accounting manager can open '
+                                    'Bulk Repair Transactions for each company to preview proposed fixes.'),
+                       'next': reload_action},
+        }
 
 
 class ShopifyPayoutRepairHistory(models.Model):

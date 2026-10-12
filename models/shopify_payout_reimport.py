@@ -12,8 +12,9 @@ class ShopifyPayoutReimport(models.Model):
     _inherit = 'shopify.payout.report.ept'
 
     reimport_reconciliation_issue = fields.Text(
-        string='Payout Reimport Review', readonly=True, copy=False,
-        help='Why automatic reconciliation was skipped or needs review after reimporting this payout.')
+        string='Payout Exceptions', readonly=True, copy=False,
+        help='Transactions or payout configuration that need review after statement generation, '
+             'reconciliation or reimport. Use Bulk Repair Transactions to preview proposed fixes.')
 
     def _check_payout_reimport_period(self):
         """Never use a user lock exception or shift a payout into another period."""
@@ -161,6 +162,8 @@ class ShopifyPayoutReimport(models.Model):
                 # If final validation fails, keep the earlier atomic Shop Cash repairs.
                 with self.env.cr.savepoint():
                     self.with_context(cron_process=True).process_bank_statement()
+                    if self.reimport_reconciliation_issue:
+                        issues.append(self.reimport_reconciliation_issue)
             except OperationalError:
                 raise
             except UserError as error:

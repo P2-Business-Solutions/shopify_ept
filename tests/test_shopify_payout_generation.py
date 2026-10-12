@@ -1,6 +1,7 @@
 """Accounting integration coverage for repeatable payout generation."""
 
 import unittest
+from unittest.mock import patch
 
 try:
     from odoo import Command, fields
@@ -130,12 +131,18 @@ class TestShopifyPayoutGeneration(PayoutTestCase):
         self.assertFalse(self._statement_lines(payout))
 
     def test_bulk_action_generates_multiple_payouts_and_is_repeatable(self):
+        self.env.user.groups_id |= self.env.ref('account.group_account_manager')
         payouts = self._payout('bulk-1') | self._payout('bulk-2')
         action = self.env.ref('shopify_ept.action_generate_shopify_payout_statements')
-        result = action.with_context(
-            active_model=payouts._name, active_ids=payouts.ids,
-        ).run()
-        self.assertEqual(result['tag'], 'reload')
+        with patch.object(type(payouts.payout_transaction_ids), '_repair_source',
+                          side_effect=UserError('Missing source order')):
+            result = action.with_context(
+                active_model=payouts._name, active_ids=payouts.ids,
+            ).run()
+        self.assertEqual(result['res_model'], 'shopify.payout.repair.ept')
+        workspace = self.env[result['res_model']].browse(result['res_id'])
+        self.assertEqual(workspace.payout_ids, payouts)
+        self.assertEqual(len(workspace.line_ids), 2)
         lines = self._statement_lines(payouts)
         self.assertEqual(len(lines), 4)
         for payout in payouts:
@@ -143,6 +150,59 @@ class TestShopifyPayoutGeneration(PayoutTestCase):
             self.assertEqual(sum(self._statement_lines(payout).mapped('amount')), 97)
         payouts.generate_bank_statement()
         self.assertEqual(self._statement_lines(payouts), lines)
+
+    def test_blocked_refund_rolls_back_its_credit_and_generates_other_payout_rows(self):
+        from ..models.shopify_repair_error import ShopifyRepairBlocked
+        payout = self._payout('blocked-refund')
+        other = self._payout('healthy-payout')
+        partner = self.env['res.partner'].create({'name': 'Blocked Refund Customer'})
+        order = self.env['sale.order'].create({'partner_id': partner.id,
+            'shopify_instance_id': self.instance.id, 'shopify_order_id': 'blocked-order'})
+        transaction = payout.payout_transaction_ids.filtered(lambda line: line.transaction_type == 'charge')
+        transaction.write({'transaction_type': 'refund', 'amount': -45,
+                           'order_id': order.id, 'source_order_id': order.shopify_order_id})
+        payout.amount = -48
+        sales = self.env['account.journal'].create({'name': 'Blocked Refund Sales', 'code': 'BLKR',
+            'type': 'sale', 'company_id': self.env.company.id})
+        original = type(payout).check_for_invoice_refund
+        def refund(model, row, logs):
+            if row == transaction:
+                self.env['account.move'].create({'move_type': 'out_refund', 'journal_id': sales.id,
+                    'partner_id': partner.id, 'ref': 'must-rollback-blocked-refund'})
+                raise ShopifyRepairBlocked('Existing payments do not match Shopify cash history', 'payments')
+            return original(model, row, logs)
+        with patch.object(type(payout), 'check_for_invoice_refund', refund):
+            (payout | other).generate_bank_statement()
+        self.assertEqual(len(self._statement_lines(payout | other)), 4)
+        statement = self._statement_lines(payout).filtered(lambda row: row.payout_line_id == transaction)
+        self.assertFalse(statement.is_reconciled)
+        self.assertFalse(statement.refund_invoice_id)
+        self.assertFalse(self.env['account.move'].search([('ref', '=', 'must-rollback-blocked-refund')]))
+        self.assertEqual(payout.state, 'generated')
+        self.assertIn(transaction.transaction_id, payout.reimport_reconciliation_issue)
+        self.assertIn('Existing payments', payout.common_log_line_ids.message)
+        lines = self._statement_lines(payout | other)
+        (payout | other).generate_bank_statement()
+        self.assertEqual(self._statement_lines(payout | other), lines)
+
+        def match_fee(model, fee_statement, _data, logs):
+            _liquidity, suspense, _counterpart = fee_statement._seek_for_lines()
+            suspense.account_id = model.instance_id.transaction_line_ids.filtered(
+                lambda row: row.transaction_type == 'fees').account_id
+            fee_statement.move_id.checked = True
+            return logs
+        with patch.object(type(payout), 'get_invoices_for_reconcile',
+                          side_effect=ShopifyRepairBlocked('Existing payments need accounting review', 'payments')), \
+                patch.object(type(payout), 'reconcile_other_transactions', match_fee):
+            payout.process_bank_statement()
+            fee_statement = self._statement_lines(payout) - statement
+            self.assertTrue(fee_statement.is_reconciled)
+            self.assertFalse(statement.is_reconciled)
+            self.assertEqual(payout.state, 'partially_processed')
+            fee_items = fee_statement.line_ids
+            payout.process_bank_statement()
+            self.assertEqual(fee_statement.line_ids, fee_items)
+        self.assertIn('Existing payments need accounting review', payout.reimport_reconciliation_issue)
 
     def test_stale_remaining_flags_do_not_duplicate_existing_lines(self):
         payout = self._payout('stale-flags')
