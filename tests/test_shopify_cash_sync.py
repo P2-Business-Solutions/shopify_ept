@@ -634,6 +634,221 @@ class TestShopifyCashSync(PayoutTestCase):
         invoice.matched_payment_ids |= payment
         return payment
 
+    def _split_invoice_receipt(self):
+        order, first, payload, events = self._fixture(gross=True, retained=90, removed=150)
+        first.button_draft()
+        line = first.invoice_line_ids.filtered(lambda row: row.name == 'removed')
+        second = self.env['account.move'].create({
+            'journal_id': self.sales_journal.id, 'move_type': 'out_invoice',
+            'partner_id': self.partner.id, 'invoice_date': first.invoice_date, 'date': first.date,
+            'shopify_instance_id': self.instance.id, 'invoice_line_ids': [Command.create({
+            'product_id': line.product_id.id, 'name': line.name, 'account_id': line.account_id.id,
+            'quantity': 1, 'price_unit': 150, 'tax_ids': [Command.clear()],
+            'sale_line_ids': [Command.set(line.sale_line_ids.ids)],
+        })]})
+        line.unlink()
+        first.action_post()
+        second.action_post()
+        self.assertEqual((first | second).mapped('amount_total'), [90, 150])
+        self.assertEqual(order.invoice_ids, first | second)
+        payload['refunds'] = []
+        payload['customer'] = {'id': 'split-invoice-customer'}
+        self.env['shopify.res.partner.ept'].create({
+            'shopify_instance_id': self.instance.id, 'shopify_customer_id': 'split-invoice-customer',
+            'partner_id': self.partner.id})
+        legacy = self._legacy(first, 90)
+        return order, first | second, payload, events[:1], legacy
+
+    def test_invoice_receipt_needs_separate_review_and_reverses_before_source_capture(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        original = legacy.move_id
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            count = self.env['account.move'].search_count([])
+            preview = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            self.assertEqual(preview.state, 'blocked')
+            self.assertTrue(preview.invoice_receipt_available, preview.preview_html)
+            self.assertFalse(preview.allow_invoice_receipt)
+            with self.assertRaises(UserError):
+                preview.action_apply()
+            preview.action_preview_invoice_receipt()
+            self.assertEqual(preview.state, 'preview', preview.preview_html)
+            self.assertIn('Invoice receipt correction', preview.preview_html)
+            self.assertEqual(preview.plan_json[0]['replacement_basis'], 'invoice_receipt')
+            self.assertEqual(self.env['account.move'].search_count([]), count)
+            preview.action_apply()
+            payments = self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)])
+            self.assertEqual(payments.amount, 240)
+            self.assertEqual(payments.shopify_order_transaction_id, events[0]['id'])
+            self.assertEqual(legacy.state, 'canceled')
+            self.assertEqual(original.state, 'posted')
+            self.assertEqual(len(original.reversal_move_ids), 1)
+            self.assertEqual(invoices.mapped('amount_total'), [90, 150])
+            self.assertTrue(all(invoices.currency_id.is_zero(move.amount_residual) for move in invoices))
+            self.assertEqual(payments._seek_for_lines()[0].amount_residual, 240)
+            self.assertEqual(order.shopify_payment_audit_ids.replaced_payment_ids, legacy)
+            count = self.env['account.move'].search_count([])
+            order._sync_shopify_cash()
+            self.assertEqual(self.env['account.move'].search_count([]), count)
+            self.assertEqual(len(order.shopify_payment_audit_ids), 1)
+
+    def test_invoice_receipt_does_not_expand_automatic_sync(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaises(UserError):
+                order._sync_shopify_cash()
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_invoice_receipt_rejects_partial_allocation_and_amount_only_identity(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        legacy.move_id.line_ids.remove_move_reconcile()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(repair=True, allow_invoice_receipt=True)
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+
+    def test_invoice_receipt_rejects_multiple_captures_even_when_total_agrees(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        events = [dict(events[0], amount='100.00'), dict(events[0], id='other-capture', amount='140.00')]
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(repair=True, allow_invoice_receipt=True)
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+
+    def test_invoice_receipt_rejects_multiple_existing_receipts(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        extra = self._legacy(invoices[1], 150)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(repair=True, allow_invoice_receipt=True)
+        self.assertFalse((legacy | extra).move_id.reversal_move_ids)
+
+    def test_invoice_receipt_rejects_bank_match_added_after_preview(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            preview = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            preview.action_preview_invoice_receipt()
+            statement = self.env['account.bank.statement.line'].create({
+                'journal_id': self.journal.id, 'date': legacy.date, 'amount': 90,
+                'payment_ref': 'Previously matched receipt', 'counterpart_account_id': self.outstanding.id})
+            (legacy._seek_for_lines()[0] | statement.line_ids.filtered(lambda row: row.account_id == self.outstanding)).reconcile()
+            with self.assertRaises(UserError):
+                preview.action_apply()
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+        self.assertTrue(statement.is_reconciled)
+
+    def test_invoice_receipt_rejects_settled_payout_without_order_link(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        payout = self._payout('source-linked-settled')
+        payout.payout_transaction_ids.filtered(lambda tx: tx.transaction_type == 'charge').write({
+            'source_order_id': order.shopify_order_id, 'source_order_transaction_id': events[0]['id'],
+            'order_id': False})
+        payout.settlement_move_id = self.env['account.move'].create({
+            'journal_id': self.sales_journal.id, 'date': invoices[0].date})
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'settlement transfer'):
+                order._build_shopify_cash_plan(repair=True, allow_invoice_receipt=True)
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+
+    def test_invoice_receipt_changed_capture_invalidates_approval(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            preview = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            preview.action_preview_invoice_receipt()
+            events[0]['id'] = 'changed-capture'
+            with self.assertRaisesRegex(UserError, 'changed after preview'):
+                preview.action_apply()
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+
+    def test_invoice_receipt_requires_exact_source_customer_mapping(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        payload['customer']['id'] = 'another-source-customer'
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(repair=True, allow_invoice_receipt=True)
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+
+    def test_invoice_receipt_changed_customer_mapping_invalidates_approval(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            preview = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            preview.action_preview_invoice_receipt()
+            mapping = self.env['shopify.res.partner.ept'].search([
+                ('shopify_instance_id', '=', self.instance.id), ('shopify_customer_id', '=', 'split-invoice-customer')])
+            mapping.partner_id = self.env['res.partner'].create({'name': 'Another receipt customer'})
+            with self.assertRaises(UserError):
+                preview.action_apply()
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+
+    def test_invoice_receipt_failure_rolls_back_reversal_and_allocation(self):
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            preview = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            preview.action_preview_invoice_receipt()
+            with patch.object(type(self.env['account.payment']), 'action_post', side_effect=UserError('Cannot post source receipt')):
+                with self.assertRaises(UserError):
+                    preview.action_apply()
+        self.assertNotEqual(legacy.state, 'canceled')
+        self.assertFalse(legacy.move_id.reversal_move_ids)
+        self.assertEqual(invoices.mapped('amount_residual'), [0, 150])
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_invoice_receipt_workspace_round_trip_matches_payout_and_bank(self):
+        try:
+            from .test_shopify_historical_collection import TestShopifyHistoricalCollection as MatchFixtures
+        except ImportError:
+            from test_shopify_historical_collection import TestShopifyHistoricalCollection as MatchFixtures
+        order, invoices, payload, events, legacy = self._split_invoice_receipt()
+        payout = self._payout('guided-receipt')
+        payout.amount = 237
+        payout.payout_transaction_ids.filtered(lambda tx: tx.transaction_type == 'charge').write({
+            'amount': 240, 'order_id': order.id, 'source_order_id': order.shopify_order_id,
+            'source_order_transaction_id': events[0]['id']})
+        payout.generate_bank_statement()
+        workspace = self.env['shopify.payout.repair.ept'].browse(payout.action_bulk_repair_transactions()['res_id'])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            workspace.action_preview()
+            case = workspace.line_ids
+            self.assertEqual(case.resolution, 'invoice_receipt')
+            self.assertIn('Review Payments', case.next_step)
+            documents = case.action_open_accounting_documents()
+            self.assertEqual(documents['domain'], [('id', 'in', invoices.ids)])
+            preview = self.env['shopify.payment.repair.ept'].browse(case.action_review_payments()['res_id'])
+            self.assertEqual(preview.repair_case_id, case)
+            preview.action_preview_invoice_receipt()
+            preview.action_apply()
+            history = case.history_ids.filtered(lambda row: row.operation == 'payment')
+            self.assertEqual(history.payment_ids.amount, 240)
+            self.assertIn('order audit', history.detail)
+            action = preview.action_return_to_payout_case()
+            self.assertEqual(action['res_id'], workspace.id)
+            self.assertEqual(case.status, 'ready', case.detail)
+            with MatchFixtures._matcher(self, payout):
+                workspace.action_apply()
+            self.assertEqual(case.reconciliation_status, 'matched', workspace.result)
+            self.assertTrue(all(payout.payout_statement_line_ids.mapped('is_reconciled')))
+            self.assertIn('Matched.', case.next_step)
+            with self.assertRaises(UserError):
+                case.action_review_payments()
+        transit = self.outstanding.copy({'name': 'Guided Payout Transit', 'code': 'GUIDETRN'})
+        bank = self.journal.copy({'name': 'Guided Receiving Bank', 'code': 'GDBK',
+                                 'default_account_id': self.journal.default_account_id.copy({'code': 'GUIDEBANK'}).id})
+        (bank.inbound_payment_method_line_ids | bank.outbound_payment_method_line_ids).payment_account_id = transit
+        transfer = self.env['account.journal'].create({'name': 'Guided Transfers', 'code': 'GTRF', 'type': 'general'})
+        self.instance.write({'shopify_payout_bank_journal_id': bank.id,
+                             'shopify_payout_transit_account_id': transit.id,
+                             'shopify_payout_transfer_journal_id': transfer.id})
+        payout.action_create_settlement_transfer()
+        statement = self.env['account.bank.statement.line'].create({
+            'journal_id': bank.id, 'date': payout.payout_date, 'payment_ref': 'Guided payout deposit',
+            'amount': 237, 'counterpart_account_id': transit.id})
+        (payout.settlement_line_id | statement.line_ids.filtered(lambda row: row.account_id == transit)).reconcile()
+        self.assertEqual(payout.settlement_status, 'matched')
+        self.assertTrue(payout.currency_id.is_zero(payout.settlement_line_id.amount_residual))
+        settlement = payout.settlement_move_id
+        payout.action_create_settlement_transfer()
+        self.assertEqual(payout.settlement_move_id, settlement)
+
     def test_net_invoice_creates_gross_receipt_and_independent_refund(self):
         order, invoice, payload, events = self._fixture()
         with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):

@@ -6,6 +6,8 @@
         <field name="arch" type="xml">
             <form string="Preview / Repair Shopify Payments" create="false" edit="false">
                 <field name="state" invisible="1"/>
+                <field name="repair_case_id" invisible="1"/>
+                <field name="invoice_receipt_available" invisible="1"/>
                 <field name="order_ids" widget="many2many_tags"/>
                 <div class="alert alert-info" role="alert" invisible="state == 'done'">
                     Review the transactions below before applying. This records payments and refunds already made in Shopify.
@@ -16,9 +18,13 @@
                 </div>
                 <field name="preview_html" nolabel="1"/>
                 <footer>
+                    <button name="action_preview_invoice_receipt" type="object" string="Preview Invoice Receipt Correction"
+                            invisible="state != 'blocked' or not invoice_receipt_available"/>
                     <button name="action_apply" type="object" string="Apply Reviewed Repair" class="btn-primary"
                             invisible="state != 'preview'"/>
                     <button name="action_preview" type="object" string="Refresh Preview" invisible="state == 'done'"/>
+                    <button name="action_return_to_payout_case" type="object" string="Refresh / Return to Payout Case"
+                            invisible="not repair_case_id"/>
                     <button string="Close" special="cancel"/>
                 </footer>
             </form>

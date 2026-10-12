@@ -60,6 +60,41 @@ class TestShopifyRepairProgress(PayoutTestCase):
         self.assertEqual(old_event.detail, 'Missing product mapping')
         self.assertEqual(len(payout.repair_history_ids), 2)
 
+    def test_guidance_uses_typed_routes_and_unknown_errors_keep_manual_review(self):
+        try:
+            from ..models.shopify_repair_error import ShopifyRepairBlocked
+        except ImportError:
+            self.skipTest('Odoo runtime required')
+        payout, workspace, payload, events = self._historical('typed-guidance')
+        for route, phrase in [('documents', 'Invoices / Credits'), ('payments', 'Review Payments'),
+                              ('credit', 'refund allocation'), ('source', 'Open Shopify'),
+                              ('customer', 'Import Customer')]:
+            with patch.object(type(payout.payout_transaction_ids), '_repair_source',
+                              side_effect=ShopifyRepairBlocked('Translated source message', route)):
+                workspace.action_preview()
+            self.assertEqual(workspace.line_ids.resolution, route)
+            self.assertIn(phrase, workspace.line_ids.next_step)
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', side_effect=UserError('Unexpected source issue')):
+            workspace.action_preview()
+        self.assertEqual(workspace.line_ids.resolution, 'review')
+        self.assertIn('Review Details', workspace.line_ids.next_step)
+
+    def test_actual_fulfillment_blocker_has_source_guidance(self):
+        payout, workspace, payload, events = self._historical('fulfillment-guidance')
+        payload['fulfillments'] = []
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            workspace.action_preview()
+        self.assertEqual(workspace.line_ids.resolution, 'source')
+        self.assertIn('Open Shopify', workspace.line_ids.next_step)
+
+    def test_payment_shortcut_rejects_missing_order_before_cash_source_read(self):
+        payout, workspace, payload, events = self._historical('missing-order-payment')
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            workspace.action_preview()
+        with patch.object(type(self.env['sale.order']), '_shopify_cash_source', side_effect=AssertionError('Unexpected read')):
+            with self.assertRaises(UserError):
+                workspace.line_ids.action_review_payments()
+
     def test_refresh_case_does_not_rerun_unrelated_orders(self):
         payout, wizard, payload, events = self._historical('individual')
         other = self.env['shopify.payout.report.line.ept'].create(dict(payout_id=payout.id,
@@ -190,6 +225,9 @@ class TestShopifyRepairProgress(PayoutTestCase):
             wizard.line_ids.with_user(accountant).action_refresh_case()
         with self.assertRaises(AccessError):
             wizard.line_ids.with_user(accountant).write({'detail': 'changed'})
+        with patch.object(type(self.env['sale.order']), '_shopify_cash_source', side_effect=AssertionError('Unauthorized source read')):
+            with self.assertRaises(AccessError):
+                wizard.line_ids.with_user(accountant).action_review_payments()
 
     def test_failed_apply_is_saved_without_claiming_accounting_was_created(self):
         payout, wizard, payload, events = self._historical('failed')

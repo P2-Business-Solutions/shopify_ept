@@ -7,6 +7,7 @@ from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
 from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, prove_cancelled_cash, fingerprint, component_money, money
 from .shopify_refund_plan import prove_final_net_invoice, refund_components
+from .shopify_repair_error import ShopifyRepairBlocked
 
 _logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ class SaleOrderPaymentSync(models.Model):
                 source_tax = component_money(payload, 'current_total_tax', self.currency_id.name,
                                              payload.get('currency', self.currency_id.name))
                 if self.currency_id.compare_amounts(tax, float(source_tax)):
-                    raise UserError(_('The final Shopify tax and invoice tax do not agree. Review the invoice.'))
+                    raise ShopifyRepairBlocked(_('The final Shopify tax and invoice tax do not agree. Review the invoice.'), 'documents')
             return []
         prepared = []
         covered = set()
@@ -100,7 +101,7 @@ class SaleOrderPaymentSync(models.Model):
         source_refund_ids = {str(refund.get('id')) for refund in payload.get('refunds', [])
                              if refund_events.keys() & {str(row.get('id')) for row in refund.get('transactions', [])}}
         if credits.filtered(lambda credit: credit.shopify_refund_id not in source_refund_ids):
-            raise UserError(_('An existing reviewed credit note has an unknown Shopify Refund ID. Correct its source link before proceeding.'))
+            raise ShopifyRepairBlocked(_('An existing reviewed credit note has an unknown Shopify Refund ID. Correct its source link before proceeding.'), 'credit')
         for refund in payload.get('refunds', []):
             ids = {str(row.get('id')) for row in refund.get('transactions', [])} & refund_events.keys()
             if not ids:
@@ -145,7 +146,7 @@ class SaleOrderPaymentSync(models.Model):
         if refund.get('duties') or refund.get('refund_duties') or refund.get('additional_fees'):
             raise UserError(_('Refund adjustments, duties or additional fees need a reviewed credit note linked by Shopify Refund ID.'))
         if len(invoices) != 1:
-            raise UserError(_('Create and link the refund credit note manually when an order has multiple invoices.'))
+            raise ShopifyRepairBlocked(_('Create and link the refund credit note manually when an order has multiple invoices.'), 'credit')
         invoice = invoices
         lines = []
         tax_total = 0.0
@@ -210,7 +211,7 @@ class SaleOrderPaymentSync(models.Model):
                 account = self.fiscal_position_id.map_account(account)
             if part['kind'] == 'adjustment' and component_accounts:
                 if len(component_accounts) != 1:
-                    raise UserError(_('The refund adjustment spans multiple revenue accounts. Review and allocate the credit manually before reconciling this refund.'))
+                    raise ShopifyRepairBlocked(_('The refund adjustment spans multiple revenue accounts. Review and allocate the credit manually before reconciling this refund.'), 'credit')
                 account = component_accounts
             if (not product or not account or account.deprecated or self.company_id not in account.company_ids
                     or account.account_type not in ('income', 'income_other')):
@@ -270,12 +271,54 @@ class SaleOrderPaymentSync(models.Model):
         other_moves = (matches.debit_move_id | matches.credit_move_id).move_id - payment.move_id
         if other_moves - invoices or payment.invoice_ids - invoices:
             raise UserError(_('The legacy payment is applied outside this order.'))
-        payouts = self.env['shopify.payout.report.line.ept'].search([
-            ('order_id', '=', self.id)]).payout_id
-        if payouts.settlement_move_id:
+        if self._shopify_cash_payouts().settlement_move_id:
             raise UserError(_('An affected payout already has a settlement transfer. Review the correction manually.'))
 
-    def _build_shopify_cash_plan(self, repair=False):
+    def _shopify_cash_payouts(self):
+        self.ensure_one()
+        return self.env['shopify.payout.report.line.ept'].search([
+            '|', ('order_id', '=', self.id),
+            '&', ('source_order_id', '=', self.shopify_order_id),
+            ('payout_id.instance_id', '=', self.shopify_instance_id.id)]).payout_id
+
+    def _is_shopify_invoice_receipt(self, payment, invoices, events, credits, payload):
+        """Prove one fully paid invoice within a split-invoice, single-capture sale."""
+        if (len(events) != 1 or events[0]['kind'] not in ('sale', 'capture')
+                or events[0]['gateway'] != 'shopify_payments' or credits or len(invoices) < 2
+                or self.currency_id.compare_amounts(payment.amount, 0) <= 0
+                or self.currency_id.compare_amounts(payment.amount, float(events[0]['amount'])) >= 0
+                or payment.date < fields.Date.to_date(events[0]['date'])
+                or payment.payment_method_line_id.code != 'manual'
+                or payment.shopify_parent_transaction_id or payment.shopify_cash_timestamp
+                or payment.shopify_cash_kind or payment.shopify_cash_gateway):
+            return False
+        customer_id = str((payload.get('customer') or {}).get('id') or '')
+        mapping = self.env['shopify.res.partner.ept'].search([
+            ('shopify_instance_id', '=', self.shopify_instance_id.id),
+            ('shopify_customer_id', '=', customer_id)]) if customer_id else self.env['shopify.res.partner.ept']
+        if (len(mapping) != 1 or not mapping.partner_id.active
+                or not mapping.partner_id.commercial_partner_id.active
+                or (mapping.partner_id.company_id and mapping.partner_id.company_id != self.company_id)
+                or (mapping.partner_id.commercial_partner_id.company_id
+                    and mapping.partner_id.commercial_partner_id.company_id != self.company_id)
+                or mapping.partner_id.commercial_partner_id != self.partner_id.commercial_partner_id):
+            return False
+        liquidity, counterpart, writeoffs = payment._seek_for_lines()
+        if (len(liquidity) != 1 or len(counterpart) != 1 or writeoffs or not counterpart.reconciled
+                or liquidity.account_id.id != events[0]['outstanding_id']
+                or self.currency_id.compare_amounts(abs(liquidity.amount_currency), payment.amount)):
+            return False
+        matches = counterpart.matched_debit_ids | counterpart.matched_credit_ids
+        allocated = (matches.debit_move_id | matches.credit_move_id).move_id - payment.move_id
+        if (len(allocated) != 1 or allocated not in invoices
+                or payment.invoice_ids - allocated or payment.reconciled_invoice_ids - allocated
+                or payment.reconciled_bill_ids
+                or self.currency_id.compare_amounts(allocated.amount_total, payment.amount)):
+            return False
+        receivables = allocated.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')
+        return bool(receivables) and all(receivables.mapped('reconciled'))
+
+    def _build_shopify_cash_plan(self, repair=False, allow_invoice_receipt=False):
         self.ensure_one()
         if self.env['shopify.refund.reference.ept'].search_count([
                 ('instance_id', '=', self.shopify_instance_id.id), ('source_order_id', '=', self.shopify_order_id)]):
@@ -301,19 +344,19 @@ class SaleOrderPaymentSync(models.Model):
             standalone_credits = referenced_credits - documents
             documents |= referenced_credits
             if documents.filtered(lambda move: move.state != 'posted'):
-                raise UserError(_('Post or remove draft invoices/credit notes before synchronizing cash transactions.'))
+                raise ShopifyRepairBlocked(_('Post or remove draft invoices/credit notes before synchronizing cash transactions.'), 'documents')
             invoices = documents.filtered(lambda move: move.move_type == 'out_invoice')
             credits = documents.filtered(lambda move: move.move_type == 'out_refund')
             cancelled_cash = not documents and self.state == 'cancel' and self.canceled_in_shopify
             if (not invoices and not cancelled_cash) or documents.filtered(lambda move: move.company_id != self.company_id
                                                   or move.currency_id != self.currency_id):
-                raise UserError(_('Posted invoices in the order company and currency are required.'))
+                raise ShopifyRepairBlocked(_('Posted invoices in the order company and currency are required.'), 'documents')
             if documents.invoice_line_ids.sale_line_ids.order_id - self:
                 raise UserError(_('An invoice includes another order. Allocate its payments manually before using this repair.'))
             if credits.filtered(lambda move: move.shopify_refund_order_id and move.shopify_refund_order_id != self):
                 raise UserError(_('A refund credit has a conflicting Shopify order link.'))
             if documents.filtered(lambda move: move.commercial_partner_id != self.partner_id.commercial_partner_id):
-                raise UserError(_('The invoice or refund credit belongs to another customer. Review its Shopify refund link.'))
+                raise ShopifyRepairBlocked(_('The invoice or refund credit belongs to another customer. Review its Shopify refund link.'), 'documents')
             for credit in standalone_credits:
                 if credit.shopify_instance_id != self.shopify_instance_id:
                     raise UserError(_('The standalone refund credit must use this order\'s Shopify store.'))
@@ -340,9 +383,12 @@ class SaleOrderPaymentSync(models.Model):
                     or (embedded_ids and sorted(invoices.ids) != sorted(prior.get('invoice_ids', [])))):
                 raise UserError(_('The invoice or refunds from the previous net-invoice audit are missing. Review the history.'))
             embedded_amount = sum(money(refund_events[key]['amount']) for key in embedded_ids)
-            mode = 'cancelled_cash' if cancelled_cash else invoice_mode(
-                events, sum(invoices.mapped('amount_total')), sum(credits.mapped('amount_total')),
-                self.currency_id.compare_amounts, embedded_amount)
+            try:
+                mode = 'cancelled_cash' if cancelled_cash else invoice_mode(
+                    events, sum(invoices.mapped('amount_total')), sum(credits.mapped('amount_total')),
+                    self.currency_id.compare_amounts, embedded_amount)
+            except ValueError as error:
+                raise ShopifyRepairBlocked(str(error), 'documents') from error
             credit_values = [] if cancelled_cash else self._shopify_refund_documents(
                 payload, events, invoices, credits, mode, embedded_ids)
             if mode == 'net':
@@ -410,8 +456,9 @@ class SaleOrderPaymentSync(models.Model):
                     fields.Date.to_date(event['date']), False, method.journal_id):
                 raise UserError(_('The transaction date is locked. A reviewed accounting correction is required.'))
         replacements = self.env['account.payment']
+        replacement_basis = None
         if remaining:
-            # Only the demonstrable single net-payment legacy shape is replaced.
+            # Ordinary repair still accepts only a proven full net-payment shape.
             final_amount = sum(invoices.mapped('amount_total'))
             if mode == 'gross':
                 final_amount -= sum(float(row['amount']) for row in events if row['kind'] == 'refund')
@@ -422,10 +469,15 @@ class SaleOrderPaymentSync(models.Model):
                     or (remaining.shopify_cash_order_id and remaining.shopify_cash_order_id != self)
                     or remaining.journal_id.id not in [row['journal_id'] for row in events if row['direction'] == 'inbound']
                     or remaining.partner_id.commercial_partner_id != self.partner_id.commercial_partner_id
-                    or self.currency_id.compare_amounts(remaining.amount, final_amount)
                     or any(row['payment_id'] for row in events if row['direction'] == 'inbound')):
-                raise UserError(_('Existing payments do not match Shopify cash history. Use Preview / Repair Shopify Payments; ambiguous cases require accounting review.'))
+                raise ShopifyRepairBlocked(_('Existing payments do not match Shopify cash history. Use Preview / Repair Shopify Payments; ambiguous cases require accounting review.'), 'payments')
             self._check_shopify_replacement(remaining, documents)
+            if self.currency_id.compare_amounts(remaining.amount, final_amount):
+                if mode != 'gross' or not self._is_shopify_invoice_receipt(remaining, invoices, events, credits, payload):
+                    raise ShopifyRepairBlocked(_('Existing payments do not match Shopify cash history. Use Preview / Repair Shopify Payments; ambiguous cases require accounting review.'), 'payments')
+                if not allow_invoice_receipt:
+                    raise ShopifyRepairBlocked(_('One legacy receipt fully pays one invoice, but Shopify captured the complete split-invoice sale. Use Review Payments, then Preview Invoice Receipt Correction to review its reversal and the exact source receipt.'), 'invoice_receipt')
+                replacement_basis = 'invoice_receipt'
             replacements = remaining
         # Snapshot allocations as well as payment headers: a new bank match must invalidate a preview.
         items = candidates.move_id.line_ids | documents.line_ids
@@ -440,13 +492,16 @@ class SaleOrderPaymentSync(models.Model):
                        line.amount_residual, line.amount_residual_currency,
                        line.matched_debit_ids.ids, line.matched_credit_ids.ids) for line in items.sorted('id')],
         }
-        return {'order_id': self.id, 'mode': mode, 'events': events, 'credits': credit_values,
+        plan = {'order_id': self.id, 'mode': mode, 'events': events, 'credits': credit_values,
                 'reused_credit_ids': credits.ids,
                 'embedded_refund_ids': embedded_ids, 'invoice_ids': invoices.ids,
                 'source_fingerprint': fingerprint({'order': payload, 'transactions': transactions}),
                 'receivable_account_id': receivable.id,
                 'replace_ids': replacements.ids, 'document_ids': documents.ids,
                 'snapshot': fingerprint(snapshot)}
+        if replacement_basis:
+            plan['replacement_basis'] = replacement_basis
+        return plan
 
     def _apply_shopify_cash_plan(self, plan):
         """Caller holds the order lock and supplies a freshly rebuilt plan."""

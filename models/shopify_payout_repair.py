@@ -3,6 +3,7 @@ from urllib.parse import quote
 
 from odoo import api, Command, fields, models, _
 from odoo.exceptions import UserError
+from .shopify_repair_error import ShopifyRepairBlocked
 from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
 from .shopify_payment_plan import cash_events, fingerprint, money
@@ -105,6 +106,57 @@ class ShopifyPayoutRepairLine(models.Model):
             raise UserError(_('Shopify returned a different order.'))
         return payload, transactions
 
+    def _import_repair_customer(self):
+        """Reuse the customer importer without importing an old sales order."""
+        self.ensure_one()
+        instance = self.payout_id.instance_id
+        company = instance.shopify_company_id
+        payload, _transactions = self._repair_source()
+        customer_id = str((payload.get('customer') or {}).get('id') or '')
+        if not customer_id:
+            raise UserError(_('The source order has no Shopify customer ID. Review its customer identity manually.'))
+        try:
+            customer = shopify.Customer.find(customer_id).to_dict()
+        except ShopifyError as error:
+            raise UserError(_('Could not read the exact Shopify customer.')) from error
+        if str(customer.get('id') or '') != customer_id:
+            raise UserError(_('Shopify returned a different customer.'))
+        self.env.cr.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',
+                            ['shopify-customer:%s:%s' % (instance.id, customer_id)])
+        mappings = self.env['shopify.res.partner.ept'].with_context(active_test=False)
+        existing = mappings.search([('shopify_instance_id', '=', instance.id),
+                                    ('shopify_customer_id', '=', customer_id)])
+        if existing:
+            partners = existing.partner_id
+            if (len(existing) != 1 or len(partners) != 1 or not partners.active
+                    or (partners.company_id and partners.company_id != company)
+                    or not partners.commercial_partner_id.active
+                    or (partners.commercial_partner_id.company_id
+                        and partners.commercial_partner_id.company_id != company)):
+                raise UserError(_('The existing Shopify customer mapping is ambiguous, inactive or belongs to another company. Correct it before retrying.'))
+            return customer_id, partners
+        email = str(customer.get('email') or '').strip()
+        if not email:
+            raise UserError(_('The Shopify customer has no email. Review the mapping manually instead of matching by name.'))
+        candidates = self.env['res.partner'].with_context(active_test=False).search([('email', '=ilike', email)])
+        if (len(candidates.commercial_partner_id) > 1
+                or candidates.filtered(lambda partner: not partner.active
+                    or not partner.commercial_partner_id.active
+                    or (partner.company_id and partner.company_id != company)
+                    or (partner.commercial_partner_id.company_id
+                        and partner.commercial_partner_id.company_id != company))):
+            raise UserError(_('The Shopify email identifies ambiguous, inactive or other-company customers. Correct the customer mapping manually.'))
+        # This is the same entry point used by customer queues. Keep the regular
+        # customer's tags/channel handling; suppress import notifications only.
+        customer = dict(customer, email=email)
+        partner = mappings.with_company(company).with_context(
+            tracking_disable=True, mail_create_nosubscribe=True, mail_create_nolog=True,
+            order_data_queue=False, customer_data_queue=False,
+        ).shopify_create_contact_partner(customer, instance, self.env['shopify.customer.data.queue.line.ept'])
+        if not partner:
+            raise UserError(_('The customer importer did not create a customer mapping. Review the source customer details.'))
+        return customer_id, partner
+
     def _historical_refund_plan(self, cutover, timezone, sales_journal, post, source=None,
                                 opening_account=None, opening_confirmed=False):
         self.ensure_one()
@@ -123,6 +175,9 @@ class ShopifyPayoutRepairLine(models.Model):
         payload, transactions = source or self._repair_source()
         try:
             prove_historical_fulfillment(payload, cutover, timezone)
+        except ValueError as error:
+            raise ShopifyRepairBlocked(str(error), 'source') from error
+        try:
             events = cash_events(transactions, self.source_order_id, currency.name)
             if any(source_date(row['timestamp'], timezone) >= cutover for row in events if row['kind'] != 'refund'):
                 raise UserError(_('The original collection is on or after cutover. Review its normal invoice/payment accounting.'))
@@ -148,7 +203,7 @@ class ShopifyPayoutRepairLine(models.Model):
             if source_date(row['timestamp'], timezone) < cutover:
                 raise UserError(_('A refund document mixes cash transactions from before and after cutover.'))
             if row['gateway'] != 'shopify_payments':
-                raise UserError(_('A historical refund document includes another processor; review its separate settlement.'))
+                raise ShopifyRepairBlocked(_('A historical refund document includes another processor; review its separate settlement.'), 'credit')
         successful_refunds = {row['id'] for row in events if row['kind'] == 'refund'}
         quantities = {}
         originals = {str(row['id']): row for row in payload.get('line_items', [])}
@@ -169,7 +224,7 @@ class ShopifyPayoutRepairLine(models.Model):
         ]).partner_id.commercial_partner_id
         partner = order.partner_id.commercial_partner_id if order else partners
         if len(partner) != 1 or (partners and partners != partner):
-            raise UserError(_('Import or correct the Shopify customer mapping before preparing this refund.'))
+            raise ShopifyRepairBlocked(_('Import or correct the Shopify customer mapping before preparing this refund.'), 'customer')
         receivable = partner.with_company(company).property_account_receivable_id
         if (not receivable or not receivable.reconcile or receivable.account_type != 'asset_receivable'
                 or receivable.deprecated or company not in receivable.company_ids):
@@ -301,7 +356,7 @@ class ShopifyPayoutRepairLine(models.Model):
         component_accounts = self.env['account.account'].browse(sorted({account.id for part, _name, account in resolved
             if part['kind'] != 'adjustment' and account}))
         if len(component_accounts) > 1 and any(part['kind'] == 'adjustment' for part in parts):
-            raise UserError(_('The refund adjustment spans multiple revenue accounts. Review and allocate the credit manually before reconciling this refund.'))
+            raise ShopifyRepairBlocked(_('The refund adjustment spans multiple revenue accounts. Review and allocate the credit manually before reconciling this refund.'), 'credit')
         for part, name, account in resolved:
             if part['kind'] == 'adjustment' and component_accounts:
                 # Preserve the returned sale's classification, including Readers.
@@ -437,6 +492,8 @@ class ShopifyPayoutRepairHistory(models.Model):
     payout_ids = fields.Many2many('shopify.payout.report.ept', 'shopify_payout_repair_history_rel',
                                  'history_id', 'payout_id', readonly=True)
     operation = fields.Selection([('preview', 'Preview / Refresh'), ('apply', 'Accounting Applied'),
+                                  ('customer', 'Customer Imported / Reused'),
+                                  ('payment', 'Reviewed Payment Repair'),
                                   ('failure', 'Apply Failed'), ('match', 'Matching Result'),
                                   ('post_only', 'Posted Without Matching')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)

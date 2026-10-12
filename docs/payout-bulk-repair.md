@@ -1,5 +1,47 @@
 # Bulk payout exception processing
 
+### Guided closeout and invoice-sized receipts (18.0.3.36)
+
+Saved cases now show **Next Step** for common customer, payment, document, refund
+allocation and fulfillment errors. **Review Payments** opens the existing payment
+preview for that one order; **Invoices / Credits** opens its accounting documents.
+After a payment repair, **Refresh / Return to Payout Case** takes you back to the
+same saved workspace. Review the ready case and apply it to finish payout matching.
+
+A proven single invoice-sized receipt in a fully invoiced, single-capture sale
+can use **Preview Invoice Receipt Correction** before **Apply Reviewed Repair**.
+The correction retains the original receipt and its reversal, then records the
+exact source capture. Ordinary import/sync and bulk Apply do not authorize this
+additional replacement. See [eligibility and closeout steps](payout-guided-closeout.md).
+Invoice corrections, multi-account/processor credit allocations and missing source
+proof still use their existing review routes; no automatic allocation or write-off
+is introduced.
+
+### Import the customer for a blocked historical refund (18.0.3.35)
+
+When a missing-order refund says **Import or correct the Shopify customer mapping**,
+use **Import Customer** on its saved case in the bulk workspace, **Details**, or
+the payout's **Bulk Repair Audit → Current Repair Progress**. This reads the exact
+Shopify customer named by that order and reuses the existing customer importer.
+It creates/reuses the customer mapping and refreshes only this case; the normal
+customer import checkpoint stays unchanged. It avoids importing the old sales order.
+
+The action requires an accounting manager with the existing connector/customer
+permissions, including contact creation rights when the customer is new. A unique
+existing email can identify the customer; a name alone cannot. Conflicting or
+duplicate mappings, ambiguous email identities, inactive customers, other-company
+candidates, missing email and a different returned customer stay for manual review.
+An existing valid mapping is reused without rewriting that customer's details.
+New mappings use the normal importer's tags and customer-channel handling.
+
+Customer import creates no invoice, credit, payment, delivery or manufacturing order,
+and never applies the accounting preview. The permanent repair history records the
+source customer, Odoo customer and initiating user. Read the refreshed **Details**,
+review accounts/taxes, then use **Apply Selected Ready Cases**. Any remaining source,
+document or period blocker stays visible. Other cases and successful matches remain
+available in the same saved workspace. Settlement and bank matching follow the
+existing steps below.
+
 Version **18.0.3.28** adds **Bulk Repair Transactions** on a Shopify payout and
 **Actions → Bulk Repair Payout Transactions** on selected payouts. These actions
 record money already charged/refunded in Shopify; they never charge a customer or

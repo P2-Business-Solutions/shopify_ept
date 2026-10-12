@@ -56,8 +56,14 @@
                         <field name="last_error" optional="show"/>
                         <field name="transaction_ids" widget="many2many_tags" optional="hide"/>
                         <field name="detail"/>
+                        <field name="resolution" optional="hide"/><field name="next_step" optional="show"/>
                         <button name="action_open_details" string="Details" type="object"/>
+                        <button name="action_review_payments" string="Review Payments" type="object" groups="account.group_account_manager"
+                                invisible="not current_order_id or reconciliation_status == 'matched'"/>
+                        <button name="action_open_accounting_documents" string="Invoices / Credits" type="object" invisible="not current_order_id"/>
                         <button name="action_link_refund_credit_note" string="Link Credit Note" type="object"/>
+                        <button name="action_import_customer" string="Import Customer" type="object" groups="account.group_account_manager"
+                                invisible="kind != 'review' or current_order_id or reconciliation_status == 'matched'"/>
                         <button name="action_open_order" string="Open Order" type="object" invisible="not current_order_id"/>
                         <button name="action_open_shopify_order" string="Shopify" type="object"/>
                         <button name="action_refresh_case" string="Refresh Case" type="object"/>
@@ -81,7 +87,7 @@
                     <field name="transaction_ids" widget="many2many_tags"/>
                     <field name="credit_ids" widget="many2many_tags"/><field name="payment_ids" widget="many2many_tags"/>
                     <field name="collection_move_ids" widget="many2many_tags"/></group>
-                <field name="detail"/><field name="review_html" nolabel="1"/>
+                <field name="resolution"/><field name="next_step"/><field name="detail"/><field name="review_html" nolabel="1"/>
                 <field name="history_ids" readonly="1">
                     <list create="false" edit="false" delete="false" default_order="id desc">
                         <field name="create_date"/><field name="create_uid"/><field name="operation"/>
@@ -89,7 +95,13 @@
                     </list>
                 </field>
                 <footer><button name="action_open_order" type="object" string="Open Order" invisible="not current_order_id"/>
+                    <button name="action_review_payments" type="object" string="Review Payments" groups="account.group_account_manager"
+                            invisible="not current_order_id or reconciliation_status == 'matched'"/>
+                    <button name="action_open_accounting_documents" type="object" string="Invoices / Credits"
+                            invisible="not current_order_id and not credit_ids"/>
                     <button name="action_link_refund_credit_note" type="object" string="Link Refund Credit Note" groups="account.group_account_manager"/>
+                    <button name="action_import_customer" type="object" string="Import Customer" groups="account.group_account_manager"
+                            invisible="kind != 'review' or current_order_id or reconciliation_status == 'matched'"/>
                     <button name="action_open_shopify_order" type="object" string="Open Shopify Order"/>
                     <button name="action_refresh_case" type="object" string="Refresh Case" groups="account.group_account_manager"/>
                     <button name="action_back_to_bulk_repair" type="object" string="Back to Bulk Repair" class="btn-primary"/>
@@ -116,7 +128,13 @@
                                 <field name="source_reference"/><field name="current_order_id"/>
                                 <field name="last_preview_at" optional="hide"/><field name="last_apply_at" optional="hide"/>
                                 <field name="detail"/><field name="last_error" optional="show"/>
+                                <field name="resolution" optional="hide"/><field name="next_step" optional="show"/>
                                 <button name="action_open_details" string="Details" type="object"/>
+                                <button name="action_review_payments" string="Review Payments" type="object" groups="account.group_account_manager"
+                                        invisible="not current_order_id or reconciliation_status == 'matched'"/>
+                                <button name="action_open_accounting_documents" string="Invoices / Credits" type="object" invisible="not current_order_id"/>
+                                <button name="action_import_customer" string="Import Customer" type="object" groups="account.group_account_manager"
+                                        invisible="kind != 'review' or current_order_id or reconciliation_status == 'matched'"/>
                                 <button name="action_open_order" string="Open Order" type="object" invisible="not current_order_id"/>
                                 <button name="action_open_shopify_order" string="Shopify" type="object"/>
                                 <button name="action_refresh_case" string="Refresh Case" type="object" groups="account.group_account_manager"/>

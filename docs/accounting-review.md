@@ -1,5 +1,88 @@
 # Accounting review — 18.0.3.18
 
+## Guided closeout and invoice receipt correction — 18.0.3.36
+
+Validated October 11, 2026 in a disposable Odoo **18.0-20260908 Community** /
+PostgreSQL 16 database with the actual Shopify connector, common connector library,
+sale order type, delivery hold, Manufacturing, Payment Payout Reconciliation and
+Loop Returns. Fresh installation and subsequent module upgrades loaded the new
+fields, error routes, history selection and workspace/payment views. Production
+accounting inspection remained read-only; no live repair or closeout was applied.
+
+- **233 database tests passed; 3 existing Enterprise widget tests skipped.** The
+  final module upgrade/full Shopify run reported **0 failures and 0 errors across
+  236 tests**. This includes 15 new tests for guided routes and invoice receipts.
+- **101 standalone tests passed.** Discovery reported 411 tests with 310
+  database/fixture cases skipped outside Odoo. Changed Python compiled, edited XML
+  parsed, manifest/version/data paths validated and `git diff --check` passed.
+- A synthetic single Shopify capture of **240**, two posted invoices of **90**
+  and **150**, and one fully allocated untagged **90** receipt first remained
+  blocked. The separate **Preview Invoice Receipt Correction** changed only the
+  preview. Apply retained the original receipt and reversal, recorded one exact
+  **240** receipt, retained both invoice totals and closed both receivables.
+  Repeating ordinary cash sync created no further move or audit.
+- The complete saved-case flow used **Review Payments**, applied that correction,
+  retained payment history/order audit, refreshed only its original case, matched
+  the payout statement and fee, posted its **237** net settlement and matched one
+  bank receipt. Transit residual was zero; repeat settlement reused the same move.
+  Community matching reconciled actual ledger items through the existing test
+  adapter. This is not verification of the Enterprise bank widget or live UI.
+- Automatic cash sync stayed blocked before the separate review. Multiple
+  captures/receipts, an unreconciled receipt identified only by amount, missing or
+  changed source customer mapping, a bank match added after preview and a settled
+  source-linked payout without an Odoo order link were refused. Changed capture
+  identity invalidated approval. A posting failure rolled back the reversal,
+  payment creation and allocations together.
+- Typed guidance was independent of translated error text. Missing historical
+  fulfillment produced the source-evidence route, unknown issues retained manual
+  review, and existing permission tests denied the new payment shortcut before a
+  source read. Old saved explanations/history remain; their guidance updates on
+  Refresh Case. Invoice/credit navigation creates no accounting document.
+
+In Enterprise staging, verify the new buttons with a normal accounting manager,
+the eligible invoice-receipt case through the actual payout and bank widget, and
+one remaining document/allocation/source blocker. Confirm one source receipt,
+one retained reversal, unchanged invoice totals and one deposit match. No live
+payout is claimed closed; this release adds one narrow accounting route and
+navigation/guidance to existing repair tools. See [workflow](payout-guided-closeout.md).
+
+## Customer import from a blocked payout case — 18.0.3.35
+
+Validated October 11, 2026 in a disposable Odoo 18 Community / PostgreSQL 16
+database with the actual connector, common connector library, sale order type,
+delivery hold, Manufacturing, Payment Payout Reconciliation and Loop Returns.
+Fresh module installation and subsequent upgrades loaded the action, history
+selection and all three existing views. Production inspection was read-only;
+no live customer imports, credits, payments, settlement or bank matches were applied.
+
+- **218 database tests passed; 3 Enterprise widget tests skipped.** The final
+  Odoo runner reported **0 failures and 0 errors across 221 tests**. Nine focused
+  customer-import tests passed, including a real manager with standard connector
+  and contact-creation permissions, and an accountant denied before reading source.
+- **101 standalone tests passed.** Standalone discovery reported 396 tests with
+  295 database/fixture cases skipped outside Odoo; actual database validation ran
+  separately above. Ruff's F checks on changed Python files, compilation, edited
+  XML parsing, manifest file/version checks and `git diff --check` passed.
+- A missing customer mapping became a Ready historical refund preview without
+  creating a sales order, invoice, credit, payment, delivery or manufacturing order.
+  Repeating the action reused the same customer/mapping and left the ordinary
+  customer-import checkpoint unchanged. The history retained the initiating user.
+- A unique existing email reused the customer. The unchanged Apply workflow then
+  posted a synthetic **215.35** credit and outgoing payment, reconciled the exact
+  refund statement, created its negative settlement, and matched one synthetic
+  bank withdrawal. Credit and transit residuals were zero, and repeated settlement
+  creation reused the same move. Community matching used ledger reconciliation
+  in place of the Enterprise widget; it is not an Enterprise UI validation.
+- Ambiguous/inactive email candidates, conflicting customer mappings, missing
+  email and a different returned customer stayed in review. A remaining accounting
+  lock after customer import retained its own blocker and created no accounting.
+
+The action reuses the existing customer importer and case refresh; accounting
+eligibility and approval stay in the existing preview/apply flow. Existing importer
+tag/customer-channel behavior and access controls remain in force. Check the new
+button and complete one new/reused customer case through the actual Enterprise
+bank widget in staging before production use. No production payout is claimed closed.
+
 ## Order-scoped standalone refund credits — 18.0.3.22
 
 Reviewed October 9, 2026 in a disposable Odoo 18 Community/PostgreSQL database with
