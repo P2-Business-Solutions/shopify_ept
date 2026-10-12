@@ -1,5 +1,26 @@
 # Bulk payout exception processing
 
+### Focused backlog controls and evidence (18.0.3.37)
+
+The saved workspace has **Show Cases** and **Issue** filters, **Clear Selection**,
+**Select Ready in This Filter** and **Select First 10 Ready**. Selection controls
+exclude matched cases and clear previous hidden selections; Apply refuses a
+selection hidden by the current filters. A selected-count message states the run's
+scope. Lists use short summaries, with full explanations in **Details**.
+
+Blocked Details retain Shopify cash, invoice/credit, payment and fulfillment
+evidence from preview, including the document/source difference and unproven
+shipping quantities. Repair history retains these snapshots. Source/ledger
+revalidation on Apply remains mandatory. Customer-import and credit-link buttons
+appear only for their relevant cases. Missing Shop Cash allocations open the
+exact dependency in Shopify and prefill the existing specific-order import
+wizard for review, without importing on open. Historical migration treatment
+still needs review before importing an order or creating an invoice.
+
+See [workflow and 5–10 case pilot](payout-guided-closeout.md). Refresh old cases
+after upgrading to populate their evidence and exact dependency links. No new
+accounting route or automatic historical sales/fulfillment import is added.
+
 ### Guided closeout and invoice-sized receipts (18.0.3.36)
 
 Saved cases now show **Next Step** for common customer, payment, document, refund

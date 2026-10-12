@@ -9,6 +9,7 @@ from .. import shopify
 from .shopify_shop_cash_utils import (
     SHOP_CASH_DETAILS_QUERY, decimal_amount, shop_cash_kind, shop_cash_allocations,
 )
+from .shopify_repair_error import ShopifyRepairBlocked
 
 
 class ShopifyShopCash(models.Model):
@@ -98,7 +99,8 @@ class ShopifyShopCash(models.Model):
                     ('shopify_instance_id', '=', self.instance_id.id),
                     ('company_id', '=', self.instance_id.shopify_company_id.id)], limit=2)
                 if len(order) != 1:
-                    raise UserError(_('Import the missing Shop Cash order %s first.', entry['order_id']))
+                    raise ShopifyRepairBlocked(_('Review/import the missing Shop Cash order %s first. Confirm its cutover treatment before importing sales or fulfillment.', entry['order_id']),
+                                               'shop_cash', str(entry['order_id']))
             else:
                 payment = self.env['account.payment'].search([
                     ('shopify_order_transaction_id', '=', entry.get('transaction_id')),

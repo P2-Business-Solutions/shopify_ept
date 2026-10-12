@@ -318,7 +318,7 @@ class SaleOrderPaymentSync(models.Model):
         receivables = allocated.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')
         return bool(receivables) and all(receivables.mapped('reconciled'))
 
-    def _build_shopify_cash_plan(self, repair=False, allow_invoice_receipt=False):
+    def _build_shopify_cash_plan(self, repair=False, allow_invoice_receipt=False, source=None):
         self.ensure_one()
         if self.env['shopify.refund.reference.ept'].search_count([
                 ('instance_id', '=', self.shopify_instance_id.id), ('source_order_id', '=', self.shopify_order_id)]):
@@ -330,7 +330,7 @@ class SaleOrderPaymentSync(models.Model):
                 ('shopify_legacy_collection_transaction_id', '!=', False)]):
             raise UserError(_('This order has a historical collection cleared from opening balances. '
                               'Review that entry before creating customer payments or repairing current-period cash.'))
-        payload, transactions = self._shopify_cash_source()
+        payload, transactions = source or self._shopify_cash_source()
         try:
             events = cash_events(transactions, self.shopify_order_id, self.currency_id.name)
             documents = self.invoice_ids.filtered(lambda move: move.state != 'cancel')

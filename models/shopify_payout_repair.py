@@ -503,6 +503,7 @@ class ShopifyPayoutRepairHistory(models.Model):
     order_id = fields.Many2one('sale.order', readonly=True)
     detail = fields.Text(readonly=True)
     plan = fields.Json(readonly=True)
+    review_evidence = fields.Json(readonly=True)
     credit_ids = fields.Many2many('account.move', readonly=True)
     payment_ids = fields.Many2many('account.payment', readonly=True)
     collection_move_ids = fields.Many2many('account.move', 'shopify_repair_history_move_rel',

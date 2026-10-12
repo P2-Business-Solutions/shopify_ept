@@ -1,5 +1,55 @@
 # Accounting review — 18.0.3.18
 
+## Backlog workflow and blocked-case evidence — 18.0.3.37
+
+Validated October 12, 2026 in a disposable local Odoo **18.0-20260908 Community** /
+PostgreSQL 16 database with Shopify, common connector library, sale order type,
+delivery hold, Manufacturing, Payment Payout Reconciliation and Loop Returns.
+Fresh installation and upgrades loaded the new workspace filters, filtered saved
+case field, selection actions, dependency fields, evidence snapshots and views.
+
+- **241 database tests passed; 3 existing Enterprise widget tests skipped.** The
+  final full Shopify run reported **0 failures and 0 errors across 244 tests**.
+  Eight new database tests cover the workflow and ten-case batch. A focused run
+  after the behavior changes passed **40 tests**, including Shop Cash; a final
+  **8-test workflow run** passed after the evidence display refinements.
+- **105 standalone tests passed.** Discovery reported 473 tests with 368
+  database/fixture aliases skipped outside Odoo. Python compilation, XML parsing,
+  manifest version/data paths and `git diff --check` passed.
+- One synthetic payout had **five historical collections, five opening-balance
+  refunds and one blocked order**. The new pilot selection selected ten Ready
+  cases. Apply posted/reused ten exact clearing entries and fully matched their
+  statements; the unrelated case stayed Needs Review and the payout stayed open
+  without a settlement transfer. No sales order, invoice credit, customer payment
+  or fulfillment was created. Refresh retained the entries and matches. The
+  Community test adapter reconciled real ledger items; it does not validate the
+  Enterprise bank widget or real Shopify API data.
+- Filtered selection capped the pilot at ten, cleared hidden selections, excluded
+  matched cases and preserved all saved rows. Editing a child through the filtered
+  x2many retained the original workspace. Apply refused a hidden selection before
+  source/accounting work, and a repeated fully matched workspace did no work.
+- A Shop Cash error naming another order retained its exact dependency. Source
+  navigation and the existing specific-order wizard used that dependency/store,
+  creating no order on open. Changed allocations invalidated the shortcut.
+- A blocked draft-invoice preview retained source collections/refunds/net,
+  document state/totals/residuals and their comparison using one source read,
+  without creating accounting. History retained the evidence. HTML escaped source
+  and document values. Missing identity was rejected before an unspecified source
+  read. Unproven collection and refund fulfillment used consistent typed guidance;
+  proof failures and customer-import eligibility remained enforced.
+- Source-only tests covered partial shipping quantities, failed/post-cutover
+  fulfillment in the business time zone, invalid currency/order history and
+  separate collection/refund totals. Managers retained the existing write scope;
+  accounting readers were denied selection changes before any mutation.
+
+The user took responsibility for staging/submodule updates during this work.
+**No staging or production accounting was changed, and the 5–10 case pilot on
+business records was not run.** After upgrading, follow the
+[short staging procedure](payout-guided-closeout.md#five-to-ten-case-staging-pilot-after-upgrade),
+including the actual Enterprise widget and selected statements. This release
+improves the existing workspace; it adds no accounting eligibility override,
+automatic Shop Cash historical route, write-off or historical sales import.
+
 ## Guided closeout and invoice receipt correction — 18.0.3.36
 
 Validated October 11, 2026 in a disposable Odoo **18.0-20260908 Community** /

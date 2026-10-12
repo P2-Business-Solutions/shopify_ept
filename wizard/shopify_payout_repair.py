@@ -7,6 +7,14 @@ from odoo import api, Command, fields, models, _
 from odoo.exceptions import UserError
 from psycopg2 import OperationalError
 from ..models.shopify_payment_plan import fingerprint
+from ..models.shopify_repair_evidence import source_review
+
+
+REPAIR_ROUTES = [
+    ('review', 'Accounting Review'), ('customer', 'Customer Mapping'),
+    ('documents', 'Invoices / Credits'), ('credit', 'Refund Allocation'),
+    ('source', 'Source Evidence'), ('payments', 'Payment Identity'),
+    ('invoice_receipt', 'Invoice Receipt Correction'), ('shop_cash', 'Shop Cash Order')]
 
 
 class ShopifyPayoutRepair(models.Model):
@@ -43,6 +51,65 @@ class ShopifyPayoutRepair(models.Model):
     result = fields.Text(string='Last Run Result', readonly=True)
     progress_summary = fields.Char(compute='_compute_progress_summary', string='Current Progress')
     history_ids = fields.One2many('shopify.payout.repair.history.ept', 'workspace_id', readonly=True)
+    queue_filter = fields.Selection([('pending', 'Unmatched'), ('ready', 'Ready'),
+        ('review', 'Needs Review'), ('done', 'Applied / Awaiting Match'), ('matched', 'Matched'),
+        ('all', 'All Cases')], string='Show Cases', default='pending', required=True)
+    issue_filter = fields.Selection([('all', 'All Issues')] + REPAIR_ROUTES,
+                                   string='Issue', default='all', required=True)
+    visible_line_ids = fields.One2many('shopify.payout.repair.line.ept', 'wizard_id',
+        compute='_compute_visible_line_ids', inverse='_inverse_visible_line_ids', readonly=False)
+    selection_summary = fields.Char(compute='_compute_selection_summary', string='Selected for Apply')
+
+    @api.depends('line_ids.status', 'line_ids.reconciliation_status', 'line_ids.resolution',
+                 'line_ids.active', 'queue_filter', 'issue_filter')
+    def _compute_visible_line_ids(self):
+        for workspace in self:
+            workspace.visible_line_ids = workspace.line_ids.filtered(workspace._case_is_visible)
+
+    def _inverse_visible_line_ids(self):
+        # This is a filtered view of the same cases. Only child selection is editable.
+        for workspace in self:
+            if workspace.visible_line_ids - workspace.line_ids:
+                raise UserError(_('Cases cannot be moved between repair workspaces.'))
+
+    def _case_is_visible(self, line):
+        self.ensure_one()
+        matched = line.reconciliation_status == 'matched'
+        stage = self.queue_filter
+        return ((stage == 'all' or (stage == 'matched' and matched)
+                 or (stage == 'pending' and not matched)
+                 or (stage in ('ready', 'review', 'done') and not matched and line.status == stage))
+                and (self.issue_filter == 'all' or line.resolution == self.issue_filter))
+
+    @api.depends('line_ids.selected', 'line_ids.status', 'line_ids.reconciliation_status')
+    def _compute_selection_summary(self):
+        for workspace in self:
+            selected = workspace.line_ids.filtered(lambda line: line.selected and line.status == 'ready'
+                                                    and line.reconciliation_status != 'matched')
+            workspace.selection_summary = _('%s ready unmatched case(s) selected across all filters.', len(selected))
+
+    def _select_ready(self, limit=None):
+        self._check_manager()
+        self.env.cr.execute('SELECT id FROM shopify_payout_repair_ept WHERE id = %s FOR UPDATE', [self.id])
+        self.invalidate_recordset()
+        self.line_ids.write({'selected': False})
+        ready = self.line_ids.filtered(lambda line: self._case_is_visible(line)
+            and line.status == 'ready' and line.reconciliation_status != 'matched').sorted('id')
+        (ready[:limit] if limit else ready).write({'selected': True})
+        return self._reopen()
+
+    def action_select_ready(self):
+        return self._select_ready()
+
+    def action_select_pilot(self):
+        return self._select_ready(limit=10)
+
+    def action_clear_selection(self):
+        self._check_manager()
+        self.env.cr.execute('SELECT id FROM shopify_payout_repair_ept WHERE id = %s FOR UPDATE', [self.id])
+        self.invalidate_recordset()
+        self.line_ids.write({'selected': False})
+        return self._reopen()
 
     @api.depends('payout_ids.instance_id.shopify_company_id')
     def _compute_company_id(self):
@@ -81,7 +148,7 @@ class ShopifyPayoutRepair(models.Model):
                                 collection_account=self.historical_collection_account_id.id,
                                 open_only=self.open_only, rematch=self.rematch_payouts))
 
-    def _plan(self, transactions, order, historical=False, collection=False):
+    def _plan(self, transactions, order, historical=False, collection=False, evidence=None):
         if transactions.payout_id - self.payout_ids:
             raise UserError(_('The repair contains transactions outside the selected payouts.'))
         for payout in transactions.payout_id:
@@ -91,21 +158,53 @@ class ShopifyPayoutRepair(models.Model):
             references |= transaction._refund_credit_reference()
         if references and len(references) == len(transactions):
             return dict(kind='credit_link', credit_ids=references.credit_note_id.ids, transaction_ids=transactions.ids)
+        source = None
+        if evidence is not None:
+            if (historical or collection) and (not transactions[:1].source_order_id
+                    or not transactions[:1].source_order_transaction_id):
+                raise UserError(_('The payout cash transaction is missing its Shopify order or exact transaction ID. Reimport the payout to refresh its source links, then preview again.'))
+            if order and not historical and not collection:
+                order.check_access('write')
+                source = order._shopify_cash_source()
+            else:
+                source = transactions.sorted('id')[:1]._repair_source()
+            source_order_id = order.shopify_order_id if order and not historical and not collection else transactions[:1].source_order_id
+            evidence.update(source_review(*source, source_order_id,
+                transactions[:1].payout_id.currency_id.name, self.cutover_date, self.timezone))
+            if order:
+                documents = order.invoice_ids | self.env['account.move'].search([
+                    ('shopify_refund_order_id', '=', order.id), ('move_type', '=', 'out_refund')])
+                documents = documents.filtered(lambda move: move.state != 'cancel')
+                payments = order._shopify_payment_candidates(documents, evidence.get('events', []))
+                evidence['documents'] = [dict(id=move.id, name=move.display_name, kind=move.move_type,
+                    state=move.state, amount=move.amount_total, residual=move.amount_residual,
+                    currency=move.currency_id.name, company=move.company_id.display_name,
+                    customer=move.commercial_partner_id.display_name,
+                    compatible=move.company_id == order.company_id and move.currency_id == order.currency_id
+                        and move.commercial_partner_id == order.partner_id.commercial_partner_id)
+                    for move in documents]
+                evidence['payments'] = [dict(id=pay.id, name=pay.display_name, amount=pay.amount,
+                    direction=pay.payment_type, state=pay.state, date=str(pay.date),
+                    currency=pay.currency_id.name, transaction=pay.shopify_order_transaction_id or '',
+                    posted=pay.move_id.state == 'posted', compatible=pay.company_id == order.company_id
+                        and pay.currency_id == order.currency_id
+                        and pay.partner_id.commercial_partner_id == order.partner_id.commercial_partner_id)
+                    for pay in payments]
         if historical:
             return transactions.sorted('id')[:1]._historical_refund_plan(
                 self.cutover_date, self.timezone, self.sales_journal_id, self.post_historical,
                 opening_account=self.historical_collection_account_id,
-                opening_confirmed=self.clear_historical_collections)
+                opening_confirmed=self.clear_historical_collections, source=source)
         if collection:
             if len(transactions) != 1:
                 raise UserError(_('Review each historical collection against its exact payout transaction.'))
             return transactions._historical_collection_plan(
                 self.cutover_date, self.timezone, self.historical_collection_account_id,
-                self.clear_historical_collections)
+                self.clear_historical_collections, source=source)
         if len(order) != 1:
             raise UserError(_('Import or correct the order before repairing its current-period accounting.'))
         order.check_access('write')
-        plan = order._build_shopify_cash_plan(repair=True)
+        plan = order._build_shopify_cash_plan(repair=True, source=source)
         return dict(kind='order', order_id=order.id, cash=plan)
 
     def action_preview(self):
@@ -126,48 +225,50 @@ class ShopifyPayoutRepair(models.Model):
                 continue
             refreshed |= transaction
             orders = self.env['sale.order']
+            evidence = {}
             try:
                 orders = (transaction.payout_id._shop_cash_orders_for_preview(transaction)
                           if transaction.shop_cash_kind else transaction._repair_order())
                 if transaction._refund_credit_reference():
-                    groups[('credit_link', transaction.id)] = [transaction, orders, self._plan(transaction, orders)]
+                    groups[('credit_link', transaction.id)] = [transaction, orders, self._plan(transaction, orders), evidence]
                 elif transaction.shop_cash_kind:
                     for order in orders:
                         key = ('order', order.id)
                         if key not in groups:
-                            groups[key] = [self.env['shopify.payout.report.line.ept'], order, False]
+                            groups[key] = [self.env['shopify.payout.report.line.ept'], order, False, {}]
                         groups[key][0] |= transaction
                 elif orders and orders.invoice_ids.filtered(lambda move: move.state != 'cancel'):
                     key = ('order', orders.id)
                     if key not in groups:
-                        groups[key] = [self.env['shopify.payout.report.line.ept'], orders, False]
+                        groups[key] = [self.env['shopify.payout.report.line.ept'], orders, False, {}]
                     groups[key][0] |= transaction
                 elif transaction.transaction_type in ('refund', 'payment_refund'):
                     # Multiple captures/refunds in one document produce one credit.
-                    plan = self._plan(transaction, orders, historical=True)
+                    plan = self._plan(transaction, orders, historical=True, evidence=evidence)
                     if plan['kind'] == 'opening_refund':
-                        groups[('opening_refund', transaction.id)] = [transaction, orders, plan]
+                        groups[('opening_refund', transaction.id)] = [transaction, orders, plan, evidence]
                         continue
                     key = ('historical', transaction.payout_id.instance_id.id, plan['values']['shopify_refund_id'])
                     if key not in groups:
-                        groups[key] = [self.env['shopify.payout.report.line.ept'], orders, plan]
+                        groups[key] = [self.env['shopify.payout.report.line.ept'], orders, plan, evidence]
                     groups[key][0] |= transaction
                 elif orders:
                     key = ('order', orders.id)
                     if key not in groups:
-                        groups[key] = [self.env['shopify.payout.report.line.ept'], orders, False]
+                        groups[key] = [self.env['shopify.payout.report.line.ept'], orders, False, {}]
                     groups[key][0] |= transaction
                 else:
-                    plan = self._plan(transaction, orders, collection=True)
-                    groups[('collection', transaction.id)] = [transaction, orders, plan]
+                    plan = self._plan(transaction, orders, collection=True, evidence=evidence)
+                    groups[('collection', transaction.id)] = [transaction, orders, plan, evidence]
             except UserError as error:
                 exceptions.append((transaction, orders if len(orders) == 1 else self.env['sale.order'],
-                                   str(error), getattr(error, 'repair_route', 'review')))
+                                   str(error), getattr(error, 'repair_route', 'review'), evidence,
+                                   getattr(error, 'dependency_order_id', False)))
         values = []
-        for transactions, order, historic_plan in groups.values():
+        for transactions, order, historic_plan, evidence in groups.values():
             plan, error, route = None, '', 'review'
             try:
-                plan = historic_plan or self._plan(transactions, order)
+                plan = historic_plan or self._plan(transactions, order, evidence=evidence)
             except UserError as problem:
                 error = str(problem)
                 route = getattr(problem, 'repair_route', 'review')
@@ -178,12 +279,14 @@ class ShopifyPayoutRepair(models.Model):
                                    'source_name', transactions[:1].source_order_id),
                                status='review' if error else 'ready', selected=not error,
                                plan=json.loads(json.dumps(plan, default=str)) if plan else False,
-                               detail=summary, resolution=route))
+                               detail=summary, resolution=route, review_evidence=evidence,
+                               dependency_order_id=False))
         values.extend(dict(wizard_id=self.id, transaction_ids=[Command.set(transaction.ids)],
                            order_id=order.id,
                            source_reference=transaction.source_order_id or transaction.transaction_id,
-                           kind='review', status='review', selected=False, detail=error, resolution=route)
-                      for transaction, order, error, route in exceptions)
+                           kind='review', status='review', selected=False, detail=error, resolution=route,
+                           review_evidence=evidence, dependency_order_id=dependency)
+                      for transaction, order, error, route, evidence, dependency in exceptions)
         retained = self.env['shopify.payout.repair.line.ept']
         previous = self.line_ids.filtered(lambda line: bool(line.transaction_ids & refreshed))
         for value in values:
@@ -239,9 +342,15 @@ class ShopifyPayoutRepair(models.Model):
         self.invalidate_recordset()
         if self.preview_settings != self._settings():
             raise UserError(_('Settings changed. Refresh the preview before applying.'))
-        selected = self.line_ids.filtered(lambda row: row.selected and row.status == 'ready')
+        selected = self.line_ids.filtered(lambda row: row.selected and row.status == 'ready'
+                                         and row.reconciliation_status != 'matched')
         if not selected:
+            if self.line_ids and all(line.reconciliation_status == 'matched' for line in self.line_ids):
+                self.result = _('All cases are already matched. No accounting or matching was repeated.')
+                return self._reopen()
             raise UserError(_('Select at least one ready repair.'))
+        if selected.filtered(lambda line: not self._case_is_visible(line)):
+            raise UserError(_('Some selected cases are hidden by the current filters. Clear Selection and select the visible Ready cases before applying.'))
         self.payout_ids._lock_settlement_payouts()
         keys = sorted({'shopify-cash:%s:%s' % (transaction.payout_id.instance_id.id, transaction.source_order_id)
                        for transaction in selected.transaction_ids})
@@ -359,11 +468,13 @@ class ShopifyPayoutRepairLine(models.Model):
                              ('review', 'Needs Review')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
     detail = fields.Text(readonly=True)
-    resolution = fields.Selection([
-        ('review', 'Accounting Review'), ('customer', 'Customer Mapping'),
-        ('documents', 'Invoices / Credits'), ('credit', 'Refund Allocation'),
-        ('source', 'Source Evidence'), ('payments', 'Payment Identity'),
-        ('invoice_receipt', 'Invoice Receipt Correction')], default='review', readonly=True)
+    resolution = fields.Selection(REPAIR_ROUTES, default='review', readonly=True, string='Issue')
+    summary = fields.Char(compute='_compute_summary', string='Summary')
+    review_evidence = fields.Json(readonly=True)
+    evidence_html = fields.Html(compute='_compute_evidence_html', string='Source and Accounting Evidence')
+    dependency_order_id = fields.Char(string='Missing Shop Cash Order', readonly=True)
+    can_import_customer = fields.Boolean(compute='_compute_can_import_customer')
+    can_link_credit = fields.Boolean(compute='_compute_can_import_customer')
     next_step = fields.Char(compute='_compute_next_step', string='Next Step')
     plan = fields.Json(readonly=True)
     settings_fingerprint = fields.Char(readonly=True)
@@ -372,6 +483,129 @@ class ShopifyPayoutRepairLine(models.Model):
     last_error = fields.Text(string='Latest Processing Issue', readonly=True)
     history_ids = fields.One2many('shopify.payout.repair.history.ept', 'case_id', readonly=True)
     review_html = fields.Html(compute='_compute_review_html', string='Accounting Preview')
+
+    @api.depends('detail')
+    def _compute_summary(self):
+        for line in self:
+            value = ' '.join((line.detail or '').split())
+            line.summary = value[:117] + '…' if len(value) > 120 else value
+
+    @api.depends('review_evidence')
+    def _compute_evidence_html(self):
+        def table(headers, rows):
+            return (Markup('<table class="table table-sm"><thead><tr>')
+                + Markup('').join(Markup('<th>%s</th>') % escape(header) for header in headers)
+                + Markup('</tr></thead><tbody>')
+                + Markup('').join(Markup('<tr>') + Markup('').join(Markup('<td>%s</td>') % escape(str(value))
+                    for value in row) + Markup('</tr>') for row in rows)
+                + Markup('</tbody></table>'))
+        for line in self:
+            evidence = line.review_evidence or {}
+            if not evidence:
+                line.evidence_html = False
+                continue
+            sections = [Markup('<p>Source order %s · %s · Cutover %s (%s).</p>') %
+                tuple(escape(evidence.get(key, '')) for key in ('order_id', 'currency', 'cutover', 'timezone'))]
+            if evidence.get('source_issue'):
+                sections.append(Markup('<p>Source history needs review: %s</p>') % escape(evidence['source_issue']))
+            documents = evidence.get('documents', [])
+            payments = evidence.get('payments', [])
+            posted = [row for row in documents if row['state'] == 'posted' and row['compatible']]
+            invoices = sum(row['amount'] for row in posted if row['kind'] == 'out_invoice')
+            credits = sum(row['amount'] for row in posted if row['kind'] == 'out_refund')
+            if 'net' in evidence:
+                totals = [[_('Shopify collections'), evidence['gross']], [_('Shopify refunds'), evidence['refunds']],
+                          [_('Shopify net cash'), evidence['net']]]
+                if 'documents' in evidence:
+                    totals.extend([[_('Posted invoices'), invoices], [_('Posted credit notes'), credits],
+                        [_('Invoice less credits'), invoices - credits],
+                        [_('Documents minus Shopify net cash'), round(invoices - credits - float(evidence['net']), 6)],
+                        [_('Posted receipts less refund payments'), sum(row['amount'] * (
+                            -1 if row['direction'] == 'outbound' else 1) for row in payments
+                            if row['posted'] and row['compatible'])]])
+                sections.append(table([_('Comparison'), evidence['currency']], totals))
+            if 'documents' in evidence:
+                sections.append(Markup('<p>Totals include posted documents for this customer, company and currency. '
+                    'A difference needs review; it does not authorize a write-off or new sales invoice. '
+                    'For migrated sales, confirm the opening balances before creating any invoice.</p>'))
+                sections.append(table([_('Document'), _('Status'), _('Total'), _('Open'), _('Currency'),
+                    _('Customer'), _('Company'), _('Same scope')], [[row[key] for key in
+                    ('name', 'state', 'amount', 'residual', 'currency', 'customer', 'company', 'compatible')]
+                    for row in documents]))
+                if not documents:
+                    sections.append(Markup('<p>No active invoice or credit note is linked to this order.</p>'))
+            if payments:
+                sections.append(table([_('Payment'), _('Direction'), _('Status'), _('Date'), _('Amount'),
+                    _('Currency'), _('Source transaction')], [[row[key] for key in
+                    ('name', 'direction', 'state', 'date', 'amount', 'currency', 'transaction')] for row in payments]))
+            if evidence.get('events'):
+                sections.append(table([_('Shopify transaction'), _('Type'), _('Processor'), _('Source time'), _('Amount')],
+                    [[row[key] for key in ('id', 'kind', 'gateway', 'timestamp', 'amount')] for row in evidence['events']]))
+            sections.append(Markup('<p>Historical fulfillment: %s</p>') % escape(evidence.get('fulfillment_result', '')))
+            sections.append(Markup('<p>Shopify payment status: %s. Fulfillment status: %s. Cancelled at: %s.</p>') %
+                tuple(escape(evidence.get(key) or '—') for key in ('financial_status', 'fulfillment_status', 'cancelled_at')))
+            if evidence.get('fulfillment'):
+                sections.append(table([_('Fulfillment'), _('Status'), _('Source time'), _('Before cutover'), _('Issue')],
+                    [[row.get(key, '') for key in ('id', 'status', 'timestamp', 'before_cutover', 'issue')]
+                    for row in evidence['fulfillment']]))
+            if evidence.get('items'):
+                sections.append(table([_('Source item'), _('Item'), _('SKU'), _('Required'), _('Proven before cutover'), _('Unproven'), _('Issue')],
+                    [[row.get(key, '') for key in ('id', 'name', 'sku', 'required', 'fulfilled', 'missing', 'issue')]
+                    for row in evidence['items']]))
+            line.evidence_html = Markup('').join(sections)
+
+    def _customer_import_eligible(self):
+        self.ensure_one()
+        refunds = self.transaction_ids.filtered(lambda tx:
+            tx.transaction_type in ('refund', 'payment_refund') and not tx.shop_cash_kind)
+        return (((self.resolution == 'customer' and self.status == 'review') or self.status == 'ready') and bool(refunds)
+            and refunds == self.transaction_ids and len(set(refunds.mapped('source_order_id'))) == 1
+            and bool(refunds[:1].source_order_id) and len(refunds.payout_id.instance_id) == 1
+            and not self.current_order_id and self.reconciliation_status != 'matched')
+
+    @api.depends('resolution', 'status', 'transaction_ids', 'transaction_ids.transaction_type',
+                 'transaction_ids.shop_cash_kind', 'transaction_ids.source_order_id',
+                 'current_order_id', 'reconciliation_status')
+    def _compute_can_import_customer(self):
+        for line in self:
+            line.can_import_customer = (line.resolution == 'customer' and line.status == 'review'
+                                       and line._customer_import_eligible())
+            refunds = line.transaction_ids.filtered(lambda tx:
+                tx.transaction_type in ('refund', 'payment_refund') and not tx.shop_cash_kind)
+            line.can_link_credit = len(refunds) == 1 and refunds == line.transaction_ids and line.reconciliation_status != 'matched'
+
+    def _dependency(self):
+        self.ensure_one()
+        self.check_access('read')
+        transactions = self.transaction_ids.filtered('shop_cash_kind')
+        if (self.resolution != 'shop_cash' or not self.dependency_order_id
+                or len(transactions.payout_id.instance_id) != 1
+                or transactions.payout_id - self.wizard_id.payout_ids
+                or self.dependency_order_id not in {str(item.get('order_id'))
+                    for transaction in transactions for item in transaction.shop_cash_allocations or []}):
+            raise UserError(_('Refresh this case to identify its exact Shop Cash order dependency.'))
+        return transactions[:1].payout_id.instance_id
+
+    def action_open_dependency_order(self):
+        from urllib.parse import quote
+        instance = self._dependency()
+        host = (instance.shopify_host or '').removeprefix('https://').removeprefix('http://').strip('/')
+        if not host or '/' in host:
+            raise UserError(_('Configure the store hostname first.'))
+        return {'type': 'ir.actions.act_url', 'url': 'https://%s/admin/orders/%s' %
+            (host, quote(self.dependency_order_id, safe='')), 'target': 'new'}
+
+    def action_review_dependency_import(self):
+        self.wizard_id._check_manager()
+        instance = self._dependency()
+        if self.env['sale.order'].search_count([('shopify_order_id', '=', self.dependency_order_id),
+                ('shopify_instance_id', '=', instance.id), ('company_id', '=', self.company_id.id)]):
+            raise UserError(_('The dependency order is now imported. Refresh this case to continue.'))
+        action = self.env['ir.actions.act_window']._for_xml_id(
+            'shopify_ept.action_wizard_shopify_instance_import_export_operations')
+        action['context'] = dict(self.env.context, default_shopify_instance_id=instance.id,
+            default_shopify_operation='import_orders_by_remote_ids', default_shopify_order_ids=self.dependency_order_id)
+        return action
 
     def action_link_refund_credit_note(self):
         self.ensure_one()
@@ -395,6 +629,7 @@ class ShopifyPayoutRepairLine(models.Model):
             'source': _('Open Shopify and verify fulfillment, cancellation and processor history, then Refresh Case.'),
             'payments': _('Review Payments to inspect the exact source transactions and existing receipts.'),
             'invoice_receipt': _('Review Payments, then Preview Invoice Receipt Correction; inspect the reversal before applying.'),
+            'shop_cash': _('Open Dependency in Shopify, verify cutover treatment, then Review Order Import and Refresh Case.'),
             'review': _('Review Details and the recorded issue, correct the evidence/accounting, then Refresh Case.'),
         }
         for case in self:
@@ -468,6 +703,7 @@ class ShopifyPayoutRepairLine(models.Model):
             'source_reference': self.source_reference, 'source_order_id': self.transaction_ids[:1].source_order_id,
             'order_id': self.current_order_id.id, 'detail': detail if detail is not None else self.last_error or self.detail,
             'plan': self.plan, 'payment_ids': [Command.set(self.payment_ids.ids)],
+            'review_evidence': self.review_evidence,
             'credit_ids': [Command.set(self.credit_ids.ids)],
             'collection_move_ids': [Command.set(self.collection_move_ids.ids)],
         })
@@ -484,11 +720,7 @@ class ShopifyPayoutRepairLine(models.Model):
             raise UserError(_('The repair contains transactions outside the selected payouts.'))
         refunds = self.transaction_ids.filtered(lambda tx:
             tx.transaction_type in ('refund', 'payment_refund') and not tx.shop_cash_kind)
-        if (not refunds or refunds != self.transaction_ids
-                or len(set(refunds.mapped('source_order_id'))) != 1
-                or not refunds[:1].source_order_id or len(refunds.payout_id.instance_id) != 1
-                or self.current_order_id or self.reconciliation_status == 'matched'
-                or refunds[:1]._repair_order()):
+        if not self._customer_import_eligible() or refunds[:1]._repair_order():
             raise UserError(_('Import a customer only for an unmatched refund case with one missing source order.'))
         customer_id, partner = refunds.sorted('id')[:1]._import_repair_customer()
         self._record_history('customer', detail=_('Shopify customer %s mapped to %s (customer %s). Customer import only; review the refreshed accounting preview before applying.',

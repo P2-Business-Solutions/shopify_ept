@@ -4,6 +4,7 @@ from odoo.exceptions import UserError
 
 from .shopify_payment_plan import cash_events, fingerprint
 from .shopify_refund_plan import prove_historical_fulfillment, source_date
+from .shopify_repair_error import ShopifyRepairBlocked
 
 
 class ShopifyHistoricalCollectionMove(models.Model):
@@ -120,8 +121,8 @@ class ShopifyHistoricalCollectionLine(models.Model):
             if any(source_date(row['timestamp'], timezone) >= cutover for row in events if row['kind'] != 'refund'):
                 raise UserError(_('%s: collections span the cutover. Review the opening-balance allocation separately.', name))
         except ValueError as error:
-            raise UserError(_('%(order)s: %(reason)s Import a current-period order only if its sales/fulfillment were not included in migration balances.',
-                              order=name, reason=str(error))) from error
+            raise ShopifyRepairBlocked(_('%(order)s: %(reason)s Import a current-period order only if its sales/fulfillment were not included in migration balances.',
+                                         order=name, reason=str(error)), 'source') from error
         if payout.payout_date < cutover:
             raise UserError(_('%s: the payout predates cutover and needs review of the opening balances.', name))
         refund_id = False
