@@ -144,6 +144,104 @@ class TestShopCashSettlement(PayoutTestCase):
                                          lambda row: row.transaction_type == statement.shopify_transaction_type).account_id)):
                 return operation()
 
+    def test_generation_action_matches_exact_payment_before_previewing_blocked_refund(self):
+        from ..models.shopify_repair_error import ShopifyRepairBlocked
+        order, invoice = self._order('automatic-card-payment', 100)
+        payment = self._payment(order, 100, 'automatic-card-capture', gateway='shopify_payments', invoice=invoice)
+        payout = self._payout('automatic-partial')
+        charge = payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'charge')
+        charge.write({'order_id': order.id, 'source_order_id': order.shopify_order_id,
+                      'source_order_transaction_id': payment.shopify_order_transaction_id})
+        blocked_order = self.env['sale.order'].create({'partner_id': order.partner_id.id,
+            'shopify_instance_id': self.instance.id, 'shopify_order_id': 'automatic-blocked-order'})
+        refund = self.env['shopify.payout.report.line.ept'].create({'payout_id': payout.id,
+            'transaction_type': 'refund', 'transaction_id': 'automatic-blocked-refund',
+            'source_order_id': blocked_order.shopify_order_id, 'order_id': blocked_order.id,
+            'source_order_transaction_id': 'automatic-refund-cash', 'amount': -45,
+            'is_remaining_statement': True})
+        payout.amount = 52
+        original = type(payout).check_for_invoice_refund
+        def blocked(model, transaction, logs):
+            if transaction == refund:
+                raise ShopifyRepairBlocked('Existing payments need accounting review', 'payments')
+            return original(model, transaction, logs)
+        with patch.object(type(payout), 'check_for_invoice_refund', blocked), \
+                patch.object(type(refund), '_repair_source',
+                             side_effect=ShopifyRepairBlocked('Existing payments need accounting review', 'payments')):
+            action = self._process(payout, payout.action_generate_bank_statement)
+        self.assertEqual(action['res_model'], 'shopify.payout.repair.ept')
+        self.assertTrue(payment._seek_for_lines()[0].reconciled)
+        matched = payout.payout_statement_line_ids.filtered(lambda row: row.payout_line_id == charge)
+        self.assertTrue(matched.is_reconciled)
+        pending = payout.payout_statement_line_ids.filtered(lambda row: row.payout_line_id == refund)
+        self.assertFalse(pending.is_reconciled)
+        self.assertEqual(payout.state, 'partially_processed')
+        self.assertEqual(payout.unreconciled_total, -45)
+        self.assertEqual(payout.unreconciled_transaction_count, 1)
+        workspace = self.env[action['res_model']].browse(action['res_id'])
+        self.assertEqual(workspace.line_ids.transaction_ids, refund)
+        self.assertEqual(workspace.line_ids.resolution, 'payments')
+        self.assertIn('Review Payments', workspace.line_ids.next_step)
+
+    def test_generation_action_fully_matches_payment_and_is_repeatable(self):
+        order, invoice = self._order('automatic-full-payment', 100)
+        payment = self._payment(order, 100, 'automatic-full-capture', gateway='shopify_payments', invoice=invoice)
+        payout = self._payout('automatic-full')
+        payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'charge').write({
+            'order_id': order.id, 'source_order_id': order.shopify_order_id,
+            'source_order_transaction_id': payment.shopify_order_transaction_id})
+        self.assertEqual(payout.unreconciled_total, 97)
+        self.assertEqual(payout.unreconciled_transaction_count, 2)
+        action = self._process(payout, payout.action_generate_bank_statement)
+        self.assertEqual(action['tag'], 'reload')
+        self.assertEqual(payout.state, 'validated')
+        self.assertEqual(payout.unreconciled_total, 0)
+        self.assertEqual(payout.unreconciled_transaction_count, 0)
+        lines = payout.payout_statement_line_ids.line_ids
+        self._process(payout, payout.action_generate_bank_statement)
+        self.assertEqual(payout.payout_statement_line_ids.line_ids, lines)
+
+    def test_unreconciled_total_tracks_partial_matches_unmatching_and_missing_rows(self):
+        payout = self._payout('residual-total')
+        payout.generate_bank_statement()
+        charge = payout.payout_statement_line_ids.filtered(lambda row: row.shopify_transaction_type == 'charge')
+        self.assertEqual(payout.unreconciled_total, 100)
+        self.assertEqual(payout.unreconciled_transaction_count, 1)
+        suspense = charge._seek_for_lines()[1]
+        offset = self.env['account.move'].create({'journal_id': self.sales_journal.id,
+            'date': payout.payout_date, 'line_ids': [
+                Command.create({'account_id': suspense.account_id.id, 'debit': 40, 'credit': 0}),
+                Command.create({'account_id': self.revenue.id, 'debit': 0, 'credit': 40})]})
+        offset.action_post()
+        (suspense | offset.line_ids.filtered(lambda row: row.account_id == suspense.account_id)).reconcile()
+        self.assertFalse(charge.is_reconciled)
+        self.assertEqual(payout.unreconciled_total, 60)
+        self.assertEqual(payout.unreconciled_transaction_count, 1)
+        suspense.remove_move_reconcile()
+        self.assertEqual(payout.unreconciled_total, 100)
+        charge.unlink()
+        self.assertEqual(payout.unreconciled_total, 100)
+        self.assertEqual(payout.unreconciled_transaction_count, 1)
+
+    def test_net_zero_does_not_hide_unreconciled_transaction_count(self):
+        payout = self.env['shopify.payout.report.ept'].create({'instance_id': self.instance.id,
+            'payout_date': fields.Date.today(), 'currency_id': self.env.company.currency_id.id,
+            'payout_transaction_ids': [Command.create({'transaction_type': kind, 'amount': amount})
+                for kind, amount in [('charge', 100), ('refund', -100), ('fees', 0)]]})
+        self.assertEqual(payout.unreconciled_total, 0)
+        self.assertEqual(payout.unreconciled_transaction_count, 2)
+
+    def test_unreconciled_total_uses_payout_currency_at_statement_booked_rate(self):
+        payout = self._payout('foreign-residual')
+        payout.generate_bank_statement()
+        foreign = self.env.ref('base.EUR')
+        foreign.active = True
+        charge = payout.payout_statement_line_ids.filtered(lambda row: row.shopify_transaction_type == 'charge')
+        charge.write({'foreign_currency_id': foreign.id, 'amount_currency': 80})
+        self.assertEqual(charge.amount_residual, -80)
+        self.assertEqual(payout.unreconciled_total, 100)
+        self.assertEqual(payout.unreconciled_transaction_count, 1)
+
     def test_reimport_repairs_generic_credit_preserves_card_and_is_repeatable(self):
         order, invoice = self._order('reimport-mixed', 265.91)
         card = self._payment(order, 225.91, 'reimport-card', gateway='shopify_payments', invoice=invoice)

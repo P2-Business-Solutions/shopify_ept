@@ -71,7 +71,7 @@ class TestShopifyRepairProgress(PayoutTestCase):
         with patch.object(type(workspace), 'action_preview', side_effect=UserError('Preview unavailable')):
             action = payout.action_generate_bank_statement()
         self.assertEqual(action['tag'], 'display_notification')
-        self.assertEqual(payout.state, 'generated')
+        self.assertEqual(payout.state, 'partially_processed')
         self.assertEqual(len(payout.payout_statement_line_ids), 1)
         self.assertIn('Preview unavailable', payout.reimport_reconciliation_issue)
 

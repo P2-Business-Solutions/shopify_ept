@@ -1,5 +1,36 @@
 # Bulk payout exception processing
 
+### Reconcile available payments and track the remaining balance (18.0.3.39)
+
+**Generate Bank Statement** now generates the cash rows and immediately reconciles
+the transactions it can, before showing the remaining exceptions in Bulk Repair.
+The list action does this for each eligible selected payout, including already
+generated or partially processed payouts. Each blocked transaction retains its
+existing exception handling; successful payment matches and fee postings remain
+saved. Fully reconciled payouts validate through the usual checks. The reviewed
+repair plans still require **Apply Selected Ready Cases**.
+
+The payout form and list show **Unreconciled Total** in the payout currency. This
+is the signed net balance: incoming payments are positive; refunds and deductions
+are negative. It includes cash transactions whose statement rows are still missing,
+and uses the remaining balance for partially matched statement lines. It updates
+when matching is applied or undone. Optional foreign-currency rows use their
+booked statement exchange rate.
+
+**Unreconciled Transactions** shows how many nonzero rows remain. A zero net total
+can still have unresolved offsetting payments/refunds; use the count and exception
+details to identify them. These fields describe payout transaction matching. The
+actual bank-deposit match and final review/validation remain their existing steps.
+
+Upgrade the module to install the fields and updated views. Internal generation
+callers retain the generation-only API; the generation button/list action performs
+the combined workflow.
+
+Validation: 251 tests passed in the full Odoo 18 Community connector suite, followed
+by 37 accounting tests covering the final remaining-balance and foreign-currency
+calculations. All 114 standalone tests passed. Tests used a disposable database and
+the existing Community ledger matcher in place of the Enterprise widget.
+
 ### Statement exceptions and proposed fixes (18.0.3.38)
 
 **Generate Bank Statement** now retains a cash statement row when an automatic

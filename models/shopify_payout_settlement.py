@@ -25,6 +25,40 @@ class ShopifyPayoutSettlement(models.Model):
         string='Matched Bank Transactions', store=True)
     payout_statement_line_ids = fields.One2many(
         'account.bank.statement.line', 'payout_id', readonly=True)
+    unreconciled_total = fields.Monetary(
+        string='Unreconciled Total', compute='_compute_unreconciled_total', store=True,
+        currency_field='currency_id',
+        help='Net balance still awaiting reconciliation in the payout currency: payments less refunds '
+             'and other deductions. Includes transactions without a statement line and the remaining '
+             'balance of partially matched lines. Offsetting transactions can produce a zero net total '
+             'while the unreconciled transaction count is still positive.')
+    unreconciled_transaction_count = fields.Integer(
+        string='Unreconciled Transactions', compute='_compute_unreconciled_total', store=True,
+        help='Nonzero statement lines still awaiting reconciliation, plus payout transactions '
+             'without a statement line.')
+
+    @api.depends('currency_id', 'payout_transaction_ids.amount',
+                 'payout_statement_line_ids.is_reconciled', 'payout_statement_line_ids.amount_residual',
+                 'payout_statement_line_ids.amount', 'payout_statement_line_ids.amount_currency',
+                 'payout_statement_line_ids.foreign_currency_id', 'payout_statement_line_ids.payout_line_id')
+    def _compute_unreconciled_total(self):
+        for payout in self:
+            currency = payout.currency_id
+            pending = payout.payout_statement_line_ids.filtered(
+                lambda line: not line.is_reconciled and (
+                    not currency.is_zero(line.amount) if currency else bool(line.amount)))
+            missing = (payout.payout_transaction_ids - payout.payout_statement_line_ids.payout_line_id).filtered(
+                lambda line: not currency.is_zero(line.amount) if currency else bool(line.amount))
+            total = sum(missing.mapped('amount'))
+            for statement in pending:
+                # Odoo's suspense residual has the opposite sign to the cash row.
+                residual = -statement.amount_residual
+                if statement.foreign_currency_id and statement.amount_currency:
+                    # Preserve the statement's booked exchange rate.
+                    residual *= statement.amount / statement.amount_currency
+                total += residual
+            payout.unreconciled_total = currency.round(total) if currency else total
+            payout.unreconciled_transaction_count = len(pending) + len(missing)
 
     @api.depends(
         'settlement_move_id.state', 'settlement_move_id.reversal_move_ids.state',

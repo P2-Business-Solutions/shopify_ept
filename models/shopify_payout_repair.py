@@ -482,6 +482,9 @@ class ShopifyPayoutRepair(models.Model):
 
     def action_generate_bank_statement(self):
         self.generate_bank_statement()
+        for payout in self.filtered(lambda row: row.state in (
+                'generated', 'partially_generated', 'partially_processed') and row.payout_statement_line_ids).sorted('id'):
+            payout.process_bank_statement()
         return self.action_review_payout_exceptions()
 
     def action_process_bank_statement(self):

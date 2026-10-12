@@ -45,6 +45,9 @@
                 <field name="payout_status"/>
                 <field name="instance_id"/>
                 <field name="amount"/>
+                <field name="currency_id" column_invisible="True"/>
+                <field name="unreconciled_total"/>
+                <field name="unreconciled_transaction_count" optional="show"/>
                 <field name="state"/>
                 <field name="settlement_status"/>
             </list>
@@ -115,6 +118,8 @@
                             <field name="payout_reference_id" readonly="1"/>
                             <field name="payout_status" readonly="1"/>
                             <field name="amount" readonly="1"/>
+                            <field name="unreconciled_total" readonly="1"/>
+                            <field name="unreconciled_transaction_count" readonly="1"/>
                         </group>
                     </group>
                     <group>

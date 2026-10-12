@@ -146,7 +146,7 @@ class TestShopifyPayoutGeneration(PayoutTestCase):
         lines = self._statement_lines(payouts)
         self.assertEqual(len(lines), 4)
         for payout in payouts:
-            self.assertEqual(payout.state, 'generated')
+            self.assertEqual(payout.state, 'partially_processed')
             self.assertEqual(sum(self._statement_lines(payout).mapped('amount')), 97)
         payouts.generate_bank_statement()
         self.assertEqual(self._statement_lines(payouts), lines)
