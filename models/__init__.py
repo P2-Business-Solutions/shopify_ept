@@ -16,6 +16,7 @@ from . import customer_data_queue_line_ept
 from . import res_partner
 from . import payment_gateway
 from . import sale_order
+from . import sale_order_pos_fulfillment
 from . import location_ept
 from . import order_risk
 from . import sale_auto_workflow_configuration

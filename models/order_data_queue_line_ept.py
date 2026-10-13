@@ -136,8 +136,12 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
             instance.connect_in_shopify()
         for order in orders_data:
             fulfillment_data = []
-            cancelled = is_cancelled_shopify_order(order if isinstance(order, dict) else order.to_dict())
-            if needs_fulfillment_data and not cancelled:
+            order_payload = order if isinstance(order, dict) else order.to_dict()
+            cancelled = is_cancelled_shopify_order(order_payload)
+            completed_pos = (order_payload.get('source_name') == 'pos' and
+                             order_payload.get('fulfillment_status') in ('fulfilled', 'partial') and
+                             any(row.get('status') == 'success' for row in order_payload.get('fulfillments', [])))
+            if needs_fulfillment_data and not cancelled and not completed_pos:
                 order_id = order.get('id') if isinstance(order, dict) else order.id
                 fulfillment_data = self.env["sale.order"].get_shopify_fulfillment_orders(order_id)
             if created_by == "webhook" and not is_new_order:

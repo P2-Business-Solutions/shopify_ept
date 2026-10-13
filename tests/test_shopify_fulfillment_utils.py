@@ -114,6 +114,21 @@ class TestShopifyFulfillmentUtils(unittest.TestCase):
             {"201", "202", "203", "301"},
         )
 
+    def test_completed_pos_uses_actual_fulfillment_location_over_checkout_location(self):
+        self.assertEqual(UTILS.get_single_order_location_id({
+            'source_name': 'pos', 'fulfillment_status': 'fulfilled', 'location_id': 301,
+            'fulfillments': [{'status': 'success', 'location_id': 201},
+                             {'status': 'cancelled', 'location_id': 301}],
+            'fulfillment_data': [{'assigned_location_id': 301}],
+        }), '201')
+
+    def test_split_completed_pos_locations_do_not_set_ambiguous_header(self):
+        self.assertFalse(UTILS.get_single_order_location_id({
+            'source_name': 'pos', 'fulfillment_status': 'fulfilled', 'location_id': 301,
+            'fulfillments': [{'status': 'success', 'location_id': 201},
+                             {'status': 'success', 'location_id': 301}],
+        }))
+
     def test_draft_workflow_wins_when_order_spans_locations(self):
         automatic_workflow = Workflow(
             10, validate_order=True, create_invoice=True,

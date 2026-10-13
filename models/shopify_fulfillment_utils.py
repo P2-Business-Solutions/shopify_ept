@@ -44,6 +44,15 @@ def get_order_location_ids(order_response):
 
 def get_single_order_location_id(order_response):
     """Return the one unambiguous Shopify location represented by an order."""
+    if (order_response.get('source_name') == 'pos' and
+            order_response.get('fulfillment_status') in ('fulfilled', 'partial')):
+        completed_locations = {
+            str(fulfillment['location_id'])
+            for fulfillment in order_response.get('fulfillments', [])
+            if fulfillment.get('status') == 'success' and fulfillment.get('location_id')
+        }
+        if completed_locations:
+            return completed_locations.pop() if len(completed_locations) == 1 else False
     if order_response.get("location_id"):
         return str(order_response["location_id"])
 

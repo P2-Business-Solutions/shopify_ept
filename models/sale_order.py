@@ -715,6 +715,9 @@ class SaleOrder(models.Model):
                 if is_cancelled_shopify_order(order_response):
                     sale_order._process_shopify_cancelled_import(order_response, order_data_line)
                     continue
+                if pos_order and order_response.get("fulfillment_status") in ("fulfilled", "partial"):
+                    self.update_shopify_order(order_data_line, "Webhook", instance)
+                    continue
                 if sale_order._shopify_external_order_error():
                     # An earlier external settlement failure left this order
                     # for review. Reprocess its source instead of discarding it
@@ -783,9 +786,18 @@ class SaleOrder(models.Model):
                 if not self._context.get('shopify_order_financial_status'):
                     context.update({'shopify_order_financial_status': order_response.get(
                         "financial_status")})
-                context.update({'order_data_line': order_data_line})
+                context.update({'order_data_line': order_data_line,
+                                'shopify_order_response': order_response,
+                                'shopify_order_transactions': order_response.get('transaction', [])})
                 self.env.context = context
-                if sale_order.shopify_order_status == "fulfilled":
+                if pos_order and sale_order.shopify_order_status in ("fulfilled", "partial"):
+                    sale_order.process_shopify_pos_fulfillments(order_response, order_data_line)
+                    created_by = ('Scheduled Action' if order_data_line and
+                                  order_data_line.shopify_order_data_queue_id.created_by == "scheduled_action"
+                                  else self.env.user.name)
+                    message = self.create_shipped_order_refund(
+                        shopify_financial_status, order_response, sale_order, created_by)
+                elif sale_order.shopify_order_status == "fulfilled":
                     sale_order.auto_workflow_process_id.shipped_order_workflow_ept(sale_order)
                     if order_data_line and order_data_line.shopify_order_data_queue_id.created_by == "scheduled_action":
                         created_by = 'Scheduled Action'
@@ -1253,6 +1265,21 @@ class SaleOrder(models.Model):
         """
         shopify_location_obj = self.env['shopify.location.ept']
         shopify_order_id = order.shopify_order_id
+        if order_response.get('source_name') == 'pos' and order_response.get('fulfillments'):
+            # Completed POS sales already supply their actual stock locations.
+            # Fulfillment Orders can describe a different, planned location.
+            for fulfillment in order_response['fulfillments']:
+                if fulfillment.get('status') != 'success':
+                    continue
+                location = shopify_location_obj.search([
+                    ('shopify_location_id', '=', str(fulfillment.get('location_id'))),
+                    ('instance_id', '=', instance.id),
+                ], limit=1)
+                line_ids = {str(line['id']) for line in fulfillment.get('line_items', [])}
+                order.order_line.filtered(lambda line: line.shopify_line_id in line_ids).write({
+                    'warehouse_id_ept': location.warehouse_for_order.id or instance.shopify_warehouse_id.id,
+                })
+            return True
         if not order_response.get('fulfillment_data'):
             order_response["fulfillment_data"] = self.get_shopify_fulfillment_orders(shopify_order_id)
         fulfillment_data = order_response.get('fulfillment_data', [])
@@ -1803,8 +1830,12 @@ class SaleOrder(models.Model):
         if product and product_qty and product_uom:
             vals = self.prepare_val_for_stock_move_ept(product, product_qty, product_uom, vendor_location,
                                                        customers_location, order_line, bom_line)
+            order_response_data = self.env.context.get('shopify_order_response') or {}
+            order_data_line = self.env.context.get('order_data_line')
+            if not order_response_data and order_data_line and order_data_line.order_data:
+                order_response_data = json.loads(order_data_line.order_data)
             queue_id = self.env.context.get('active_ids')
-            if queue_id:
+            if queue_id and not order_response_data:
                 order_data_line = self.env['shopify.order.data.queue.line.ept'].search(
                     [('shopify_order_data_queue_id', 'in', queue_id), ('shopify_order_id', '=', self.shopify_order_id)],
                     limit=1)
@@ -2849,12 +2880,17 @@ class SaleOrder(models.Model):
                 if is_manual_update:
                     order_with_transactions.update_shopify_tax_line_ept(instance, order_data)
 
-                if order_data.get('fulfillment_status') in (
+                pos_fulfillment = (order_data.get('source_name') == 'pos' and
+                                   order_data.get('fulfillment_status') in ('fulfilled', 'partial'))
+                if pos_fulfillment:
+                    order.process_shopify_pos_fulfillments(order_data, queue_line)
+                    need_to_done_queue = True
+                elif order_data.get('fulfillment_status') in (
                         'fulfilled', 'partial') and instance.ship_order_webhook and order_data.get('fulfillments'):
                     need_to_done_queue = False
                     self.process_order_fulfillment_ept(order, shopify_instance, order_data, queue_line)
 
-                if shopify_status == 'paid' and queue_line.state != "failed":
+                if not pos_fulfillment and shopify_status == 'paid' and queue_line.state != "failed":
                     self.webhook_paid_workflow_process_ept(
                         order_with_transactions, instance, queue_line, order_data, shopify_status
                     )
