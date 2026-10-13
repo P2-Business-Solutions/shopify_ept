@@ -136,12 +136,19 @@ class TestSpecificPayoutImport(PayoutTestCase):
         calls = []
         def capture(model, ids, instance):
             calls.append((ids, instance.id))
-            return self.env[model._name]
+            self.assertEqual(model.env.context['active_ids'], model.ids)
+            self.assertEqual(model.env.context['active_id'], model.id)
+            self.assertNotIn('shopify_bulk_repaired_line_ids', model.env.context)
+            return model
         action = self.env.ref('shopify_ept.action_reimport_shopify_payouts')
         with patch.object(type(first), 'get_payout_report_by_ids', capture):
-            result = action.with_context(active_model=first._name, active_ids=(first | second).ids).run()
+            result = action.with_context(active_model=first._name, active_ids=(first | second).ids,
+                                         shopify_bulk_repaired_line_ids=[]).run()
         self.assertEqual(set(calls), {('123', self.instance.id), ('456', other_instance.id)})
-        self.assertEqual(result['tag'], 'reload')
+        self.assertEqual(result['tag'], 'display_notification')
+        self.assertIn('2 payout(s) reimported', result['params']['message'])
+        self.assertTrue(first.last_reimport_at and second.last_reimport_at)
+        self.assertIn('still unreconciled', first.last_reimport_result)
 
     def test_import_from_populated_recordset_returns_only_requested_store_report(self):
         existing = self._payout('999')

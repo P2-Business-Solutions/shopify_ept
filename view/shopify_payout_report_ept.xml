@@ -11,15 +11,31 @@
                 <field name="state"/>
                 <field name="instance_id"/>
                 <field name="statement_id"/>
+                <field name="payout_date"/>
                 <field name="payout_transaction_ids" string="Shopify Order ID" filter_domain="[('payout_transaction_ids.source_order_id', '=', self)]"/>
                 <filter name="remaining_reports" string="Remaining Reports"
-                        domain="['|', '|', ('state', '!=', 'validated'), ('settlement_status', '!=', 'matched'), ('reimport_reconciliation_issue', '!=', False)]"/>
+                        domain="[('unreconciled_transaction_count', '&gt;', 0)]"
+                        help="Payouts with transactions still unreconciled, including transactions missing statement lines."/>
+                <filter name="partially_reconciled" string="Partially Reconciled"
+                        domain="[('unreconciled_transaction_count', '&gt;', 0), ('payout_statement_line_ids.is_reconciled', '=', True)]"/>
+                <filter name="not_generated" string="Statements Not Generated"
+                        domain="[('state', 'in', ['draft', 'partially_generated']), ('unreconciled_transaction_count', '&gt;', 0)]"/>
+                <filter name="validation_review" string="Reconciled / Needs Validation"
+                        domain="[('unreconciled_transaction_count', '=', 0), ('payout_statement_line_ids', '!=', False), ('state', '!=', 'validated')]"/>
+                <filter name="fully_reconciled" string="Fully Reconciled"
+                        domain="[('unreconciled_transaction_count', '=', 0), ('state', '=', 'validated')]"/>
+                <separator/>
+                <filter name="open_payment_exceptions" string="Open Payment Exceptions"
+                        domain="[('has_open_payment_exceptions', '=', True)]"/>
+                <separator/>
                 <filter name="awaiting_bank" string="Awaiting Bank Match"
                         domain="[('settlement_status', 'in', ['pending', 'partial'])]"/>
                 <filter name="settlement_review" string="Settlement Needs Review"
                         domain="[('settlement_status', '=', 'review')]"/>
                 <filter name="missing_settlement" string="No Settlement Transfer"
                         domain="[('state', '=', 'validated'), ('settlement_move_id', '=', False)]"/>
+                <separator/>
+                <filter name="payout_date_filter" string="Payout Date" date="payout_date"/>
                 <group expand="0" string="Group By...">
                     <filter name="instance" string="Instance" context="{'group_by':'instance_id'}"/>
                     <filter name="status" string="Status" context="{'group_by':'state'}"/>
@@ -38,7 +54,7 @@
                   decoration-info="state== 'processed' "
                   decoration-muted="state == 'partially_generated'"
                   decoration-bf="state == 'generated'"
-                  decoration-success="state == 'closed'" create="false" sample="1">
+                  decoration-success="state == 'closed'" create="false" sample="1" default_order="payout_date asc, id asc">
                 <field name="name"/>
                 <field name="payout_date"/>
                 <field name="payout_reference_id"/>
@@ -50,6 +66,7 @@
                 <field name="unreconciled_transaction_count" optional="show"/>
                 <field name="state"/>
                 <field name="settlement_status"/>
+                <field name="last_reimport_at" optional="hide"/>
             </list>
         </field>
     </record>
@@ -121,6 +138,10 @@
                             <field name="unreconciled_total" readonly="1"/>
                             <field name="unreconciled_transaction_count" readonly="1"/>
                         </group>
+                    </group>
+                    <group string="Last Reimport / Reconcile" invisible="not last_reimport_at">
+                        <field name="last_reimport_at" readonly="1"/>
+                        <field name="last_reimport_result" readonly="1"/>
                     </group>
                     <group>
                         <group>

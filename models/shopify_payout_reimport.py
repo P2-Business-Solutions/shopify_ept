@@ -15,6 +15,8 @@ class ShopifyPayoutReimport(models.Model):
         string='Payout Exceptions', readonly=True, copy=False,
         help='Transactions or payout configuration that need review after statement generation, '
              'reconciliation or reimport. Use Bulk Repair Transactions to preview proposed fixes.')
+    last_reimport_at = fields.Datetime(string='Last Reimport / Reconcile', readonly=True, copy=False)
+    last_reimport_result = fields.Text(string='Last Reimport / Reconcile Result', readonly=True, copy=False)
 
     def _check_payout_reimport_period(self):
         """Never use a user lock exception or shift a payout into another period."""
@@ -156,7 +158,7 @@ class ShopifyPayoutReimport(models.Model):
                 issues.append(str(error))
         if fees_repaired or repaired or issues or statements.filtered(lambda row: not row.is_reconciled):
             self.state = 'partially_processed'
-        if self.state in ('generated', 'partially_processed', 'processed'):
+        if self.state in ('generated', 'partially_processed', 'processed', 'validated'):
             try:
                 # Normal processing isolates missing payments per statement line.
                 # If final validation fails, keep the earlier atomic Shop Cash repairs.

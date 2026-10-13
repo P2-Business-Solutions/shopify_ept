@@ -4,6 +4,15 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from datetime import timedelta
+from xml.etree import ElementTree
+
+try:
+    from .test_shopify_payout_generation import PayoutTestCase, ODOO_AVAILABLE
+except ImportError:
+    from test_shopify_payout_generation import PayoutTestCase, ODOO_AVAILABLE
+if ODOO_AVAILABLE:
+    from odoo import Command, fields
 
 
 source = ast.parse((Path(__file__).resolve().parents[1] / 'models' / 'shopify_payout_settlement.py').read_text())
@@ -78,3 +87,69 @@ class TestShopifyPayoutReview(unittest.TestCase):
     def test_reviewed_but_unreconciled_source_still_requires_review(self):
         self.source.is_reconciled = False
         self.assertEqual(self._status(), 'review')
+
+
+class TestShopifyPayoutFilters(PayoutTestCase):
+    def _filter(self, name, payouts):
+        view = ElementTree.fromstring(self.env.ref('shopify_ept.shopify_payout_report_search_view').arch_db)
+        domain = ast.literal_eval(view.find('.//filter[@name="%s"]' % name).get('domain'))
+        return self.env[payouts._name].search(domain + [('id', 'in', payouts.ids)])
+
+    def _matched_payout(self, name):
+        payout = self._payout(name)
+        self.journal.autocheck_on_post = True
+        payout.generate_bank_statement()
+        for line in payout.payout_statement_line_ids:
+            _liquidity, suspense, _other = line._seek_for_lines()
+            suspense.account_id = self.instance.transaction_line_ids.account_id
+        payout.validate_statement()
+        return payout
+
+    def test_remaining_and_payment_exception_filters_ignore_old_notes_and_bank_only_work(self):
+        closed = self._matched_payout('matched-old-note')
+        closed.reimport_reconciliation_issue = 'Old processing warning'
+        open_payout = self._payout('truly-open')
+        open_payout.reimport_reconciliation_issue = 'Current missing payment'
+        offset = self._payout('offset-open')
+        charge = offset.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'charge')
+        charge.fee = 0
+        offset.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'fees').amount = 0
+        offset.payout_transaction_ids = [Command.create({'transaction_type': 'refund', 'amount': -100})]
+        payouts = closed | open_payout | offset
+        self.assertEqual(offset.unreconciled_total, 0)
+        self.assertEqual(offset.unreconciled_transaction_count, 2)
+        self.assertEqual(closed.settlement_status, 'not_created')
+        self.assertFalse(closed.has_open_payment_exceptions)
+        self.assertTrue(open_payout.has_open_payment_exceptions)
+        self.assertEqual(set(self._filter('remaining_reports', payouts).ids), set((open_payout | offset).ids))
+        self.assertEqual(self._filter('open_payment_exceptions', payouts), open_payout)
+        self.assertEqual(self._filter('missing_settlement', payouts), closed)
+        self.assertEqual(self._filter('fully_reconciled', payouts), closed)
+
+    def test_validation_review_is_separate_from_unreconciled_payments(self):
+        payout = self._matched_payout('validation-review')
+        payout.write({'state': 'partially_processed', 'reimport_reconciliation_issue': 'Review payout totals'})
+        self.assertFalse(self._filter('remaining_reports', payout))
+        self.assertFalse(self._filter('open_payment_exceptions', payout))
+        self.assertEqual(self._filter('validation_review', payout), payout)
+
+    def test_open_exception_flag_updates_after_manual_matching_without_erasing_history(self):
+        payout = self._payout('manual-match')
+        self.journal.autocheck_on_post = True
+        payout.generate_bank_statement()
+        payout.reimport_reconciliation_issue = 'Missing payment from prior processing'
+        self.assertTrue(payout.has_open_payment_exceptions)
+        for line in payout.payout_statement_line_ids:
+            _liquidity, suspense, _other = line._seek_for_lines()
+            suspense.account_id = self.instance.transaction_line_ids.account_id
+        self.assertFalse(payout.has_open_payment_exceptions)
+        self.assertTrue(payout.reimport_reconciliation_issue)
+
+    def test_payouts_default_to_oldest_date_first(self):
+        later = self._payout('created-first')
+        earlier = self._payout('created-second')
+        earlier.payout_date = fields.Date.today() - timedelta(days=2)
+        selected = later | earlier
+        self.assertEqual(self.env[selected._name].search([('id', 'in', selected.ids)]), earlier | later)
+        view = ElementTree.fromstring(self.env.ref('shopify_ept.shopify_payout_report_tree_view').arch_db)
+        self.assertEqual(view.get('default_order'), 'payout_date asc, id asc')

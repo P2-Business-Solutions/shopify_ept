@@ -78,9 +78,10 @@ The payout shows its settlement entry, receiving bank, matched bank transactions
 bank status. It distinguishes awaiting, partial and completed bank matches. Undoing
 reconciliation removes the match status. A non-bank write-off, reversal, canceled entry
 or unreconciled source statement is reported as **Needs Review**. Statements marked
-for review must be checked before settlement. The default Remaining Reports filter
-includes these exceptions, even when the transit item has already been reconciled;
-**Settlement Needs Review** shows them separately.
+for review must be checked before settlement. **Settlement Needs Review** shows
+these exceptions even when the transit item has already been reconciled. From
+18.0.3.41, the default **Remaining Reports** filter shows only unreconciled payout
+transactions; clear it when inspecting bank settlement or final validation work.
 Settlement status is stored and indexed, and payout links are indexed for statement
 lookups and bulk processing.
 
@@ -190,6 +191,9 @@ change the date-range scheduler's last-import checkpoint.
 For existing reports, use **Reimport / Reconcile Payout** on a report, or select several
 reports and choose **Action → Reimport / Reconcile Payouts**. The date-range payout import
 also uses this repair path for reports already imported, including Partially Processed
-and Validated payouts. Review messages appear on the report and remain visible in the
-Remaining Reports filter. New open-period payouts still generate statement lines for
-the usual reconciliation workflow.
+and Validated payouts. Review messages appear on the report. **Remaining Reports**
+and **Open Payment Exceptions** use the live unreconciled count; old warning text
+alone does not keep a finished payout in those views. The form and bulk actions
+record their latest timestamp/result and report completed and blocked work.
+New open-period payouts still generate statement lines for the usual reconciliation
+workflow.

@@ -201,6 +201,50 @@ class TestShopCashSettlement(PayoutTestCase):
         self._process(payout, payout.action_generate_bank_statement)
         self.assertEqual(payout.payout_statement_line_ids.line_ids, lines)
 
+    def test_bulk_reimport_matches_each_payment_and_retains_success_beside_source_failure(self):
+        payouts, payments, sources = self.env['shopify.payout.report.ept'], self.env['account.payment'], {}
+        for identity in ('9201', '9202', '9203'):
+            order, invoice = self._order('bulk-order-' + identity, 100)
+            payment = self._payment(order, 100, 'bulk-capture-' + identity,
+                                    gateway='shopify_payments', invoice=invoice)
+            payout = self._payout(identity)
+            charge = payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'charge')
+            charge.write({'order_id': order.id, 'source_order_id': order.shopify_order_id,
+                          'source_order_transaction_id': payment.shopify_order_transaction_id,
+                          'currency_id': payout.currency_id.id})
+            sources[identity] = {'id': charge.transaction_id, 'type': 'charge', 'amount': '100', 'fee': '3',
+                'net': '97', 'currency': payout.currency_id.name, 'source_order_id': order.shopify_order_id,
+                'source_order_transaction_id': payment.shopify_order_transaction_id}
+            payouts |= payout
+            payments |= payment
+        payouts.generate_bank_statement()
+        def report(identity):
+            if identity == '9202':
+                raise UserError('Source unavailable for selected payout')
+            return SimpleNamespace(to_dict=lambda: {'id': int(identity), 'status': 'paid'})
+        action = self.env.ref('shopify_ept.action_reimport_shopify_payouts')
+        with patch.object(type(self.instance), 'connect_in_shopify'), \
+                patch.object(shopify.Payouts, 'find', side_effect=report), \
+                patch.object(shopify.Transactions, 'find', side_effect=lambda **kwargs: [
+                    SimpleNamespace(to_dict=lambda: sources[kwargs['payout_id']])]):
+            result = self._process(payouts, lambda: action.with_context(active_model=payouts._name,
+                active_ids=payouts.ids, shopify_bulk_repaired_line_ids=[]).run())
+            ready = payouts.filtered(lambda row: row.payout_reference_id != '9202')
+            failed = payouts - ready
+            self.assertEqual(ready.mapped('state'), ['validated', 'validated'])
+            self.assertTrue(all(ready.payout_statement_line_ids.mapped('is_reconciled')))
+            self.assertEqual(ready.mapped('unreconciled_transaction_count'), [0, 0])
+            self.assertEqual(failed.unreconciled_transaction_count, 1)
+            self.assertIn('Reimport failed', failed.last_reimport_result)
+            self.assertTrue(all(payouts.mapped('last_reimport_at')))
+            self.assertIn('2 payout(s) reimported', result['params']['message'])
+            self.assertIn('1 reimport(s) failed', result['params']['message'])
+            self.assertEqual(result['params']['type'], 'warning')
+            items = ready.payout_statement_line_ids.line_ids
+            self._process(ready, ready[:1].action_reimport_payouts)
+            self.assertEqual(ready.payout_statement_line_ids.line_ids, items)
+            self.assertFalse(ready.mapped('reimport_reconciliation_issue')[0])
+
     def test_unreconciled_total_tracks_partial_matches_unmatching_and_missing_rows(self):
         payout = self._payout('residual-total')
         payout.generate_bank_statement()

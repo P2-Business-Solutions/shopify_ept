@@ -1,5 +1,41 @@
 # Bulk payout exception processing
 
+### Live open filters and visible bulk reimport results (18.0.3.41)
+
+**Remaining Reports** now shows payouts with at least one nonzero transaction still
+unreconciled, including transactions with no statement row. Old warning text and
+bank settlement work alone no longer keep a fully reconciled payout in this view.
+The transaction count handles offsetting unresolved payments/refunds even when
+their net **Unreconciled Total** is zero. Payouts sort by **Payout Date**, oldest first.
+
+Use **Open Payment Exceptions** for current warnings on payouts that still have
+unreconciled transactions. The generic **Payment exceptions is set** condition
+only checks whether a text field contains a message; replace that condition in
+saved favorites with **Open Payment Exceptions**. Earlier notes remain available.
+Additional filters include **Partially Reconciled**, **Statements Not Generated**,
+**Reconciled / Needs Validation**, **Fully Reconciled**, and a **Payout Date** range.
+Clear **Remaining Reports** to inspect fully reconciled or bank-only work through
+the existing settlement filters.
+
+The form and list **Reimport / Reconcile** actions use the same workflow, with each
+selected payout processed independently in its own form context. A source read
+failure rolls back only that payout's reimport; successful work on other payouts
+is retained. The list selection and any prior Bulk Repair selection do not restrict
+the individual payout's matching. Existing matches remain intact. Validated payouts
+also retry final validation and clear resolved current warnings in open periods.
+
+The action reports how many payouts were refreshed, transactions reconciled,
+transactions still open and reimports failed. Each payout records **Last Reimport /
+Reconcile** and **Last Reimport / Reconcile Result**, also retained in its chatter.
+The timestamp is an optional list column. Locked accounting periods and source or
+configuration blockers remain explained in the result; closed periods are not reopened.
+
+Validated in a disposable Odoo 18 Community database: all 257 connector tests
+passed, including live filter domains, date ordering, selection-context isolation,
+real payment matching beside a failed source read, and retained matches on retry.
+All 114 standalone tests passed. Accounting tests use the existing Community ledger
+matcher in place of the Enterprise reconciliation widget.
+
 ### Reconcile available payments and track the remaining balance (18.0.3.39)
 
 **Generate Bank Statement** now generates the cash rows and immediately reconciles

@@ -36,6 +36,16 @@ class ShopifyPayoutSettlement(models.Model):
         string='Unreconciled Transactions', compute='_compute_unreconciled_total', store=True,
         help='Nonzero statement lines still awaiting reconciliation, plus payout transactions '
              'without a statement line.')
+    has_open_payment_exceptions = fields.Boolean(
+        string='Open Payment Exceptions', compute='_compute_open_payment_exceptions', store=True,
+        help='A processing warning with transactions that are still unreconciled. '
+             'Old warning text on a fully reconciled payout does not qualify.')
+
+    @api.depends('unreconciled_transaction_count', 'reimport_reconciliation_issue')
+    def _compute_open_payment_exceptions(self):
+        for payout in self:
+            payout.has_open_payment_exceptions = (payout.unreconciled_transaction_count > 0
+                and bool((payout.reimport_reconciliation_issue or '').strip()))
 
     @api.depends('currency_id', 'payout_transaction_ids.amount',
                  'payout_statement_line_ids.is_reconciled', 'payout_statement_line_ids.amount_residual',

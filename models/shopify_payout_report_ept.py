@@ -9,6 +9,7 @@ from odoo import models, fields,api, _
 from odoo.exceptions import AccessError, UserError
 from .. import shopify
 from ..shopify.pyactiveresource.connection import ClientError
+from ..shopify.pyactiveresource.connection import Error as ShopifyError
 import ast
 from odoo.tools.float_utils import float_is_zero
 from .shopify_transaction_utils import normalize_shopify_id
@@ -22,7 +23,7 @@ class ShopifyPaymentReportEpt(models.Model):
     _name = "shopify.payout.report.ept"
     _inherit = ['mail.thread', 'mail.activity.mixin']
     _description = "Shopify Payout Report"
-    _order = 'id desc'
+    _order = 'payout_date asc, id asc'
 
     name = fields.Char(size=256)
     instance_id = fields.Many2one('shopify.instance.ept', string="Instance")
@@ -115,10 +116,52 @@ class ShopifyPaymentReportEpt(models.Model):
         return payouts
 
     def action_reimport_payouts(self):
-        """Refresh selected reports using their Shopify IDs and retry their accounting."""
-        for instance, payouts in self.grouped('instance_id').items():
-            self.get_payout_report_by_ids(','.join(payouts.mapped('payout_reference_id')), instance)
-        return {'type': 'ir.actions.client', 'tag': 'reload'}
+        """Run the form workflow independently for every selected payout."""
+        self._lock_settlement_payouts()
+        refreshed, failed, matched = 0, 0, 0
+        results = []
+        context = {key: value for key, value in self.env.context.items()
+                   if key not in ('active_id', 'active_ids', 'active_model', 'shopify_bulk_repaired_line_ids')}
+        for payout in self.sorted(lambda row: (row.payout_date or fields.Date.to_date('9999-12-31'), row.id)):
+            scoped = payout.with_context(context, active_model=self._name, active_id=payout.id, active_ids=payout.ids)
+            before = payout.unreconciled_transaction_count
+            problem = ''
+            try:
+                with self.env.cr.savepoint():
+                    imported = scoped.get_payout_report_by_ids(payout.payout_reference_id, payout.instance_id)
+                    if imported != scoped:
+                        raise UserError(_('The reimport did not return the selected payout. Review its Shopify ID and store.'))
+                refreshed += 1
+            except (OperationalError, AccessError):
+                raise
+            except (UserError, ShopifyError) as error:
+                failed += 1
+                problem = str(error)
+                payout.reimport_reconciliation_issue = problem
+            remaining = payout.unreconciled_transaction_count
+            resolved = max(before - remaining, 0)
+            matched += resolved
+            result = _('%(matched)s transaction(s) reconciled; %(remaining)s still unreconciled.',
+                       matched=resolved, remaining=remaining)
+            if problem:
+                result = _('Reimport failed: %s', problem)
+            elif payout.reimport_reconciliation_issue:
+                result += '\n' + payout.reimport_reconciliation_issue
+            payout.write({'last_reimport_at': fields.Datetime.now(), 'last_reimport_result': result})
+            payout._message_log(body=result)
+            results.append('%s: %s' % (payout.display_name, result))
+        pending = sum(self.mapped('unreconciled_transaction_count'))
+        review = len(self.filtered(lambda payout: payout.reimport_reconciliation_issue))
+        message = _('%(refreshed)s payout(s) reimported; %(matched)s transaction(s) reconciled; '
+                    '%(pending)s still unreconciled; %(failed)s reimport(s) failed.',
+                    refreshed=refreshed, matched=matched, pending=pending, failed=failed)
+        if failed or review:
+            message += '\n' + '\n'.join(results)
+        return {'type': 'ir.actions.client', 'tag': 'display_notification',
+                'params': {'title': _('Payout Reimport / Reconciliation'), 'message': message,
+                           'type': 'warning' if failed or review or pending else 'success',
+                           'sticky': bool(failed or review or pending),
+                           'next': {'type': 'ir.actions.client', 'tag': 'reload'}}}
 
     def create_payout_reports(self, payout_reports, instance):
         """
