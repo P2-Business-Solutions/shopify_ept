@@ -46,6 +46,10 @@ class ShopifyProcessImportExport(models.TransientModel):
         default="sync_product", string="Operation")
     orders_from_date = fields.Datetime(string="From Date")
     orders_to_date = fields.Datetime(string="To Date")
+    pos_orders_only = fields.Boolean(
+        string="POS Orders Only", default=False,
+        help="Import or reprocess only Shopify POS orders in the selected date range. Web orders are excluded.",
+    )
     shopify_instance_ids = fields.Many2many("shopify.instance.ept", "shopify_instance_import_export_rel",
                                             "process_id", "shopify_instance_id", "Instances")
     shopify_is_set_price = fields.Boolean(string="Set Price ?",
@@ -172,7 +176,8 @@ class ShopifyProcessImportExport(models.TransientModel):
             order_queues = order_date_queue_obj.with_context(queue_created_by="manual").shopify_create_order_data_queues(instance,
                                                                                  self.orders_from_date,
                                                                                  self.orders_to_date,
-                                                                                 order_type="shipped")
+                                                                                 order_type="shipped",
+                                                                                 pos_only=self.pos_orders_only)
             if order_queues:
                 queue_ids = order_queues
                 action_name = "shopify_ept.action_shopify_shipped_order_data_queue_ept"

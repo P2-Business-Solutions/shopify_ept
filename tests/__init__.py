@@ -2,6 +2,7 @@
 
 from . import test_shopify_fulfillment_utils
 from . import test_shopify_pos_fulfillment
+from . import test_shopify_pos_order_import
 from . import test_shopify_inventory_utils
 from . import test_shopify_order_type
 from . import test_shopify_order_utils

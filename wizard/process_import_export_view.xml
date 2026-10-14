@@ -579,6 +579,8 @@
                                                    placeholder="To Date"
                                                    options="{'related_start_date': 'orders_from_date'}"
                                                    required="shopify_operation in ['import_shipped_orders','import_unshipped_orders','sync_product','import_cancel_orders','import_buy_with_prime_orders']"/>
+                                            <field name="pos_orders_only"
+                                                   invisible="shopify_operation != 'import_shipped_orders'"/>
                                             <field name="skip_existing_product"
                                                    invisible="shopify_operation != 'sync_product'"/>
                                             <field name="is_import_draft_product"

@@ -173,7 +173,7 @@ class ShopifyOrderDataQueueEpt(models.Model):
         return from_date, to_date
 
     def shopify_create_order_data_queues(self, instance, from_date, to_date, created_by="import",
-                                         order_type="unshipped"):
+                                         order_type="unshipped", pos_only=False):
         """
         This method used to create order data queues.
         @param : self, instance,  from_date, to_date, created_by, order_type
@@ -213,8 +213,11 @@ class ShopifyOrderDataQueueEpt(models.Model):
                 instance.last_date_order_import = to_date - timedelta(days=2)
         elif order_type == "shipped":
             order_queues = self.shopify_shipped_order_request(instance, from_date, to_date, created_by="import",
-                                                              order_type="shipped")
-            instance.last_shipped_order_import_date = to_date - timedelta(days=2)
+                                                              order_type="shipped", pos_only=pos_only)
+            # A scoped POS import must not move the checkpoint used to fetch
+            # all shipped orders, including web orders, in scheduled imports.
+            if not pos_only:
+                instance.last_shipped_order_import_date = to_date - timedelta(days=2)
         else:
             if order_type == "buy_with_prime" and instance.import_buy_with_prime_shopify_order:
                 order_queues = self.shopify_shipped_order_request(instance, from_date, to_date, created_by="import",
@@ -252,7 +255,8 @@ class ShopifyOrderDataQueueEpt(models.Model):
 
         return order_ids
 
-    def shopify_shipped_order_request(self, instance, from_date, to_date, order_type, created_by):
+    def shopify_shipped_order_request(self, instance, from_date, to_date, order_type, created_by,
+                                      pos_only=False):
         """ This method is used to import shipped order from the shopify store to Odoo.
             @author: Haresh Mori @Emipro Technologies Pvt. Ltd on date 30 December 2020 .
             Task_id:169381 - Gift card order import changes
@@ -263,16 +267,24 @@ class ShopifyOrderDataQueueEpt(models.Model):
         order_ids = self.shopify_order_request(instance, from_date, to_date, queue_type)
         if order_ids and order_type == "buy_with_prime":
             order_ids = self.filter_buy_with_prime_order(instance, order_ids)
-        if order_ids:
-            order_queues = order_data_queue_line_obj.create_order_data_queue_line(order_ids,
+        orders_to_queue = self.filter_shopify_pos_orders(order_ids) if pos_only else order_ids
+        if orders_to_queue:
+            order_queues = order_data_queue_line_obj.create_order_data_queue_line(orders_to_queue,
                                                                                   instance,
                                                                                   queue_type,
                                                                                   created_by)
-            if len(order_ids) >= 250:
-                order_queue_list = self.list_all_orders(order_ids, instance, created_by, queue_type)
-                order_queues += order_queue_list
+        # Keep the original page and its size: a full page of web orders can
+        # still lead to POS orders on the following pages.
+        if order_ids and len(order_ids) >= 250:
+            order_queues += self.list_all_orders(
+                order_ids, instance, created_by, queue_type, pos_only=pos_only)
 
         return order_queues
+
+    def filter_shopify_pos_orders(self, orders):
+        """Exclude other channels before creating queues or fetching transactions."""
+        return [order for order in (orders or [])
+                if (order if isinstance(order, dict) else order.to_dict()).get('source_name') == 'pos']
 
     def filter_buy_with_prime_order(self, instance, order_ids):
         buy_with_prime_order_ids = []
@@ -285,7 +297,7 @@ class ShopifyOrderDataQueueEpt(models.Model):
                     buy_with_prime_order_ids.append(order_id)
         return buy_with_prime_order_ids
 
-    def list_all_orders(self, result, instance, created_by, queue_type):
+    def list_all_orders(self, result, instance, created_by, queue_type, pos_only=False):
         """
         This method used to get the list of orders from Shopify to Odoo.
         @param result: Response of order which received from Shopify store.
@@ -323,8 +335,9 @@ class ShopifyOrderDataQueueEpt(models.Model):
                             result = shopify.Order().find(limit=250, page_info=page_info)
                     except Exception as error:
                         raise UserError(error)
-                    if result:
-                        order_queues = order_data_queue_line_obj.create_order_data_queue_line(result, instance,
+                    orders_to_queue = self.filter_shopify_pos_orders(result) if pos_only else result
+                    if orders_to_queue:
+                        order_queues = order_data_queue_line_obj.create_order_data_queue_line(orders_to_queue, instance,
                                                                                               queue_type,
                                                                                               created_by)
                         order_queue_list += order_queues
