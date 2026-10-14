@@ -2,6 +2,7 @@
 from datetime import timedelta
 import json
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import patch
 try:
     from .test_shopify_payout_generation import PayoutTestCase, ODOO_AVAILABLE
@@ -419,7 +420,9 @@ class TestShopifyCashSync(PayoutTestCase):
         return order, invoice, payload, events
 
     def _free_shipping_refund_fixture(self):
-        """Order #140582: address/tax edits, two extra sales and one refund."""
+        """Replay verified source shape, including an unitemized cash-only refund."""
+        source = json.loads((Path(__file__).parent / 'fixtures' / 'order_140582_cash.json').read_text())
+        payload, events = source['order'], source['transactions']
         order, invoice, _payload, _events = self._fixture(retained=144.59, removed=.67)
         order.shopify_order_id = False
         order.order_line.filtered(lambda line: line.shopify_line_id == 'removed').unlink()
@@ -446,23 +449,17 @@ class TestShopifyCashSync(PayoutTestCase):
                 'sale_line_ids': [Command.set(line.ids)],
             })]
         invoice.action_post()
-        common = dict(order_id=order.shopify_order_id, currency=order.currency_id.name,
-                      gateway='shopify_payments', status='success')
         date = invoice.invoice_date.isoformat()
-        events = [dict(common, id=key, kind=kind, amount=amount, parent_id=parent,
-                       processed_at=date + 'T' + time + '-04:00')
-                  for key, kind, amount, parent, time in (
-                      ('original-capture', 'capture', '143.92', '', '09:45:55'),
-                      ('first-extra-sale', 'sale', '0.67', '', '09:56:00'),
-                      ('tax-refund', 'refund', '0.67', 'first-extra-sale', '09:57:00'),
-                      ('second-extra-sale', 'sale', '0.67', '', '14:54:00'))]
-        payload = dict(id=order.shopify_order_id, currency=order.currency_id.name,
-                       current_total_price='144.59', current_total_tax='10.09',
-                       line_items=[dict(id=item.shopify_line_id, quantity=1, current_quantity=1)],
-                       shipping_lines=[dict(id='5839385133282', price='0.00')],
-                       refunds=[dict(id='tax-refund-doc', transactions=[dict(id='tax-refund')],
-                                     refund_line_items=[], order_adjustments=[dict(
-                                         kind='refund_discrepancy', amount='-0.67', tax_amount='0.00')])])
+        payload['currency'] = order.currency_id.name
+        for event in events:
+            event['currency'] = order.currency_id.name
+            for key in ('created_at', 'processed_at'):
+                event[key] = date + event[key][10:]
+        for refund in payload['refunds']:
+            for key in ('created_at', 'processed_at'):
+                refund[key] = date + refund[key][10:]
+            refund['transactions'] = [deepcopy(event) for event in events
+                                      if event['id'] in {row['id'] for row in refund['transactions']}]
         return order, invoice, payload, events
 
     def _reviewed_credit(self, order, invoice, post=True, **overrides):
@@ -929,6 +926,8 @@ class TestShopifyCashSync(PayoutTestCase):
         payout.payout_transaction_ids.unlink()
         transactions = []
         for event in events:
+            if event['kind'] == 'authorization':
+                continue
             refund = event['kind'] == 'refund'
             transactions.append(Command.create({
                 'transaction_id': 'balance-' + event['id'],
@@ -959,6 +958,8 @@ class TestShopifyCashSync(PayoutTestCase):
                 'second-extra-sale': ('inbound', .67),
                 'tax-refund': ('outbound', .67),
             })
+            self.assertEqual(payments.filtered(lambda pay: pay.payment_type == 'outbound').shopify_parent_transaction_id,
+                             'original-capture')
             self.assertEqual(legacy.state, 'canceled')
             self.assertEqual(legacy.move_id.state, 'posted')
             self.assertEqual(len(legacy.move_id.reversal_move_ids), 1)
@@ -1001,6 +1002,28 @@ class TestShopifyCashSync(PayoutTestCase):
                 order._build_shopify_cash_plan(repair=True)
         self.assertEqual(self.env['account.move'].search_count([]), count)
         self.assertEqual(invoice.amount_total, 144.59)
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_cash_only_net_refund_still_requires_matching_invoice_tax(self):
+        order, invoice, payload, events = self._free_shipping_refund_fixture()
+        payload['current_total_tax'] = '10.10'
+        count = self.env['account.move'].search_count([])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'final Shopify tax and invoice tax'):
+                order._build_shopify_cash_plan(repair=True)
+        self.assertEqual(self.env['account.move'].search_count([]), count)
+        self.assertEqual(invoice.amount_total, 144.59)
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_cash_only_refund_on_gross_invoice_needs_reviewed_credit(self):
+        order, invoice, payload, events = self._fixture(gross=True)
+        payload['refunds'][0].update(refund_line_items=[], order_adjustments=[])
+        count = self.env['account.move'].search_count([])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'do not explain the cash refund'):
+                order._build_shopify_cash_plan(repair=True)
+        self.assertEqual(self.env['account.move'].search_count([]), count)
+        self.assertEqual(order.invoice_ids, invoice)
         self.assertFalse(order.shopify_payment_audit_ids)
 
     def test_gross_invoice_gets_one_credit_note_and_reuses_receipt(self):

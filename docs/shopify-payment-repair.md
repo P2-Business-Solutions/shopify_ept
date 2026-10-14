@@ -1,5 +1,12 @@
 # Shopify cash transactions and payment repair
 
+Version **18.0.3.46** supports a cash-only refund with explicitly empty refunded-item
+and order-adjustment lists when the final Shopify order total, invoice, net cash,
+item quantities and tax agree. This includes address/tax corrections such as order
+#140582. Repair records the separate refund payment without creating another credit
+note. Refunds with supplied components still require those components to explain
+the cash amount; original gross invoices still require a supported or reviewed credit.
+
 Version **18.0.3.45** excludes delivery lines from merchandise quantity evidence
 when validating a final net invoice. Free shipping retains its Shopify shipping
 ID without being mistaken for an item. Invoice totals, tax, source refund evidence

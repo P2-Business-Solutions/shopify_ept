@@ -108,7 +108,17 @@ def prove_final_net_invoice(payload, events, invoiced_quantities, invoice_total,
             continue
         if ids & covered:
             raise PaymentPlanError('A cash refund occurs in multiple refund documents.')
-        refund_components(refund, events, currency, shop_currency, compare)
+        # The final invoice already explains net revenue. A source refund with
+        # explicitly empty item/adjustment lists needs no extra credit allocation;
+        # any supplied components must still explain the cash returned.
+        cash_only = (refund.get('id') and refund.get('refund_line_items') == []
+                     and refund.get('order_adjustments') == []
+                     and not any(refund.get(key) for key in (
+                         'refund_shipping_lines', 'duties', 'refund_duties', 'additional_fees')))
+        if cash_only and refund.get('total_duties_set'):
+            cash_only = not component_money(refund, 'total_duties', currency, shop_currency)
+        if not cash_only:
+            refund_components(refund, events, currency, shop_currency, compare)
         covered |= ids
     if covered != refunds:
         raise PaymentPlanError('Some successful refunds lack a unique source refund document.')
