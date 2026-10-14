@@ -1,5 +1,12 @@
 # Shopify cash transactions and payment repair
 
+Version **18.0.3.45** excludes delivery lines from merchandise quantity evidence
+when validating a final net invoice. Free shipping retains its Shopify shipping
+ID without being mistaken for an item. Invoice totals, tax, source refund evidence
+and unknown merchandise checks still apply. Matching net invoice totals still
+allow repair to replace an eligible legacy receipt with every successful Shopify
+receipt and refund separately for payout reconciliation.
+
 Version **18.0.3.28** adds [bulk payout exception processing](payout-bulk-repair.md),
 including historical fulfilled-order refund credits, direct order navigation,
 retroactive discount/order-edit refund evidence and independent ready-case execution.

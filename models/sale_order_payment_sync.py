@@ -76,6 +76,10 @@ class SaleOrderPaymentSync(models.Model):
         if mode == 'net':
             quantities = {}
             for line in invoices.invoice_line_ids:
+                # Delivery IDs belong to Shopify shipping_lines, including free
+                # shipping; they cannot prove merchandise line_items quantities.
+                if line.sale_line_ids.filtered('is_delivery'):
+                    continue
                 key = line.sale_line_ids.shopify_line_id
                 if key:
                     quantities[key] = quantities.get(key, 0) + line.quantity

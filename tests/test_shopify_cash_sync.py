@@ -418,6 +418,53 @@ class TestShopifyCashSync(PayoutTestCase):
         }])
         return order, invoice, payload, events
 
+    def _free_shipping_refund_fixture(self):
+        """Order #140582: address/tax edits, two extra sales and one refund."""
+        order, invoice, _payload, _events = self._fixture(retained=144.59, removed=.67)
+        order.shopify_order_id = False
+        order.order_line.filtered(lambda line: line.shopify_line_id == 'removed').unlink()
+        order.write({'name': '#140582', 'shopify_order_id': '7302542360802'})
+        item = order.order_line
+        item.write({'name': 'Soldado', 'shopify_line_id': '16880479830242', 'price_unit': 269})
+        tax_product = self.product.copy({'name': 'Exact Shopify Tax'})
+        self.instance.tax_product_id = tax_product
+        invoice.button_draft()
+        invoice.invoice_line_ids.write({'name': 'Soldado', 'price_unit': 269})
+        for name, product, amount, extra in (
+                ('Discount for Soldado', self.product, -134.50,
+                 {'shopify_related_line_id': 'discount_16880479830242'}),
+                ('Free Shipping', self.product, 0,
+                 {'shopify_line_id': '5839385133282', 'is_delivery': True}),
+                ('Shopify Tax', tax_product, 10.09, {})):
+            line = self.env['sale.order.line'].create({
+                'order_id': order.id, 'product_id': product.id, 'name': name,
+                'product_uom_qty': 1, 'price_unit': amount, 'tax_id': [Command.clear()], **extra,
+            })
+            invoice.invoice_line_ids = [Command.create({
+                'product_id': product.id, 'name': name, 'account_id': self.revenue.id,
+                'quantity': 1, 'price_unit': amount, 'tax_ids': [Command.clear()],
+                'sale_line_ids': [Command.set(line.ids)],
+            })]
+        invoice.action_post()
+        common = dict(order_id=order.shopify_order_id, currency=order.currency_id.name,
+                      gateway='shopify_payments', status='success')
+        date = invoice.invoice_date.isoformat()
+        events = [dict(common, id=key, kind=kind, amount=amount, parent_id=parent,
+                       processed_at=date + 'T' + time + '-04:00')
+                  for key, kind, amount, parent, time in (
+                      ('original-capture', 'capture', '143.92', '', '09:45:55'),
+                      ('first-extra-sale', 'sale', '0.67', '', '09:56:00'),
+                      ('tax-refund', 'refund', '0.67', 'first-extra-sale', '09:57:00'),
+                      ('second-extra-sale', 'sale', '0.67', '', '14:54:00'))]
+        payload = dict(id=order.shopify_order_id, currency=order.currency_id.name,
+                       current_total_price='144.59', current_total_tax='10.09',
+                       line_items=[dict(id=item.shopify_line_id, quantity=1, current_quantity=1)],
+                       shipping_lines=[dict(id='5839385133282', price='0.00')],
+                       refunds=[dict(id='tax-refund-doc', transactions=[dict(id='tax-refund')],
+                                     refund_line_items=[], order_adjustments=[dict(
+                                         kind='refund_discrepancy', amount='-0.67', tax_amount='0.00')])])
+        return order, invoice, payload, events
+
     def _reviewed_credit(self, order, invoice, post=True, **overrides):
         values = {
             'journal_id': self.sales_journal.id, 'move_type': 'out_refund',
@@ -869,6 +916,92 @@ class TestShopifyCashSync(PayoutTestCase):
             order.paid_invoice_ept(invoice)
             self.assertEqual(len(order.shopify_payment_audit_ids), audit_count)
             self.assertEqual(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]), payments)
+
+    def test_free_shipping_multiple_receipts_and_refund_repair_matches_payout(self):
+        try:
+            from .test_shopify_historical_collection import TestShopifyHistoricalCollection as MatchFixtures
+        except ImportError:
+            from test_shopify_historical_collection import TestShopifyHistoricalCollection as MatchFixtures
+        self.env.user.groups_id |= self.env.ref('account.group_account_manager')
+        order, invoice, payload, events = self._free_shipping_refund_fixture()
+        legacy = self._legacy(invoice, 144.59)
+        payout = self._payout('free-shipping-140582')
+        payout.payout_transaction_ids.unlink()
+        transactions = []
+        for event in events:
+            refund = event['kind'] == 'refund'
+            transactions.append(Command.create({
+                'transaction_id': 'balance-' + event['id'],
+                'source_order_transaction_id': event['id'], 'source_order_id': order.shopify_order_id,
+                'transaction_type': 'refund' if refund else 'charge', 'order_id': order.id,
+                'amount': -float(event['amount']) if refund else float(event['amount']),
+                'fee': 0 if refund else (3.54 if event['kind'] == 'capture' else .32),
+            }))
+        transactions.append(Command.create({'transaction_type': 'fees', 'amount': -4.18}))
+        payout.write({'amount': 140.41, 'payout_transaction_ids': transactions})
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            count = self.env['account.move'].search_count([])
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            self.assertEqual(wizard.state, 'preview', wizard.preview_html)
+            self.assertEqual(self.env['account.move'].search_count([]), count)
+            plan = wizard.plan_json[0]
+            self.assertEqual(plan['mode'], 'net')
+            self.assertEqual(plan['replace_ids'], legacy.ids)
+            self.assertEqual(len(plan['events']), 4)
+            self.assertEqual(plan['embedded_refund_ids'], ['tax-refund'])
+            self.assertFalse(plan['credits'])
+            wizard.action_apply()
+            payments = order.shopify_payment_audit_ids.payment_ids
+            self.assertEqual(len(payments), 4)
+            self.assertEqual({pay.shopify_order_transaction_id: (pay.payment_type, pay.amount) for pay in payments}, {
+                'original-capture': ('inbound', 143.92),
+                'first-extra-sale': ('inbound', .67),
+                'second-extra-sale': ('inbound', .67),
+                'tax-refund': ('outbound', .67),
+            })
+            self.assertEqual(legacy.state, 'canceled')
+            self.assertEqual(legacy.move_id.state, 'posted')
+            self.assertEqual(len(legacy.move_id.reversal_move_ids), 1)
+            self.assertEqual(invoice.amount_total, 144.59)
+            self.assertTrue(invoice.currency_id.is_zero(invoice.amount_residual))
+            self.assertEqual(order.invoice_ids, invoice)
+            for payment in payments:
+                liquidity, counterpart, _writeoffs = payment._seek_for_lines()
+                self.assertTrue(counterpart.reconciled)
+                self.assertFalse(liquidity.reconciled)
+                self.assertEqual(abs(liquidity.amount_residual_currency), payment.amount)
+            payout.generate_bank_statement()
+            statements = payout.payout_statement_line_ids
+            self.assertEqual(len(statements), 5)
+            self.assertEqual(payout.currency_id.round(sum(statements.mapped('amount'))), 140.41)
+            cash = payout.payout_transaction_ids.filtered(lambda row: row.transaction_type in ('charge', 'refund'))
+            for transaction in cash:
+                payment = payout.find_payment_for_payout_transaction(transaction)
+                self.assertEqual(payment.shopify_order_transaction_id, transaction.source_order_transaction_id)
+            with MatchFixtures._matcher(self, payout):
+                payout.process_bank_statement()
+            self.assertEqual(payout.state, 'validated')
+            self.assertTrue(all(statements.mapped('is_reconciled')))
+            self.assertTrue(all(pay._seek_for_lines()[0].reconciled for pay in payments))
+            count = self.env['account.move'].search_count([])
+            order._sync_shopify_cash()
+            self.assertEqual(self.env['account.move'].search_count([]), count)
+            self.assertEqual(len(order.shopify_payment_audit_ids), 1)
+            self.assertEqual(payout.payout_statement_line_ids, statements)
+            self.assertEqual(len(legacy.move_id.reversal_move_ids), 1)
+            self.assertTrue(all(statements.mapped('is_reconciled')))
+
+    def test_free_shipping_repair_still_rejects_unknown_merchandise(self):
+        order, invoice, payload, events = self._free_shipping_refund_fixture()
+        item = order.order_line.filtered(lambda line: line.shopify_line_id == '16880479830242')
+        item.shopify_line_id = 'unknown-merchandise'
+        count = self.env['account.move'].search_count([])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            with self.assertRaisesRegex(UserError, 'Invoice (items cannot be traced|quantities differ)'):
+                order._build_shopify_cash_plan(repair=True)
+        self.assertEqual(self.env['account.move'].search_count([]), count)
+        self.assertEqual(invoice.amount_total, 144.59)
+        self.assertFalse(order.shopify_payment_audit_ids)
 
     def test_gross_invoice_gets_one_credit_note_and_reuses_receipt(self):
         order, invoice, payload, events = self._fixture(gross=True)
