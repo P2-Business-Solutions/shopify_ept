@@ -114,6 +114,23 @@ def prove_cancelled_cash(payload, events, compare):
         raise PaymentPlanError('A cancelled order without an invoice must be fully refunded before cash can be synchronized.')
 
 
+def prove_prepayment_cash(payload, events, order_total, compare):
+    """Prove a fully paid, unshipped sale before leaving customer credit open."""
+    if payload.get('cancelled_at') or payload.get('cancel_reason'):
+        raise PaymentPlanError('A cancelled order cannot receive an unapplied prepayment.')
+    if (payload.get('fulfillments') != []
+            or payload.get('fulfillment_status') not in (None, '', 'unfulfilled')):
+        raise PaymentPlanError('Prepayments require an unfulfilled order without fulfillment history.')
+    if (payload.get('financial_status') != 'paid' or payload.get('refunds') != []
+            or any(row['kind'] == 'refund' for row in events)):
+        raise PaymentPlanError('Prepayments without an invoice require a fully paid order without refunds.')
+    gross = sum(money(row['amount']) for row in events)
+    currency = events[0]['currency']
+    current = component_money(payload, 'current_total_price', currency, payload.get('currency'))
+    if gross <= 0 or compare(float(gross), float(current)) or compare(float(gross), order_total):
+        raise PaymentPlanError('The captured cash, current Shopify total and sales order total must agree before recording a prepayment.')
+
+
 def prove_net_refunds(payload, events, invoiced_quantities):
     """Do not infer an already-net invoice from an amount difference alone."""
     lines = {str(row['id']): row for row in payload.get('line_items', [])}

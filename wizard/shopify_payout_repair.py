@@ -333,6 +333,9 @@ class ShopifyPayoutRepair(models.Model):
                      order=plan['source_name'], action='Post/reuse' if plan['post'] else 'Prepare/reuse',
                      amount=plan['amount'], count=len(plan['events']), accounts=', '.join(accounts.mapped('display_name')))
         cash = plan['cash']
+        if cash['mode'] == 'prepayment':
+            return _('%(count)s captured payment(s): record customer credit now for the payout and apply the same payment(s) when the shipment invoice posts.',
+                     count=len(cash['events']))
         return _('%(mode)s: %(count)s cash transactions; %(replace)s net payment(s) to reverse; %(credits)s credit(s) to create. The invoice total is retained.',
                  mode=cash['mode'], count=len(cash['events']), replace=len(cash['replace_ids']), credits=len(cash['credits']))
 
@@ -793,6 +796,10 @@ class ShopifyPayoutRepairLine(models.Model):
             else:
                 cash = plan.get('cash', {})
                 events = cash.get('events', [])
+                if cash.get('mode') == 'prepayment':
+                    sections.append(Markup('<p>Record customer prepayment for payout reconciliation. Leave customer credit open '
+                                           'until the shipment invoice posts, then apply the same payment. '
+                                           'No invoice is created; the payment date and payout match are retained.</p>'))
                 documents = self.env['account.move'].browse(cash.get('document_ids', []))
                 for document in documents:
                     sections.append(Markup('<p>Keep %s: %s %s.</p>') %

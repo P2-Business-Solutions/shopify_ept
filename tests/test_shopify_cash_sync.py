@@ -1560,3 +1560,218 @@ class TestShopifyCashSync(PayoutTestCase):
         self.assertFalse((first | second).shopify_payment_audit_ids)
         self.assertNotEqual(legacy.state, 'canceled')
         self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', 'in', (first | second).ids)]))
+
+    def _rx_140664_fixture(self):
+        """Verified capture/authorization; omit customer and prescription data."""
+        source = json.loads((Path(__file__).parent / 'fixtures' / 'order_140664_cash.json').read_text())
+        payload, events = source['order'], source['transactions']
+        # Keep integration dates within the running test's open accounting year.
+        date = (fields.Date.today() - timedelta(days=2)).isoformat()
+        for event in events:
+            event['created_at'] = date + event['created_at'][10:]
+            event['processed_at'] = date + event['processed_at'][10:]
+        reason = self.env['sale.order.hold.reason'].create({'name': 'RX processing'})
+        order_type = self.env['sale.order.type'].create({'name': 'RX', 'code': 'rx-test', 'hold_reason_id': reason.id})
+        lens = self.env['product.product'].create({
+            'name': 'RX Lens', 'default_code': 'PAL031RX', 'type': 'consu', 'is_storable': True,
+            'invoice_policy': 'delivery', 'property_account_income_id': self.revenue.id,
+        })
+        order = self.env['sale.order'].create({
+            'name': '#140664', 'partner_id': self.partner.id, 'order_type_id': order_type.id,
+            'shopify_instance_id': self.instance.id, 'shopify_order_id': str(payload['id']),
+            'shopify_payment_gateway_id': self.gateway.id, 'auto_workflow_process_id': self.workflow.id,
+            'order_line': [Command.create({
+                'product_id': lens.id, 'name': 'RX lens', 'product_uom_qty': 1,
+                'price_unit': 555, 'tax_id': [Command.clear()],
+            }), Command.create({
+                'product_id': self.product.id, 'name': 'Shipping', 'product_uom_qty': 1,
+                'is_delivery': True, 'price_unit': 9.95, 'tax_id': [Command.clear()],
+            })],
+        })
+        order.action_confirm()
+        # The actual order also has a canceled, shipping-only draft invoice.
+        canceled = self._rx_140664_invoice(order, shipping_only=True)
+        canceled.button_cancel()
+        self.assertTrue(order.is_on_hold)
+        self.assertEqual(order.amount_total, 564.95)
+        return order, payload, events
+
+    def _rx_140664_invoice(self, order, shipping_only=False):
+        lines = order.order_line.filtered('is_delivery') if shipping_only else order.order_line
+        return self.env['account.move'].create({
+            'journal_id': self.sales_journal.id, 'move_type': 'out_invoice', 'partner_id': self.partner.id,
+            'invoice_date': fields.Date.today(), 'shopify_instance_id': self.instance.id,
+            'invoice_line_ids': [Command.create({
+                'product_id': line.product_id.id, 'name': line.name, 'account_id': self.revenue.id,
+                'quantity': 1, 'price_unit': line.price_unit, 'tax_ids': [Command.clear()],
+                'sale_line_ids': [Command.set(line.ids)],
+            }) for line in lines],
+        })
+
+    def test_rx_140664_prepayment_payout_then_shipment_invoice_reuses_payment(self):
+        try:
+            from .test_shopify_historical_collection import TestShopifyHistoricalCollection as MatchFixtures
+        except ImportError:
+            from test_shopify_historical_collection import TestShopifyHistoricalCollection as MatchFixtures
+        self.env.user.groups_id |= self.env.ref('account.group_account_manager')
+        order, payload, events = self._rx_140664_fixture()
+        # Manual repair also works when automatic transaction recording is off.
+        self.instance.shopify_transaction_payment_sync = False
+        self.workflow.register_payment = False
+        documents, pickings = order.invoice_ids, order.picking_ids
+        stock_moves = pickings.move_ids
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            count = self.env['account.move'].search_count([])
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            self.assertEqual(wizard.state, 'preview', wizard.preview_html)
+            self.assertEqual(wizard.plan_json[0]['mode'], 'prepayment')
+            self.assertIn('customer credit open', wizard.preview_html)
+            self.assertEqual(self.env['account.move'].search_count([]), count)
+            wizard.action_apply()
+            payment = order.shopify_payment_audit_ids.payment_ids
+            self.assertEqual(len(payment), 1)
+            self.assertEqual(payment.amount, 564.95)
+            self.assertEqual(payment.shopify_order_transaction_id, '8896198377698')
+            self.assertEqual(payment.shopify_parent_transaction_id, '8896198050018')
+            self.assertEqual(payment.shopify_cash_kind, 'capture')
+            self.assertEqual(payment.date, fields.Date.to_date(events[1]['processed_at'][:10]))
+            self.assertEqual(payment.move_id.state, 'posted')
+            liquidity, credit, _writeoffs = payment._seek_for_lines()
+            self.assertEqual(credit.amount_residual_currency, -564.95)
+            self.assertFalse(credit.reconciled)
+            self.assertFalse(liquidity.reconciled)
+            self.assertEqual(order.invoice_ids, documents)
+            self.assertFalse(order.invoice_ids.filtered(lambda move: move.state != 'cancel'))
+            self.assertEqual(order.picking_ids, pickings)
+            self.assertEqual(pickings.move_ids, stock_moves)
+            self.assertTrue(order.is_on_hold)
+            self.assertTrue(all(picking.is_sale_hold for picking in pickings))
+            order._sync_shopify_cash()
+            self.assertEqual(len(order.shopify_payment_audit_ids), 1)
+            payout = self._payout('rx-140664')
+            payout.payout_transaction_ids.unlink()
+            payout.write({'amount': 551.94, 'payout_transaction_ids': [Command.create({
+                'transaction_id': 'rx-balance', 'source_order_transaction_id': '8896198377698',
+                'source_order_id': order.shopify_order_id, 'transaction_type': 'charge',
+                'order_id': order.id, 'amount': 564.95, 'fee': 13.01,
+            }), Command.create({'transaction_type': 'fees', 'amount': -13.01})]})
+            # The payout repair preview also accepts the uninvoiced RX order.
+            bulk = self.env['shopify.payout.repair.ept'].create({'payout_ids': [Command.set(payout.ids)]})
+            bulk.action_preview()
+            self.assertEqual(bulk.line_ids.status, 'ready', bulk.line_ids.detail)
+            self.assertEqual(bulk.line_ids.plan['cash']['mode'], 'prepayment')
+            self.assertIn('shipment invoice', bulk.line_ids.review_html)
+            payout.generate_bank_statement()
+            self.assertEqual(payout.find_payment_for_payout_transaction(
+                payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'charge')), payment)
+            with MatchFixtures._matcher(self, payout):
+                payout.process_bank_statement()
+            self.assertEqual(payout.state, 'validated')
+            self.assertTrue(all(payout.payout_statement_line_ids.mapped('is_reconciled')))
+            self.assertTrue(liquidity.reconciled)
+            self.assertFalse(credit.reconciled)
+            original_move, original_date = payment.move_id, payment.date
+            payout_matches = liquidity.matched_debit_ids | liquidity.matched_credit_ids
+            invoice = self._rx_140664_invoice(order)
+            payload.update(fulfillment_status='fulfilled', fulfillments=[{'id': 'shipment', 'status': 'success'}])
+            invoice.action_post()
+            self.assertEqual(invoice.state, 'posted')
+            self.assertEqual(invoice.amount_total, 564.95)
+            self.assertEqual(invoice.amount_residual, 0)
+            self.assertTrue(credit.reconciled)
+            self.assertEqual(invoice.reconciled_payment_ids, payment)
+            self.assertEqual(payment.move_id, original_move)
+            self.assertEqual(payment.date, original_date)
+            self.assertEqual(liquidity.matched_debit_ids | liquidity.matched_credit_ids, payout_matches)
+            self.assertEqual(len(order.shopify_payment_audit_ids), 2)
+            count = self.env['account.move'].search_count([])
+            order.paid_invoice_ept(invoice)
+            order._sync_shopify_cash()
+            self.assertEqual(self.env['account.move'].search_count([]), count)
+            self.assertEqual(len(order.shopify_payment_audit_ids), 2)
+            self.assertEqual(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]), payment)
+            self.assertTrue(all(payout.payout_statement_line_ids.mapped('is_reconciled')))
+
+    def test_rx_prepayment_rejects_draft_invoice_and_stale_preview(self):
+        self.env.user.groups_id |= self.env.ref('account.group_account_manager')
+        order, payload, events = self._rx_140664_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            wizard = self.env['shopify.payment.repair.ept'].browse(order.action_preview_shopify_payments()['res_id'])
+            invoice = self._rx_140664_invoice(order)
+            with self.assertRaisesRegex(UserError, 'draft invoices'):
+                order._sync_shopify_cash()
+            with self.assertRaises(UserError):
+                wizard.action_apply()
+        self.assertEqual(invoice.state, 'draft')
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_rx_prepayment_refuses_quote_wrong_total_fulfillment_or_refund(self):
+        order, payload, events = self._rx_140664_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            order.state = 'draft'
+            with self.assertRaises(UserError):
+                order._sync_shopify_cash()
+            order.state = 'sale'
+            for changes in ({'current_total_price': '565.65'}, {'id': 'other-order'},
+                            {'fulfillments': [{'id': 'shipment'}]}, {'refunds': [{'id': 'refund'}]}):
+                with self.subTest(changes=changes), self.assertRaises(UserError):
+                    order._build_shopify_cash_plan(source=(dict(payload, **changes), events))
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(source=(payload, events[:1]))
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_rx_prepayment_refuses_completed_odoo_delivery(self):
+        order, payload, events = self._rx_140664_fixture()
+        self.assertTrue(order.picking_ids)
+        order.picking_ids.state = 'done'
+        with self.assertRaisesRegex(UserError, 'completed stock movements'):
+            order._build_shopify_cash_plan(source=(payload, events))
+
+    def test_rx_prepayment_refuses_customer_credit_allocated_outside_order(self):
+        order, payload, events = self._rx_140664_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            payment = order._sync_shopify_cash()
+            # An unrelated journal entry is not discoverable through invoice_ids.
+            outside = self.env['account.move'].create({
+                'journal_id': self.journal.id, 'date': fields.Date.today(), 'line_ids': [Command.create({
+                    'account_id': self.receivable.id, 'partner_id': self.partner.id, 'debit': 10,
+                }), Command.create({'account_id': self.revenue.id, 'credit': 10})],
+            })
+            outside.action_post()
+            (outside.line_ids.filtered(lambda line: line.account_id == self.receivable)
+             | payment._seek_for_lines()[1]).reconcile()
+            with self.assertRaisesRegex(UserError, 'already allocated'):
+                order._sync_shopify_cash()
+            self.assertEqual(len(order.shopify_payment_audit_ids), 1)
+
+    def test_rx_shipment_source_failure_keeps_credit_and_never_creates_second_receipt(self):
+        order, payload, events = self._rx_140664_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            payment = order._sync_shopify_cash()
+        self.instance.shopify_transaction_payment_sync = False
+        invoice = self._rx_140664_invoice(order)
+        with patch.object(type(order), '_shopify_cash_source', side_effect=UserError('Source temporarily unavailable')):
+            invoice.action_post()
+            order.paid_invoice_ept(invoice)
+        self.assertEqual(invoice.state, 'posted')
+        self.assertEqual(invoice.amount_residual, 564.95)
+        self.assertFalse(payment._seek_for_lines()[1].reconciled)
+        self.assertEqual(self.env['account.payment'].search([('partner_id', '=', self.partner.id)]), payment)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            order.paid_invoice_ept(invoice)
+        self.assertEqual(invoice.amount_residual, 0)
+        self.assertEqual(invoice.reconciled_payment_ids, payment)
+
+    def test_rx_partial_shipment_invoice_requires_review_without_duplicate_receipt(self):
+        order, payload, events = self._rx_140664_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            payment = order._sync_shopify_cash()
+            self.instance.shopify_transaction_payment_sync = False
+            partial = self._rx_140664_invoice(order, shipping_only=True)
+            partial.action_post()
+            order.paid_invoice_ept(partial)
+            self.assertEqual(partial.amount_residual, 9.95)
+            self.assertFalse(payment._seek_for_lines()[1].reconciled)
+            with self.assertRaises(UserError):
+                order._sync_shopify_cash()
+            self.assertEqual(self.env['account.payment'].search([('partner_id', '=', self.partner.id)]), payment)

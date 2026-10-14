@@ -5,7 +5,7 @@ from odoo import Command, fields, models, _
 from odoo.exceptions import UserError
 from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
-from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, prove_cancelled_cash, fingerprint, component_money, money
+from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, prove_cancelled_cash, prove_prepayment_cash, fingerprint, component_money, money
 from .shopify_refund_plan import prove_final_net_invoice, refund_components
 from .shopify_repair_error import ShopifyRepairBlocked
 
@@ -352,7 +352,8 @@ class SaleOrderPaymentSync(models.Model):
             invoices = documents.filtered(lambda move: move.move_type == 'out_invoice')
             credits = documents.filtered(lambda move: move.move_type == 'out_refund')
             cancelled_cash = not documents and self.state == 'cancel' and self.canceled_in_shopify
-            if (not invoices and not cancelled_cash) or documents.filtered(lambda move: move.company_id != self.company_id
+            prepayment = not documents and self.state == 'sale' and not self.canceled_in_shopify
+            if (not invoices and not cancelled_cash and not prepayment) or documents.filtered(lambda move: move.company_id != self.company_id
                                                   or move.currency_id != self.currency_id):
                 raise ShopifyRepairBlocked(_('Posted invoices in the order company and currency are required.'), 'documents')
             if documents.invoice_line_ids.sale_line_ids.order_id - self:
@@ -374,8 +375,13 @@ class SaleOrderPaymentSync(models.Model):
             receivable = documents.line_ids.filtered(lambda row: row.account_type == 'asset_receivable').account_id
             if cancelled_cash:
                 prove_cancelled_cash(payload, events, self.currency_id.compare_amounts)
+            if prepayment:
+                if str(payload.get('id')) != self.shopify_order_id:
+                    raise UserError(_('Shopify returned another order.'))
+                prove_prepayment_cash(payload, events, self.amount_total, self.currency_id.compare_amounts)
+            if cancelled_cash or prepayment:
                 if self.picking_ids.filtered(lambda picking: picking.state == 'done'):
-                    raise UserError(_('The cancelled order has completed stock movements. Review its accounting manually.'))
+                    raise UserError(_('The order has completed stock movements. Review its accounting manually.'))
                 receivable = self.partner_id.commercial_partner_id.with_company(self.company_id).property_account_receivable_id
             if (len(receivable) != 1 or not receivable.reconcile or receivable.deprecated
                     or receivable.account_type != 'asset_receivable' or self.company_id not in receivable.company_ids):
@@ -388,12 +394,12 @@ class SaleOrderPaymentSync(models.Model):
                 raise UserError(_('The invoice or refunds from the previous net-invoice audit are missing. Review the history.'))
             embedded_amount = sum(money(refund_events[key]['amount']) for key in embedded_ids)
             try:
-                mode = 'cancelled_cash' if cancelled_cash else invoice_mode(
+                mode = 'prepayment' if prepayment else 'cancelled_cash' if cancelled_cash else invoice_mode(
                     events, sum(invoices.mapped('amount_total')), sum(credits.mapped('amount_total')),
                     self.currency_id.compare_amounts, embedded_amount)
             except ValueError as error:
                 raise ShopifyRepairBlocked(str(error), 'documents') from error
-            credit_values = [] if cancelled_cash else self._shopify_refund_documents(
+            credit_values = [] if cancelled_cash or prepayment else self._shopify_refund_documents(
                 payload, events, invoices, credits, mode, embedded_ids)
             if mode == 'net':
                 embedded_ids = sorted(refund_events)
@@ -453,6 +459,9 @@ class SaleOrderPaymentSync(models.Model):
                         or liquidity.account_id != method.payment_account_id
                         or self.currency_id.compare_amounts(abs(liquidity.amount_currency), float(event['amount']))):
                     raise UserError(_('The existing payment does not have the expected outstanding-account entry.'))
+                if prepayment and (matches or counterpart.reconciled
+                                   or self.currency_id.compare_amounts(-counterpart.amount_residual_currency, float(event['amount']))):
+                    raise UserError(_('The prepayment is already allocated. Review its customer receivable entries before repairing this order.'))
                 remaining -= matched
             event['payment_id'] = matched.id if matched else False
             event['payment_date'] = matched.date.isoformat() if matched else event['date']
@@ -514,8 +523,10 @@ class SaleOrderPaymentSync(models.Model):
         existing = self.env['account.payment'].browse([event['payment_id'] for event in plan['events'] if event['payment_id']])
         if (not replaced and not plan['credits'] and len(existing) == len(plan['events'])
                 and all(pay.shopify_cash_order_id == self for pay in existing)
-                and all(line.reconciled for line in (documents.line_ids | existing.move_id.line_ids).filtered(
-                    lambda line: line.account_type == 'asset_receivable'))):
+                and ((plan['mode'] == 'prepayment' and self._has_shopify_cash_prepayment())
+                     or (plan['mode'] != 'prepayment' and all(line.reconciled for line in
+                         (documents.line_ids | existing.move_id.line_ids).filtered(
+                             lambda line: line.account_type == 'asset_receivable'))))):
             return existing
         for payment in replaced:
             self._check_shopify_replacement(payment, documents)
@@ -570,12 +581,14 @@ class SaleOrderPaymentSync(models.Model):
         receivables = documents.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')
         for payment in payments:
             receivables |= payment._seek_for_lines()[1].filtered(lambda line: line.account_type == 'asset_receivable')
-        for account in receivables.account_id:
-            lines = receivables.filtered(lambda line: line.account_id == account and not line.reconciled)
-            if lines:
-                lines.reconcile()
-        if receivables.filtered(lambda line: not line.reconciled):
-            raise UserError(_('The order documents and reconstructed cash transactions leave a customer balance; the synchronization was rolled back.'))
+        # Before shipment, the receipt is customer credit awaiting its invoice.
+        if plan['mode'] != 'prepayment':
+            for account in receivables.account_id:
+                lines = receivables.filtered(lambda line: line.account_id == account and not line.reconciled)
+                if lines:
+                    lines.reconcile()
+            if receivables.filtered(lambda line: not line.reconciled):
+                raise UserError(_('The order documents and reconstructed cash transactions leave a customer balance; the synchronization was rolled back.'))
         self.prepare_vals_shopify_multi_payment_refund([], self)
         self.write({'shopify_payment_sync_revision': self.shopify_payment_sync_revision + 1})
         audit = self.env['shopify.payment.audit.ept']._record_sync({
@@ -690,8 +703,14 @@ class SaleOrderPaymentSync(models.Model):
             model_name=self._name, res_id=self.id, order_ref=self.name)
         return True
 
+    def _has_shopify_cash_prepayment(self):
+        self.ensure_one()
+        return any((audit.plan or {}).get('mode') == 'prepayment' for audit in self.shopify_payment_audit_ids)
+
     def paid_invoice_ept(self, invoices):
-        if not self._shopify_transaction_payments_enabled():
+        # A reviewed prepayment must never fall back to another invoice-sized
+        # receipt, even if transaction recording is disabled after the repair.
+        if not self._shopify_transaction_payments_enabled() and not self._has_shopify_cash_prepayment():
             return super().paid_invoice_ept(invoices)
         documents = invoices or self.invoice_ids
         if not documents:

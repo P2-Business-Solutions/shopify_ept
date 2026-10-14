@@ -1,5 +1,6 @@
 """Cash-history planning tests, including the 242.10 / 45 / 197.10 regression."""
 import importlib.util
+import json
 from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
@@ -161,3 +162,28 @@ class TestShopifyPaymentPlan(unittest.TestCase):
         row = transaction(amount='1.234')
         row['currency'] = 'KWD'
         self.assertEqual(plan.cash_events([row], 'order', 'KWD')[0]['amount'], '1.234')
+
+    def test_rx_140664_prepayment_uses_capture_not_larger_authorization(self):
+        source = json.loads((Path(__file__).parent / 'fixtures' / 'order_140664_cash.json').read_text())
+        payload = source['order']
+        events = plan.cash_events(source['transactions'], payload['id'], 'USD')
+        plan.prove_prepayment_cash(payload, events, 564.95, compare)
+        self.assertEqual([(row['id'], row['amount'], row['date']) for row in events],
+                         [('8896198377698', '564.95', '2026-09-09')])
+        self.assertEqual(events[0]['parent_id'], '8896198050018')
+
+    def test_prepayment_requires_current_total_full_capture_no_refunds_or_fulfillment(self):
+        source = json.loads((Path(__file__).parent / 'fixtures' / 'order_140664_cash.json').read_text())
+        payload = source['order']
+        events = plan.cash_events(source['transactions'], payload['id'], 'USD')
+        for changes in ({'current_total_price': '565.65'}, {'financial_status': 'partially_paid'},
+                        {'cancelled_at': '2026-09-10T10:00:00Z'}, {'refunds': [{'id': 'refund'}]},
+                        {'fulfillments': [{'status': 'cancelled'}]}, {'fulfillment_status': 'fulfilled'},
+                        {'fulfillments': None}, {'refunds': None}, {'currency': 'CAD'}):
+            with self.subTest(changes=changes), self.assertRaises(plan.PaymentPlanError):
+                plan.prove_prepayment_cash(dict(payload, **changes), events, 564.95, compare)
+        with self.assertRaises(plan.PaymentPlanError):
+            plan.prove_prepayment_cash(payload, events, 565.65, compare)
+        refund = dict(events[0], id='refund', kind='refund', amount='0.70', parent_id=events[0]['id'])
+        with self.assertRaises(plan.PaymentPlanError):
+            plan.prove_prepayment_cash(payload, events + [refund], 564.95, compare)

@@ -59,11 +59,16 @@ class ShopifyPaymentRepair(models.TransientModel):
                                     (escape(invoice.display_name), escape(str(invoice.amount_total)),
                                      escape(invoice.currency_id.name), escape(str(invoice.amount_residual))))
             treatment = {'gross': 'Original invoice', 'net': 'Refunds already included in invoice',
+                         'prepayment': 'Customer prepayment before shipment; leave customer credit open for the shipment invoice',
                          'cancelled_cash': 'Fully refunded cancellation before fulfillment; receipt and refund only',
                          'net_with_credits': 'Previously audited net invoice; later refunds recorded separately'}[plan['mode']]
             sections.append(Markup('<p>Invoice treatment: %s. Replace legacy payments: %s. Create credit notes: %s.</p>')
                             % (escape(treatment), escape(', '.join(map(str, plan['replace_ids'])) or 'None'),
                                len(plan['credits'])))
+            if plan['mode'] == 'prepayment':
+                sections.append(Markup('<p>Record the captured payment now for payout reconciliation. '
+                                       'No invoice is created. The same payment will be applied when the shipment invoice posts; '
+                                       'its original date and payout match are retained.</p>'))
             for credit in self.env['account.move'].browse(plan['reused_credit_ids']):
                 sections.append(Markup('<p>Reuse credit note %s for Shopify refund %s: %s %s.</p>')
                                 % (escape(credit.display_name), escape(credit.shopify_refund_id),

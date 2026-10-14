@@ -1,5 +1,26 @@
 # Shopify cash transactions and payment repair
 
+Version **18.0.3.47** supports prepayments before shipment, including RX order
+#140664. A confirmed, fully paid, unfulfilled order without active invoices or
+refunds can record its successful captures now. The captured cash, current Shopify
+total and sales order total must agree. Authorizations are excluded: #140664's
+$565.65 authorization produces no payment; its $564.95 capture does.
+
+Repair posts the receipt on its source date, linked to the order, and leaves an
+unapplied customer credit. Its outstanding entry can immediately reconcile the
+payout. No invoice, delivery or manufacturing order is created and the delivery
+hold is retained. Canceled invoices are ignored; draft invoices still require review.
+
+When the normal shipment invoice posts, the connector applies that same payment
+to its receivable, retaining the original date and existing payout match. This also
+works with automatic transaction recording or workflow Register Payment disabled:
+an audited prepayment never falls back to a second invoice-sized receipt. A later
+workflow call or repeated repair reuses the existing payment. If source history is
+unavailable or the invoice is partial/inconsistent, posting succeeds with the invoice
+open and the credit retained; the order log explains the review needed. Retry payment
+repair after resolving the source or document issue. Refunds before invoicing and
+receivables already applied outside the order require review.
+
 Version **18.0.3.46** supports a cash-only refund with explicitly empty refunded-item
 and order-adjustment lists when the final Shopify order total, invoice, net cash,
 item quantities and tax agree. This includes address/tax corrections such as order
@@ -26,8 +47,9 @@ transfers remain a separate step after the underlying cash movements are reconci
 
 Transaction-based recording is **off by default**. Enable **Record Payments from
 Shopify Transactions** under Shopify → Configuration → Settings for the instance.
-Upgrading does not enable it. While it is off, the workflow registers one payment for
-the invoice balance exactly as before, and refunds follow the previous credit-note flow.
+Upgrading does not enable it. While it is off, orders without an audited prepayment
+use the previous invoice-balance payment and credit-note flow. An order with an audited
+prepayment reuses it when its invoice posts, as described above.
 
 While it is on, an order whose Shopify history cannot be recorded automatically (no
 successful charge, a gift card, an unsupported currency, a partial invoice, a journal
@@ -219,9 +241,10 @@ missing refund-parent history; unsupported currency conversion; gift-card transa
 missing/ambiguous gateway journals or payment methods; and invoice/credit-note totals
 that do not fit the proven original or final-net document states. Correct payments
 identified by their Shopify transaction ID can be reused even after payout reconciliation.
-An invoice awaiting additional captures requires review. A fully refunded order with
-no posted invoice is supported only for a verified cancellation before fulfillment;
-other missing-invoice histories require review.
+An invoice awaiting additional captures requires review. Without a posted invoice,
+fully paid, unfulfilled confirmed orders support prepayment, and fully refunded orders
+support a verified cancellation before fulfillment. Other missing-invoice histories
+require review.
 
 Unproven mixed document histories (some reductions embedded in the invoice and other reductions
 represented by credit notes), goodwill/order-adjustment refunds, duties/additional fees,

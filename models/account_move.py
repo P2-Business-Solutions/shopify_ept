@@ -37,6 +37,17 @@ class AccountMove(models.Model):
     is_shopify_multi_payment = fields.Boolean("Multi Payments?", default=False, copy=False,
                                               help="It is used to identify that order has multi-payment gateway or not")
 
+    def _post(self, soft=True):
+        posted = super()._post(soft=soft)
+        invoices = posted.filtered(lambda move: move.state == 'posted' and move.move_type == 'out_invoice')
+        orders = invoices.invoice_line_ids.sale_line_ids.order_id.filtered('shopify_instance_id').filtered(
+            lambda order: order._has_shopify_cash_prepayment())
+        for order in orders:
+            # Apply the previously recorded receipt when the normal shipment
+            # invoice posts, independently of the workflow's payment checkbox.
+            order.paid_invoice_ept(invoices & order.invoice_ids)
+        return posted
+
     def action_open_refund_wizard(self):
         """This method used to open a wizard for Refund order in Shopify.
             @param : self
