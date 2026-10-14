@@ -26,3 +26,4 @@ from . import test_shopify_repair_progress
 from . import test_shopify_refund_credit
 from . import test_shopify_repair_customer
 from . import test_shopify_repair_workflow
+from . import test_shopify_payout_exception_report

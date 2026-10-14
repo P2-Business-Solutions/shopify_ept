@@ -1,5 +1,13 @@
 # Bulk payout exception processing
 
+### One live exception report (18.0.3.44)
+
+Use **Shopify → Sales → Payout Reconciliation Exceptions** for one list of open
+transaction, statement review, validation and bank settlement work across payouts.
+It includes transactions that have no saved repair case yet and links to the
+existing repair workspace, all saved cases and immutable history. See the
+[report and breadcrumb guide](payout-exception-report.md).
+
 ### Live open filters and visible bulk reimport results (18.0.3.41)
 
 **Remaining Reports** now shows payouts with at least one nonzero transaction still
