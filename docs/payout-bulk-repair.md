@@ -251,6 +251,41 @@ previously posted accounting and its existing audits are retained.
 
 ## Historical fulfilled orders
 
+### Loop return receipts and refund closeout (18.0.3.48)
+
+Upgrade Shopify together with **Loop Returns 18.0.1.14.0**. Payout repair now
+checks whether the exact Shopify refund document ID appears in the Loop return's
+processor references for the same store and order. An unmatched refund is shown
+as **initiator unverified**; it is not assumed to have been initiated by a person.
+A Loop source note without a matching return/reference requires syncing the Loop
+app before retrying. Conflicting or duplicate identities stay in review.
+
+For a proven Loop refund, all incoming Odoo return receipts (**WH/IN**) and their
+backorders must be completed, with received quantities, in the Shopify company.
+Missing, cancelled-only or pending receipts leave the refund open. This gate also
+applies to order cash repair entered through a charge row and to manual credit
+linking. A receipt alone never proves that Shopify returned the cash.
+
+For a completed return, **Preview / Refresh** prepares one case per Shopify refund
+document, including refunds split across payouts:
+
+- Reuse the existing posted credit, retain its accounts and taxes, and record or
+  reuse the exact outgoing refund payment(s).
+- If no credit exists, prepare it from the proven Shopify refund components and
+  original Odoo invoice, or use the existing historical fulfillment/cutover rules
+  for a sale from the old system. Attach the credit to the Loop return.
+- **Apply Selected Ready Cases** closes the credit receivable with the payments.
+  Payout matching then clears their outstanding cash. These Manual payments record
+  refunds that already succeeded; they do not send another refund to Shopify.
+
+The preview shows the Loop return, receipts, credit and payment actions. Draft or
+duplicate credits, changed receipts/source/accounting, currency or total conflicts,
+net invoices that already include the return, unidentified payments and unsupported
+allocations require review. Pre-cutover refunds retain their opening-balance review
+requirements. Repeat runs reuse recorded identities and do not add a payment to a
+credit already settled directly by its payout. Native Loop credit creation shares
+the same order lock with payout repair to prevent competing creation.
+
 ### Existing reviewed credit notes (18.0.3.34)
 
 If Accounting has already posted the refund credit (including a standalone Loop
@@ -438,6 +473,17 @@ supports Shopify Payments; PayPal uses Payment Payout Reconciliation's separate
 historical activity/credit linking actions.
 
 ## Validation
+
+Version **18.0.3.48**, together with Loop Returns **18.0.1.14.0**, adds 17
+receipt-aware closeout regressions alongside the three existing Loop credit-link
+tests. All 20 passed. They cover existing/missing credits, current/historical
+invoices, missing/pending receipts and unlinked backorders, source/total conflicts,
+exact payment reuse, split payouts, changed previews and atomic posting failure.
+The combined Shopify/Loop run reported 391 tests with zero failures or errors;
+three existing Enterprise bank-widget tests were skipped. The 122 standalone
+checks also passed. New payout matching tests use real journal items with the
+existing Community reconciliation adapter. These are local test results; both
+modules still require upgrade and staging verification of the Enterprise widget.
 
 Version **18.0.3.34** adds 12 existing-credit accounting tests and three Loop
 integration tests. They cover standalone credits without an SO, split refunds

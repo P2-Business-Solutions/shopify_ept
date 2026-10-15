@@ -153,6 +153,9 @@ class ShopifyPayoutRepair(models.Model):
             raise UserError(_('The repair contains transactions outside the selected payouts.'))
         for payout in transactions.payout_id:
             payout._check_payout_reimport_period()
+        return_plan = transactions.sorted('id')[:1]._refund_return_plan(self, evidence=evidence)
+        if return_plan:
+            return return_plan
         references = self.env['shopify.refund.reference.ept']
         for transaction in transactions:
             references |= transaction._refund_credit_reference()
@@ -229,7 +232,13 @@ class ShopifyPayoutRepair(models.Model):
             try:
                 orders = (transaction.payout_id._shop_cash_orders_for_preview(transaction)
                           if transaction.shop_cash_kind else transaction._repair_order())
-                if transaction._refund_credit_reference():
+                return_plan = transaction._refund_return_plan(self, evidence=evidence)
+                if return_plan:
+                    key = ('return_refund', transaction.payout_id.instance_id.id, return_plan['refund_id'])
+                    if key not in groups:
+                        groups[key] = [self.env['shopify.payout.report.line.ept'], orders, return_plan, evidence]
+                    groups[key][0] |= transaction
+                elif transaction._refund_credit_reference():
                     groups[('credit_link', transaction.id)] = [transaction, orders, self._plan(transaction, orders), evidence]
                 elif transaction.shop_cash_kind:
                     for order in orders:
@@ -312,6 +321,12 @@ class ShopifyPayoutRepair(models.Model):
         return self._reopen()
 
     def _summary(self, plan):
+        if plan['kind'] == 'return_refund':
+            return _('Loop return %(return_name)s: warehouse receipt %(receipts)s completed; %(action)s credit %(credit)s and record/reuse %(count)s refund payment(s) for %(amount)s. Match the payout to finish settlement.',
+                     return_name=plan['return_name'], receipts=', '.join(plan['receipt_names']),
+                     action=_('reuse') if plan['accounting']['credit_id'] else _('create'),
+                     credit=plan['credit_name'] or _('new'), count=len(plan['accounting']['events']),
+                     amount=plan['accounting']['amount'])
         if plan['kind'] == 'credit_link':
             return _('Reuse the reviewed refund credit %s and match its existing payout statement.',
                      ', '.join(self.env['account.move'].browse(plan['credit_ids']).mapped('display_name')))
@@ -371,7 +386,11 @@ class ShopifyPayoutRepair(models.Model):
                         raise UserError(_('Settings changed for this case. Refresh it before applying.'))
                     if fingerprint(fresh) != fingerprint(line.plan):
                         raise UserError(_('Source data or accounting changed after preview. Refresh this case before applying.'))
-                    if fresh['kind'] == 'credit_link':
+                    if fresh['kind'] == 'return_refund':
+                        credit, payments = line.transaction_ids.sorted('id')[:1]._apply_refund_return_plan(
+                            fresh, line.transaction_ids.payout_id)
+                        line.write({'credit_ids': [Command.set(credit.ids)], 'payment_ids': [Command.set(payments.ids)]})
+                    elif fresh['kind'] == 'credit_link':
                         line.write({'credit_ids': [Command.set(fresh['credit_ids'])]})
                     elif fresh['kind'] == 'historical':
                         credit, payments = line.transaction_ids.sorted('id')[:1]._apply_historical_refund_plan(
@@ -467,6 +486,7 @@ class ShopifyPayoutRepairLine(models.Model):
     selected = fields.Boolean()
     kind = fields.Selection([('order', 'Order Cash Repair'), ('historical', 'Historical Refund'),
                              ('collection', 'Historical Collection'), ('opening_refund', 'Opening-Balance Refund'),
+                             ('return_refund', 'Received Return Refund'),
                              ('credit_link', 'Existing Refund Credit'),
                              ('review', 'Needs Review')], readonly=True)
     status = fields.Selection([('ready', 'Ready'), ('review', 'Needs Review'), ('done', 'Applied')], readonly=True)
@@ -509,6 +529,12 @@ class ShopifyPayoutRepairLine(models.Model):
                 continue
             sections = [Markup('<p>Source order %s · %s · Cutover %s (%s).</p>') %
                 tuple(escape(evidence.get(key, '')) for key in ('order_id', 'currency', 'cutover', 'timezone'))]
+            if evidence.get('refund_origin'):
+                sections.append(Markup('<p>Refund origin: %s.</p>') % escape(evidence['refund_origin']))
+            if evidence.get('loop_return'):
+                record = evidence['loop_return']
+                sections.append(table([_('Loop return'), _('Warehouse status'), _('Receipts')],
+                                      [[record['name'], record['state'], record['receipts']]]))
             if evidence.get('source_issue'):
                 sections.append(Markup('<p>Source history needs review: %s</p>') % escape(evidence['source_issue']))
             documents = evidence.get('documents', [])
@@ -623,7 +649,7 @@ class ShopifyPayoutRepairLine(models.Model):
     reconciliation_status = fields.Selection([('matched', 'Matched'), ('pending', 'Awaiting Match')],
         compute='_compute_reconciliation_status', string='Payout Match')
 
-    @api.depends('resolution', 'status', 'reconciliation_status')
+    @api.depends('resolution', 'status', 'reconciliation_status', 'review_evidence')
     def _compute_next_step(self):
         routes = {
             'customer': _('Import Customer, then review the refreshed refund plan.'),
@@ -642,6 +668,8 @@ class ShopifyPayoutRepairLine(models.Model):
                 case.next_step = _('Review Details, then Apply Selected Ready Cases.')
             elif case.status == 'done':
                 case.next_step = _('Accounting applied. Review the matching issue and Refresh Case to retry.')
+            elif (case.review_evidence or {}).get('loop_return') and case.resolution == 'documents':
+                case.next_step = _('Open the Loop return, complete all WH/IN receipts and backorders, review its credit notes, then Refresh Case.')
             else:
                 case.next_step = routes.get(case.resolution, routes['review'])
 
@@ -752,7 +780,16 @@ class ShopifyPayoutRepairLine(models.Model):
         for line in self:
             plan = line.plan or {}
             sections = []
-            if plan.get('kind') == 'credit_link':
+            if plan.get('kind') == 'return_refund':
+                sections.append(Markup('<p>Loop return %s. Completed warehouse receipts: %s.</p>') %
+                    (escape(plan['return_name']), escape(', '.join(plan['receipt_names']))))
+                plan = dict(plan['accounting'], kind='historical' if plan['accounting']['values'] else 'return_credit')
+            if plan.get('kind') == 'return_credit':
+                credit = self.env['account.move'].browse(plan['credit_id'])
+                sections.append(Markup('<p>Reuse credit %s: %s %s. Retain its posted accounts and taxes.</p>') %
+                    (escape(credit.display_name), escape(str(credit.amount_total)), escape(credit.currency_id.name)))
+                events = plan['events']
+            elif plan.get('kind') == 'credit_link':
                 notes = self.env['account.move'].browse(plan['credit_ids'])
                 sections.append(Markup('<p>Reuse reviewed credit: %s. Match the exact payout refund; retain its posted accounts and taxes.</p>') %
                                 escape(', '.join(notes.mapped('display_name'))))

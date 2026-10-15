@@ -78,6 +78,14 @@ class ShopifyRefundCreditMove(models.Model):
 class ShopifyRefundCreditLine(models.Model):
     _inherit = 'shopify.payout.report.line.ept'
 
+    def _refund_return_plan(self, workspace, evidence=None):
+        """Optional return integrations prove origin, receipt and refund accounting."""
+        self.ensure_one()
+        return False
+
+    def _apply_refund_return_plan(self, plan, payouts):
+        raise UserError(_('The return integration for this refund is unavailable. Refresh the case.'))
+
     refund_credit_note_id = fields.Many2one('account.move', compute='_compute_refund_credit_note',
                                           string='Linked Refund Credit Note')
 

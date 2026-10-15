@@ -261,6 +261,36 @@ class ShopifyPayoutRepairLine(models.Model):
             if (expected.keys() != actual.keys() or credits.invoice_line_ids.tax_ids
                     or any(currency.compare_amounts(expected[key], actual[key]) for key in expected)):
                 raise UserError(_('The existing historical credit uses different refund accounts or allocations. Review and correct the credit before matching its cash.'))
+        plan_events = self._refund_payment_plan(refund_events, partner, credits)
+        return dict(kind='historical', line_id=self.id, source_order_id=self.source_order_id,
+                    order_id=order.id, source_name=payload.get('name') or self.source_order_id,
+                    cutover=str(cutover), timezone=timezone, post=post,
+                    values=values, amount=amount, events=plan_events, credit_id=credits.id,
+                    refund_components=parts,
+                    fulfillment_evidence=[dict(status=row.get('status'), created_at=row.get('created_at'),
+                                               items=[dict(id=item.get('id'), quantity=item.get('quantity'))
+                                                      for item in row.get('line_items', [])])
+                                          for row in payload.get('fulfillments', [])],
+                    credit_snapshot=fingerprint([(move.id, str(move.write_date), move.state, move.amount_total,
+                                                  move.amount_residual,
+                                                  [(line.id, str(line.write_date), line.amount_residual,
+                                                    line.matched_debit_ids.ids, line.matched_credit_ids.ids)
+                                                   for line in move.line_ids.sorted('id')]) for move in credits]),
+                    source=fingerprint({'order': payload, 'transactions': transactions}),
+                    payout_snapshot=fingerprint([(row.id, str(row.write_date), row.amount, row.is_reconciled,
+                                                 str(row.move_id.write_date))
+                                                for row in payout.payout_statement_line_ids.sorted('id')]))
+
+    def _refund_payment_plan(self, refund_events, partner, credits):
+        """Prepare recording-only refund payments with exact source identities."""
+        self.ensure_one()
+        instance = self.payout_id.instance_id
+        company, currency = instance.shopify_company_id, self.payout_id.currency_id
+        receivable = (credits.line_ids.filtered(lambda line: line.account_type == 'asset_receivable').account_id
+                      if credits else partner.with_company(company).property_account_receivable_id)
+        if (len(receivable) != 1 or not receivable.reconcile or receivable.deprecated
+                or receivable.account_type != 'asset_receivable' or company not in receivable.company_ids):
+            raise UserError(_('The refund needs one reconcilable customer receivable account.'))
         plan_events = []
         for event in refund_events:
             journal = instance.credit_note_payment_journal or instance.shopify_settlement_report_journal_id
@@ -287,10 +317,12 @@ class ShopifyPayoutRepairLine(models.Model):
                 raise UserError(_('An unidentified refund payment could already represent this cash. Verify and link its transaction ID before retrying.'))
             if payment and (len(payment) != 1 or payment.company_id != company
                             or payment.currency_id != currency or payment.payment_type != 'outbound'
+                            or payment.partner_type != 'customer'
+                            or payment.shopify_cash_kind != 'refund' or payment.shopify_cash_gateway != event['gateway']
                             or currency.compare_amounts(payment.amount, float(event['amount']))
                             or payment.partner_id.commercial_partner_id != partner or payment.journal_id != journal
                             or payment.move_id.state != 'posted' or payment.state in ('canceled', 'rejected')
-                            or payment.shopify_source_order_id != self.source_order_id
+                            or (payment.shopify_source_order_id or payment.shopify_cash_order_id.shopify_order_id) != self.source_order_id
                             or payment.shopify_parent_transaction_id != event['parent_id']
                             or payment.shopify_cash_timestamp != event['timestamp']):
                 raise UserError(_('An existing refund payment has conflicting accounting or source identity.'))
@@ -312,24 +344,7 @@ class ShopifyPayoutRepairLine(models.Model):
                                          line.amount_residual, line.amount_residual_currency,
                                          line.matched_debit_ids.ids, line.matched_credit_ids.ids)
                                         for line in payment.move_id.line_ids.sorted('id')])))
-        return dict(kind='historical', line_id=self.id, source_order_id=self.source_order_id,
-                    order_id=order.id, source_name=payload.get('name') or self.source_order_id,
-                    cutover=str(cutover), timezone=timezone, post=post,
-                    values=values, amount=amount, events=plan_events, credit_id=credits.id,
-                    refund_components=parts,
-                    fulfillment_evidence=[dict(status=row.get('status'), created_at=row.get('created_at'),
-                                               items=[dict(id=item.get('id'), quantity=item.get('quantity'))
-                                                      for item in row.get('line_items', [])])
-                                          for row in payload.get('fulfillments', [])],
-                    credit_snapshot=fingerprint([(move.id, str(move.write_date), move.state, move.amount_total,
-                                                  move.amount_residual,
-                                                  [(line.id, str(line.write_date), line.amount_residual,
-                                                    line.matched_debit_ids.ids, line.matched_credit_ids.ids)
-                                                   for line in move.line_ids.sorted('id')]) for move in credits]),
-                    source=fingerprint({'order': payload, 'transactions': transactions}),
-                    payout_snapshot=fingerprint([(row.id, str(row.write_date), row.amount, row.is_reconciled,
-                                                 str(row.move_id.write_date))
-                                                for row in payout.payout_statement_line_ids.sorted('id')]))
+        return plan_events
 
     def _historical_credit_values(self, payload, refund, parts, partner, journal, date, order):
         instance, company = self.payout_id.instance_id, self.payout_id.instance_id.shopify_company_id
