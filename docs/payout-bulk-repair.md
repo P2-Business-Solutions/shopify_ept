@@ -364,6 +364,19 @@ credits/payments must be reviewed/linked rather than recording the same cash twi
 
 ## Pre-cutover refunds settling after cutover
 
+With **Loop Returns 18.0.1.14.1**, this classification runs before the new Loop
+import/WH-IN checks. A July 31 Loop return and successful refund settling in an
+August payout can therefore close as **Opening-Balance Refund**, without importing
+the legacy Loop return or creating another credit/payment/stock receipt.
+Use **Clear Cash Included in Opening Balances** only after verifying that the
+return, tax and net cash are already represented in migration balances; a paid
+A2000 credit memo is evidence of legacy settlement, not by itself a cash-account
+tie-out. The saved case/audit records the closeout. When the selected opening cash
+account equals the Shopify journal control account, the refund clearing and
+matched statement are equal/opposite on each account, leaving net GL balances
+unchanged for that refund. Posting without matching leaves temporary balances
+and the case awaiting reconciliation. Other payout fees/deposits remain normal.
+
 Version **18.0.3.32** classifies individual Shopify Payments refunds automatically
 in the same bulk preview. A successful refund before the selected cutover, on an
 order collected and completely fulfilled before cutover, is **Opening-Balance
@@ -473,6 +486,13 @@ supports Shopify Payments; PayPal uses Payment Payout Reconciliation's separate
 historical activity/credit linking actions.
 
 ## Validation
+
+Loop Returns **18.0.1.14.1** adds eight opening-refund regressions. The July 31
+refund / August payout test verifies that every posted account balance stays
+unchanged after clearing and matching, no customer credit/payment/Loop return or
+stock receipt is created, and a repeat apply reuses the same entry. The selected
+Shopify opening-refund/payout-repair and complete Loop suites reported 111 tests
+with zero failures or errors. No live accounting was posted by this validation.
 
 Version **18.0.3.48**, together with Loop Returns **18.0.1.14.0**, adds 17
 receipt-aware closeout regressions alongside the three existing Loop credit-link
