@@ -523,15 +523,26 @@ class SaleOrder(models.Model):
 
         return is_custom_line, is_gift_card_line, product
 
+    def _shopify_resolve_shipping_lines(self, order_response, instance):
+        """Resolve every option before any shipping lines or carriers are changed."""
+        carriers = self.env["delivery.carrier"]
+        if self:
+            self.ensure_one()
+            order_type = self.order_type_id
+        else:
+            order_type = self._get_shopify_order_type(order_response, instance)
+        return [
+            (line, carriers.shopify_search_create_delivery_carrier(line, instance, order_type=order_type))
+            for line in order_response.get("shipping_lines") or []
+        ]
+
     def create_shopify_shipping_lines(self, order_response, instance):
         """
         Creates shipping lines for shopify orders.
         @author: Maulik Barad on Date 11-Sep-2020.
         """
-        delivery_carrier_obj = self.env["delivery.carrier"]
         order_number = order_response.get("order_number")
-        for line in order_response.get("shipping_lines", []):
-            carrier = delivery_carrier_obj.shopify_search_create_delivery_carrier(line, instance)
+        for line, carrier in self._shopify_resolve_shipping_lines(order_response, instance):
             shipping_product = instance.shipping_product_id
             if carrier:
                 self.write({"carrier_id": carrier.id})
@@ -573,13 +584,9 @@ class SaleOrder(models.Model):
         if not shipping_lines:
             return False
 
-        delivery_carrier_obj = self.env["delivery.carrier"]
         changed = False
         existing_delivery_lines = self.order_line.filtered("is_delivery")
-        for shipping_line in shipping_lines:
-            carrier = delivery_carrier_obj.shopify_search_create_delivery_carrier(
-                shipping_line, instance
-            )
+        for shipping_line, carrier in self._shopify_resolve_shipping_lines(order_response, instance):
             shipping_product = carrier.product_id if carrier else instance.shipping_product_id
             if carrier and self.carrier_id != carrier:
                 self.carrier_id = carrier
@@ -622,22 +629,28 @@ class SaleOrder(models.Model):
                 continue
 
             delivery_line.write({"name": shipping_name})
+            if float_is_zero(delivery_line.qty_invoiced, precision_digits=2):
+                # Free shipping can change carrier without changing its price.
+                # Keep the delivery product aligned with the mapped method too.
+                if (float_compare(delivery_line.price_unit, shipping_price, precision_digits=2)
+                        or delivery_line.product_id != shipping_product
+                        or delivery_line.shopify_line_id != remote_id):
+                    delivery_line.write({
+                        "price_unit": shipping_price,
+                        "product_id": shipping_product.id,
+                        "shopify_line_id": remote_id,
+                    })
+                    changed = True
+                if adjustment_line and not float_is_zero(adjustment_line.price_unit, precision_digits=2):
+                    adjustment_line.price_unit = 0.0
+                    changed = True
+                continue
+
             if float_compare(delivery_line.price_unit, shipping_price, precision_digits=2) == 0:
                 if adjustment_line and not float_is_zero(
                         adjustment_line.price_unit, precision_digits=2):
                     adjustment_line.price_unit = 0.0
                     changed = True
-                continue
-
-            if float_is_zero(delivery_line.qty_invoiced, precision_digits=2):
-                delivery_line.write({
-                    "price_unit": shipping_price,
-                    "product_id": shipping_product.id,
-                    "shopify_line_id": remote_id,
-                })
-                if adjustment_line:
-                    adjustment_line.price_unit = 0.0
-                changed = True
                 continue
 
             adjustment_amount = shipping_price - delivery_line.price_unit
@@ -1054,6 +1067,19 @@ class SaleOrder(models.Model):
             @change : if configuration on for Create delivery fee than going to create order line for delivery fee
             @change by : Nilam Kubavat at 09-Aug-2022 for task id : 197829
         """
+        # Fail before creating an order: otherwise a retry can find a partially
+        # imported order and mark its queue done without resolving its shipping.
+        try:
+            self._shopify_resolve_shipping_lines(order_response, instance)
+        except UserError as error:
+            self.env["common.log.lines.ept"].create_common_log_line_ept(
+                shopify_instance_id=instance.id, module="shopify_ept", message=str(error),
+                model_name="sale.order", order_ref=order_response.get("name"),
+                shopify_order_data_queue_line_id=order_data_queue_line.id if order_data_queue_line else False,
+            )
+            if order_data_queue_line:
+                order_data_queue_line.write({"state": "failed", "processed_at": datetime.now()})
+            return False
         payment_gateway_obj = self.env["shopify.payment.gateway.ept"]
         gateway = "no_payment_gateway"
         payment_gateway_names = order_response.get('payment_gateway_names')
@@ -1849,10 +1875,9 @@ class SaleOrder(models.Model):
                     continue
                 tracking_company = fulfillment.get('tracking_company')
                 if tracking_company:
-                    carrier = self.env['delivery.carrier'].search([('shopify_tracking_company', '=', tracking_company),
-                                                                   ('company_id', 'in',
-                                                                    [self.shopify_instance_id.shopify_company_id.id,
-                                                                     False])], limit=1)
+                    carrier = self.env['delivery.carrier'].search_carrier_for_webhook_fulfillment(
+                        self.shopify_instance_id, fulfillment, preferred_carrier=self.carrier_id,
+                        order_type=self.order_type_id)
                     if carrier:
                         vals.update({'carrier_id': carrier.id})
                 if fulfillment.get('tracking_number'):
@@ -2840,6 +2865,8 @@ class SaleOrder(models.Model):
                     order._process_shopify_cancelled_import(order_data, queue_line)
                     continue
                 is_manual_update = created_by == 'Manual Update'
+                if is_manual_update:
+                    order._shopify_resolve_shipping_lines(order_data, instance)
                 previous_external_error = order._shopify_external_order_error()
                 order_with_transactions = order.with_context(
                     shopify_order_transactions=order_data.get("transaction", [])
@@ -3611,7 +3638,9 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
             delivery_carrier = self.env['delivery.carrier']
             fulfillment_data = order_data.get('fulfillments')[-1] if order_data.get('fulfillments') else {}
             carrier_id = delivery_carrier.search_carrier_for_webhook_fulfillment(self.shopify_instance_id,
-                                                                                 fulfillment_data)
+                                                                                 fulfillment_data,
+                                                                                 preferred_carrier=self.carrier_id,
+                                                                                 order_type=self.order_type_id)
             tracking_number = fulfillment_data.get('tracking_number')
             fulfillment_data_id = fulfillment_data.get('id')
         for picking in pickings.filtered(lambda x: x.state not in ['cancel', 'done']):
@@ -4180,7 +4209,9 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                     fulfillment_product_data.update({sku: quantity})
                 else:
                     fulfillment_product_data.update({sku: quantity})
-            carrier_id = delivery_carrier.search_carrier_for_webhook_fulfillment(shopify_instance, fulfillment_data)
+            carrier_id = delivery_carrier.search_carrier_for_webhook_fulfillment(
+                shopify_instance, fulfillment_data, preferred_carrier=self.carrier_id,
+                order_type=self.order_type_id)
             tracking_number = fulfillment_data.get('tracking_number')
             for transfer in self.picking_ids.filtered(
                     lambda x: x.location_dest_id.usage == "customer" and x.state not in ("done", "cancel")):

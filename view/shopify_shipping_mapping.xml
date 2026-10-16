@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_shopify_shipping_mapping_list" model="ir.ui.view">
+        <field name="name">shopify.shipping.mapping.ept.list</field>
+        <field name="model">shopify.shipping.mapping.ept</field>
+        <field name="arch" type="xml">
+            <list editable="bottom">
+                <field name="company_id" column_invisible="True"/>
+                <field name="instance_id" options="{'no_create': True}"/>
+                <field name="source" placeholder="Any source"/>
+                <field name="match_on"/>
+                <field name="match_value"/>
+                <field name="carrier_id" options="{'no_create': True}"/>
+                <field name="active" optional="hide"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_shopify_shipping_mapping_form" model="ir.ui.view">
+        <field name="name">shopify.shipping.mapping.ept.form</field>
+        <field name="model">shopify.shipping.mapping.ept</field>
+        <field name="arch" type="xml">
+            <form string="Shipping Mapping">
+                <sheet>
+                    <widget name="web_ribbon" title="Archived" bg_color="text-bg-danger" invisible="active"/>
+                    <field name="active" invisible="True"/>
+                    <field name="company_id" invisible="True"/>
+                    <group>
+                        <field name="instance_id" options="{'no_create': True}"/>
+                        <field name="carrier_id" options="{'no_create': True}"/>
+                        <field name="match_on"/>
+                        <field name="match_value"/>
+                        <field name="source" placeholder="Any source"/>
+                    </group>
+                    <p>Leave Shipping Source blank to use this delivery method across sources.
+                        Codes are matched before names. Within each, a source-specific mapping
+                        takes precedence over a mapping for any source.</p>
+                    <p>A delivery method configured in the instance's Order Type Mapping
+                        takes precedence over these shipping-option mappings.</p>
+                    <p>Shipping charges continue to come from the Shopify order.</p>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_shopify_shipping_mapping_search" model="ir.ui.view">
+        <field name="name">shopify.shipping.mapping.ept.search</field>
+        <field name="model">shopify.shipping.mapping.ept</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="match_value"/>
+                <field name="source"/>
+                <field name="carrier_id"/>
+                <field name="instance_id"/>
+                <filter name="archived" string="Archived" domain="[('active', '=', False)]"/>
+                <group expand="0" string="Group By">
+                    <filter name="by_instance" string="Instance" context="{'group_by': 'instance_id'}"/>
+                    <filter name="by_carrier" string="Delivery Method" context="{'group_by': 'carrier_id'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <record id="action_shopify_shipping_mapping" model="ir.actions.act_window">
+        <field name="name">Shipping Mappings</field>
+        <field name="res_model">shopify.shipping.mapping.ept</field>
+        <field name="view_mode">list,form</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">Choose a delivery method for each shipping option.</p>
+            <p>For example: match the shipping name Free Shipping to UPS Ground,
+                leaving Shipping Source blank to share the method across Shopify and Collective.</p>
+            <p>For Warranty or Repair overrides, use the Delivery Method column in the
+                instance's existing Order Type Mapping settings.</p>
+        </field>
+    </record>
+    <menuitem id="menu_shopify_shipping_mapping" name="Shipping Mappings"
+              parent="shopify_ept.menu_configuration_ept" sequence="8"
+              action="action_shopify_shipping_mapping"/>
+</odoo>

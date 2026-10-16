@@ -8,8 +8,20 @@
         <field name="arch" type="xml">
             <xpath expr="//page[@name='destination']" position="after">
                 <page string="Shopify Carrier Info" name="shopify_carrier_info">
+                    <p>Map shipping options from multiple sources to this delivery method.
+                        Leave Shipping Source blank to accept an option from any source.</p>
+                    <field name="shopify_shipping_mapping_ids" nolabel="1">
+                        <list editable="bottom">
+                            <field name="company_id" column_invisible="True"/>
+                            <field name="instance_id" options="{'no_create': True}"/>
+                            <field name="source" placeholder="Any source"/>
+                            <field name="match_on"/>
+                            <field name="match_value"/>
+                            <field name="active" optional="hide"/>
+                        </list>
+                    </field>
                     <group>
-                         <group>
+                         <group string="Existing Mapping">
                             <field name="shopify_source"/>
                             <field name="shopify_tracking_company"/>
                         </group>
@@ -17,6 +29,8 @@
                             <field name="shopify_code"/>
                         </group>
                     </group>
+                    <p>Explicit shipping mappings above take precedence over the existing
+                        source/code fields. Imports never overwrite these fields.</p>
                 </page>
             </xpath>
         </field>

@@ -90,6 +90,9 @@ class SaleOrderPosFulfillment(models.Model):
                               quantity, line.product_uom_qty, False))
         if not specs:
             return
+        carrier = self.env['delivery.carrier'].search_carrier_for_webhook_fulfillment(
+            self.shopify_instance_id, fulfillment, preferred_carrier=self.carrier_id,
+            order_type=self.order_type_id)
         if not picking:
             picking = self.env['stock.picking'].create({
                 'partner_id': self.partner_shipping_id.id,
@@ -119,8 +122,6 @@ class SaleOrderPosFulfillment(models.Model):
             if picking.state != 'done':
                 raise UserError(_('POS delivery %s could not be completed. Review its lots or serial numbers and retry.', picking.name))
         vals = {'updated_in_shopify': True}
-        carrier = self.env['delivery.carrier'].search_carrier_for_webhook_fulfillment(
-            self.shopify_instance_id, fulfillment)
         if carrier:
             vals['carrier_id'] = carrier.id
         if fulfillment.get('tracking_number'):

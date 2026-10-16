@@ -39,6 +39,40 @@ class ShopifyOrderTypeMapping(models.Model):
         check_company=True,
         domain="['|', ('company_id', '=', False), ('company_id', '=', company_id)]",
     )
+    delivery_carrier_id = fields.Many2one(
+        "delivery.carrier", string="Delivery Method", ondelete="restrict", check_company=True,
+        domain="[('active', '=', True), '|', ('company_id', '=', False), ('company_id', '=', company_id)]",
+        help="Optional delivery method for this order type on this Shopify instance. "
+             "Overrides shipping-option mappings on import and manual refresh, while keeping Shopify's shipping charge. "
+             "All tags mapped to the same order type share one delivery method. Leave all of them blank "
+             "to use the general shipping mappings.",
+    )
+
+    @api.constrains("instance_id", "order_type_id", "delivery_carrier_id")
+    def _check_order_type_delivery_method(self):
+        for mapping in self:
+            carriers = self.search([
+                ("instance_id", "=", mapping.instance_id.id),
+                ("order_type_id", "=", mapping.order_type_id.id),
+            ]).mapped("delivery_carrier_id")
+            if len(carriers) > 1:
+                raise ValidationError(_(
+                    "Choose one delivery method for order type %(order_type)s on this Shopify instance. "
+                    "All tags mapped to that order type must use the same method (or leave it blank).",
+                    order_type=mapping.order_type_id.display_name,
+                ))
+
+    @api.model
+    def _get_delivery_carrier(self, instance, order_type):
+        carriers = self.env["delivery.carrier"]
+        if order_type:
+            carriers = self.search([
+                ("instance_id", "=", instance.id), ("order_type_id", "=", order_type.id),
+            ]).mapped("delivery_carrier_id")
+        if carriers:
+            return self.env["delivery.carrier"]._shopify_validate_carrier(
+                carriers, instance, configuration=_("Order Type Mapping"))
+        return carriers
 
     @api.constrains("instance_id", "shopify_tag")
     def _check_unique_normalized_tag(self):

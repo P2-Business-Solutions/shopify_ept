@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # See LICENSE file for full copyright and licensing details.
 
-from odoo import models, fields
+from odoo import models, fields, _
+from odoo.exceptions import UserError
 
 
 class DeliveryCarrier(models.Model):
@@ -10,6 +11,9 @@ class DeliveryCarrier(models.Model):
 
     shopify_code = fields.Char("Shopify Delivery Code")
     shopify_source = fields.Char("Shopify Delivery Source")
+    shopify_shipping_mapping_ids = fields.One2many(
+        "shopify.shipping.mapping.ept", "carrier_id", string="Shopify Shipping Mappings",
+    )
     shopify_tracking_company = fields.Selection([
         ('4PX', '4PX'),
         ('APC', 'APC'),
@@ -191,52 +195,83 @@ class DeliveryCarrier(models.Model):
             "tracking_company exactly as written in the list above. If the tracking company doesn't match one of the"
             "supported entries, then the shipping status might not be updated properly during the fulfillment process.")
 
-    def shopify_search_create_delivery_carrier(self, line, instance):
+    def shopify_search_create_delivery_carrier(self, line, instance, order_type=None):
+        """Use the order-type delivery method, then configured shipping aliases.
+
+        The historic method name is retained for downstream addon compatibility.
         """
-        This method use to search and create delivery carrier base on received response in order line.
-        :param line: Response of order line as received from Shopify store.
-        :param instance: Response of instance.
-        :return: carrier
-        """
-        delivery_source = line.get('source')
-        delivery_code = line.get('code')
-        delivery_title = line.get('title')
-        carrier = self.env['delivery.carrier']
+        carrier = self.env["shopify.order.type.mapping.ept"]._get_delivery_carrier(instance, order_type)
+        if carrier:
+            return carrier
+        carrier = self.env["shopify.shipping.mapping.ept"]._find_carrier(line, instance)
+        if carrier:
+            return carrier
+        delivery_source = (line.get("source") or "").strip()
+        delivery_code = (line.get("code") or "").strip()
+        scope = [("active", "=", True),
+                 ("company_id", "in", [instance.shopify_company_id.id, False])]
+        # Existing source/code fields remain supported, but imports never learn
+        # new values by overwriting a carrier that happens to have the same name.
         if delivery_source and delivery_code:
-            carrier = self.search([('shopify_source', '=', delivery_source), '|', ('shopify_code', '=', delivery_code),
-                                   ('shopify_tracking_company', '=', delivery_code),
-                                   ('company_id', 'in', [instance.shopify_company_id.id, False])], limit=1)
-
+            carrier = self.search(scope + [("shopify_source", "=", delivery_source),
+                                           ("shopify_code", "=", delivery_code)])
             if not carrier:
-                carrier = self.search(
-                    [('name', '=', delivery_title), ('company_id', 'in', [instance.shopify_company_id.id, False])],
-                    limit=1)
-                if carrier:
-                    carrier.write({'shopify_source': delivery_source, 'shopify_code': delivery_code})
-
-            if not carrier:
-                carrier = self.create(
-                    {'name': delivery_title, 'shopify_code': delivery_code, 'shopify_source': delivery_source,
-                     'product_id': instance.shipping_product_id.id, 'company_id': instance.shopify_company_id.id})
-        carrier.invalidate_model(['write_uid'])
-        return carrier
-
-    def search_carrier_for_webhook_fulfillment(self, instance, fulfillment_data):
-        """
-        This method is use to search the carrier for webhook fulfillment
-        @author: Haresh Mori @Emipro Technologies Pvt. Ltd on date 16 October 2023 .
-        """
-        carrier_company = fulfillment_data.get('tracking_company')
-        if carrier_company:
-            carrier = self.search([('shopify_tracking_company', '=', carrier_company)], limit=1)
+                carrier = self.search(scope + [("shopify_source", "=", delivery_source),
+                                               ("shopify_tracking_company", "=", delivery_code)])
             if carrier:
+                return self._shopify_validate_carrier(carrier, instance)
+        raise UserError(_(
+            "No delivery method is mapped for Shopify store %(store)s: "
+            "shipping source=%(shipping_source)r, code=%(code)r, name=%(title)r, order type=%(order_type)r. "
+            "Add a mapping under Shopify > Configuration > Shipping Mappings, then retry the order. "
+            "Leave Shipping Source blank to share a delivery method across sources.",
+            store=instance.name, shipping_source=delivery_source, code=delivery_code,
+            title=line.get("title") or "",
+            order_type=order_type.display_name if order_type else "",
+        ))
+
+    def _shopify_validate_carrier(self, carriers, instance, configuration="Shipping Mappings"):
+        if len(carriers) != 1:
+            raise UserError(_(
+                "Conflicting Shopify delivery methods: %(methods)s. "
+                "Configure one delivery method in %(configuration)s for this store.",
+                methods=", ".join("%s (ID %s)" % (carrier.name, carrier.id) for carrier in carriers),
+                configuration=configuration,
+            ))
+        if not carriers.active:
+            raise UserError(_(
+                "The Shopify shipping mapping points to archived delivery method %(method)s. "
+                "Select an active delivery method in %(configuration)s before retrying.",
+                method=carriers.name, configuration=configuration,
+            ))
+        if carriers.company_id and carriers.company_id != instance.shopify_company_id:
+            raise UserError(_("The mapped delivery method belongs to another company."))
+        return carriers
+
+    def search_carrier_for_webhook_fulfillment(
+            self, instance, fulfillment_data, preferred_carrier=None, order_type=None):
+        """Keep the mapped service when tracking only identifies its shipping company."""
+        carrier_company = fulfillment_data.get("tracking_company")
+        if preferred_carrier:
+            carrier = self._shopify_validate_carrier(preferred_carrier, instance)
+            if not carrier_company or carrier.shopify_tracking_company in (False, carrier_company):
                 return carrier
-        carrier_name = fulfillment_data.get('service')
-        carrier = False
+        carrier = self.env["shopify.order.type.mapping.ept"]._get_delivery_carrier(instance, order_type)
+        if carrier and (not carrier_company or carrier.shopify_tracking_company in (False, carrier_company)):
+            return carrier
+        scope = [("active", "=", True),
+                 ("company_id", "in", [instance.shopify_company_id.id, False])]
+        carrier_name = fulfillment_data.get("service")
         if carrier_name:
-            carrier = self.search([('name', '=', carrier_name)], limit=1)
+            carrier = self.env["shopify.shipping.mapping.ept"]._find_carrier(
+                {"code": carrier_name, "title": carrier_name}, instance,
+            )
             if not carrier:
-                carrier = self.create(
-                    {'name': carrier_name, 'shopify_code': carrier_name, 'shopify_source': carrier_name,
-                     'product_id': instance.shipping_product_id.id})
-        return carrier
+                carrier = self.search(scope + [("name", "=", carrier_name)])
+            if carrier:
+                return self._shopify_validate_carrier(carrier, instance)
+        if carrier_company:
+            carrier = self.search(scope + [("shopify_tracking_company", "=", carrier_company)])
+            if carrier:
+                return self._shopify_validate_carrier(carrier, instance)
+        return self.env["delivery.carrier"]

@@ -283,6 +283,10 @@
                                 Imported orders use the selected default order type when no tag
                                 mapping matches. If an order contains more than one mapped Shopify
                                 tag, the mapping with the lowest sequence is used.
+                                You can also choose a Delivery Method for Warranty, Repair or other
+                                order types here. It overrides shipping-option mappings while keeping
+                                the shipping charge from Shopify. Tags for the same order type share
+                                one method. When none is set for that type, general shipping mappings apply.
                             </div>
                             <group>
                                 <field name="shopify_company_id" invisible="True"/>
@@ -295,6 +299,8 @@
                                     <field name="company_id" column_invisible="True"/>
                                     <field name="shopify_tag" required="1"/>
                                     <field name="order_type_id" required="1"
+                                           options="{'no_create': True, 'no_create_edit': True}"/>
+                                    <field name="delivery_carrier_id"
                                            options="{'no_create': True, 'no_create_edit': True}"/>
                                 </list>
                             </field>

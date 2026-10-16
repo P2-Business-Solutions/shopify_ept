@@ -64,3 +64,7 @@ access_shopify_refund_reference_user,Shopify refund credit reference read,model_
 access_shopify_refund_reference_connector,Shopify refund credit connector read,model_shopify_refund_reference_ept,shopify_ept.group_shopify_ept,1,0,0,0
 access_shopify_refund_credit_link_manager,Shopify refund credit link,model_shopify_refund_credit_link_ept,account.group_account_manager,1,1,1,1
 access_shopify_payout_exception_report_user,Shopify payout exception report read,model_shopify_payout_exception_report_ept,account.group_account_user,1,0,0,0
+access_shopify_shipping_mapping_user,Shopify shipping mapping read,model_shopify_shipping_mapping_ept,base.group_user,1,0,0,0
+access_shopify_shipping_mapping_manager,Shopify shipping mapping manager,model_shopify_shipping_mapping_ept,shopify_ept.group_shopify_manager_ept,1,1,1,1
+access_shopify_shipping_mapping_inventory_manager,Shopify shipping mapping inventory manager,model_shopify_shipping_mapping_ept,stock.group_stock_manager,1,1,1,1
+access_shopify_order_type_mapping_reader,Shopify order type mapping read,model_shopify_order_type_mapping_ept,base.group_user,1,0,0,0

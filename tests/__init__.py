@@ -5,6 +5,8 @@ from . import test_shopify_pos_fulfillment
 from . import test_shopify_pos_order_import
 from . import test_shopify_inventory_utils
 from . import test_shopify_order_type
+from . import test_shopify_shipping_mapping
+from . import test_shopify_shipping_mapping_orm
 from . import test_shopify_order_utils
 from . import test_shopify_payout_generation
 from . import test_shopify_payout_settlement
