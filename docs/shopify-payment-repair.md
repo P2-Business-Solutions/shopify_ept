@@ -165,6 +165,51 @@ If the app's canceled-order wizard already recorded identified payments, compati
 payments can be reused; differing journals, accounts, dates without an exact ID, or
 allocations outside the cancellation require review.
 
+## Fully refunded archived orders without Shopify cancellation
+
+Version **18.0.3.51** also handles an archived, fully refunded order whose items were
+removed, even when Shopify has no cancellation timestamp or reason. It requires a
+dated `closed_at`, financial status `refunded`, an explicit empty fulfillment history,
+zero current order value in the payment currency, and zero current quantity for every
+original item. Complete transaction history must prove that every successful collection
+was fully refunded to its original parent transaction and gateway.
+
+Use **Import/Update Specific Order(s)** for a missing order or to reprocess an existing
+one. Archived orders are not returned by the separate **Import Cancel Orders** filter.
+The import keeps the original removed lines and bypasses confirmation, invoicing,
+delivery and manufacturing workflows. After proving the current source, it cancels
+only Odoo's unfulfilled sales demand when no active invoice exists; it leaves Shopify's
+cancellation flag unchanged. Payment recording uses the same store/gateway opt-ins
+as cancelled imports. Failure retains the queue payload for review and retry.
+
+For an existing cancelled Odoo order, use the payout directly:
+
+1. Open **Bulk Repair Transactions** and **Preview / Refresh** after upgrading, so
+   older separate receipt/refund diagnoses regroup into one order case. **Clear Selection**,
+   then **Refresh Case** for the affected order to select only that reviewed case.
+2. Open **Details**. Verify the archived-refund explanation, original capture/refund
+   IDs, amounts, dates, customer, currency and payment journals.
+3. Apply only the reviewed ready case with **Reconcile Payout Statements in This Run**
+   enabled. **Review Payments** also offers a separate preview/apply route.
+4. Verify **Applied / Matched**, both original cash movements, zero customer and
+   outstanding balances, and no new invoice or credit note. Continue other payout
+   exceptions before settlement and bank matching.
+
+The cash-only route requires one active source customer mapping, a cancelled Odoo
+order, no active invoice/credit note and no active or completed stock movements.
+Existing invoices continue through normal invoice/refund validation. Missing archive,
+quantity, currency or fulfillment proof, partial refunds, protected periods, ambiguous
+payments and allocations outside the order's receipt/refund group remain blocked.
+Payout repair leaves pre-cutover cash for opening-balance review rather than recording
+another pair of customer payments.
+Apply rereads the source and accounting and rejects a changed preview. Repeating the
+repair reuses the exact payments and retains their payout matches.
+
+For example, a **735 receipt dated August 6** and a **735 refund dated August 7**
+clear each other's receivables and match their two August 10 payout lines. No revenue
+documents or external refund are created. Capture the illustrated team guide only
+after the module upgrade and a verified live resolution.
+
 ## Repair existing orders
 
 An accounting manager can open **Preview / Repair Shopify Payments** on an order or

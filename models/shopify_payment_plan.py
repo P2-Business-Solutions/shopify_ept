@@ -114,6 +114,32 @@ def prove_cancelled_cash(payload, events, compare):
         raise PaymentPlanError('A cancelled order without an invoice must be fully refunded before cash can be synchronized.')
 
 
+def prove_archived_refund_cash(payload, events):
+    """Prove a removed, archived sale was fully reversed without fulfillment."""
+    try:
+        archived = datetime.fromisoformat(payload['closed_at'].replace('Z', '+00:00'))
+        if archived.tzinfo is None:
+            raise ValueError()
+    except (KeyError, AttributeError, TypeError, ValueError):
+        raise PaymentPlanError('Shopify must provide a dated archive status for this fully refunded order.') from None
+    if (payload.get('fulfillments') != []
+            or payload.get('fulfillment_status') not in (None, '', 'unfulfilled')):
+        raise PaymentPlanError('An archived refund requires explicit evidence of no fulfillment history.')
+    gross = sum(money(row['amount']) for row in events if row['kind'] != 'refund')
+    refunded = sum(money(row['amount']) for row in events if row['kind'] == 'refund')
+    if payload.get('financial_status') != 'refunded' or gross <= 0 or gross != refunded:
+        raise PaymentPlanError('The complete successful cash history must prove a full refund of every collection.')
+    currency = events[0]['currency']
+    current = component_money(payload, 'current_total_price', currency, payload.get('currency'))
+    if current != 0:
+        raise PaymentPlanError('The archived order must have zero current Shopify value before cash-only repair.')
+    items = payload.get('line_items')
+    if not isinstance(items, list) or not items or any(
+            not isinstance(row, dict) or not row.get('id') or money(row.get('quantity')) <= 0
+            or money(row.get('current_quantity')) != 0 for row in items):
+        raise PaymentPlanError('Every original item must have a proven zero current quantity before cash-only repair.')
+
+
 def prove_prepayment_cash(payload, events, order_total, compare):
     """Prove a fully paid, unshipped sale before leaving customer credit open."""
     if payload.get('cancelled_at') or payload.get('cancel_reason'):

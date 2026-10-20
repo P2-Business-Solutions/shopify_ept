@@ -21,6 +21,19 @@ def is_cancelled_shopify_order(order):
     return bool((order or {}).get("cancelled_at") or (order or {}).get("cancel_reason"))
 
 
+def is_archived_refunded_shopify_order(order):
+    """Identify cash-only candidates; the planner must prove cash and removed items."""
+    order = order or {}
+    return bool(order.get('closed_at') and order.get('financial_status') == 'refunded'
+                and order.get('fulfillments') == []
+                and order.get('fulfillment_status') in (None, '', 'unfulfilled'))
+
+
+def is_cash_only_shopify_order(order):
+    """Keep cancelled/archived refund imports out of the fulfillment workflow."""
+    return is_cancelled_shopify_order(order) or is_archived_refunded_shopify_order(order)
+
+
 def filter_importable_order_lines(lines, include_removed=False):
     """Exclude line items that remain in Shopify payloads after removal."""
     return [

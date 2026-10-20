@@ -27,7 +27,7 @@ from .shopify_fulfillment_utils import (
 )
 from .shopify_order_utils import (
     filter_importable_order_lines,
-    is_cancelled_shopify_order,
+    is_cash_only_shopify_order,
     find_matching_shopify_tag,
     get_shopify_discount_allocations_by_line_id,
     get_shopify_discount_applications,
@@ -369,7 +369,7 @@ class SaleOrder(models.Model):
         sale_order_line_obj = self.env["sale.order.line"]
         total_discount = order_response.get("total_discounts", 0.0)
         order_number = order_response.get("order_number")
-        for line in filter_importable_order_lines(lines, include_removed=is_cancelled_shopify_order(order_response)):
+        for line in filter_importable_order_lines(lines, include_removed=is_cash_only_shopify_order(order_response)):
             is_custom_line, is_gift_card_line, product = self.search_custom_tip_gift_card_product(line, instance)
             price = line.get("price")
             if instance.order_visible_currency:
@@ -725,7 +725,7 @@ class SaleOrder(models.Model):
             sale_order = self.search_existing_shopify_order(order_response, instance, order_number)
 
             if sale_order:
-                if is_cancelled_shopify_order(order_response):
+                if is_cash_only_shopify_order(order_response):
                     sale_order._process_shopify_cancelled_import(order_response, order_data_line)
                     continue
                 if pos_order and order_response.get("fulfillment_status") in ("fulfilled", "partial"):
@@ -753,9 +753,9 @@ class SaleOrder(models.Model):
                 continue
 
             lines = filter_importable_order_lines(
-                order_response.get("line_items"), include_removed=is_cancelled_shopify_order(order_response))
+                order_response.get("line_items"), include_removed=is_cash_only_shopify_order(order_response))
             if self.check_mismatch_details(lines, instance, order_number, order_data_line,
-                                           include_removed=is_cancelled_shopify_order(order_response)):
+                                           include_removed=is_cash_only_shopify_order(order_response)):
                 _logger.info("Mismatch details found in this Shopify Order(%s) and id (%s)", order_number,
                              order_response.get("id"))
                 order_data_line.write({"state": "failed", "processed_at": datetime.now()})
@@ -774,7 +774,7 @@ class SaleOrder(models.Model):
                                                                shopify_order_data_queue_line_id=order_data_line.id if order_data_line else False)
                 continue
             order_ids.append(sale_order.id)
-            if is_cancelled_shopify_order(order_response):
+            if is_cash_only_shopify_order(order_response):
                 sale_order._process_shopify_cancelled_import(order_response, order_data_line)
                 continue
             if sale_order._shopify_record_external_order_error(order_data_line):
@@ -1130,7 +1130,7 @@ class SaleOrder(models.Model):
                                  f"multipel payment. Payment might be pending or fully refunded.")
                 order_vals.update({'shopify_payment_ids': payment_vals, 'is_shopify_multi_payment': True})
         order_model = self
-        if is_cancelled_shopify_order(order_response):
+        if is_cash_only_shopify_order(order_response):
             order_model = self.with_context(tracking_disable=True, mail_create_nosubscribe=True,
                                            shopify_silent_cancelled_import=True)
         order = order_model.create(order_vals)
@@ -1147,7 +1147,7 @@ class SaleOrder(models.Model):
             order.create_shopify_Delivery_Fee_lines(order_response, instance)
             _logger.info("Created Delivery Fee for order (%s).", order.name)
 
-        if not is_cancelled_shopify_order(order_response):
+        if not is_cash_only_shopify_order(order_response):
             order._shopify_apply_external_order_adjustments(instance, order_response)
         order.create_shopify_tax_line(order_response, instance)
 
@@ -2848,7 +2848,7 @@ class SaleOrder(models.Model):
                                       f"the New Records such as product or product category.") % (
                                       self.env.ref('base.public_user').name, odoo_bot.name)
                         _logger.info(message)
-                        post = order._message_log if is_cancelled_shopify_order(order_data) else order.message_post
+                        post = order._message_log if is_cash_only_shopify_order(order_data) else order.message_post
                         post(body=message)
                         for env in self.env.transaction.envs:
                             if env.uid == self.env.user.id:
@@ -2860,7 +2860,7 @@ class SaleOrder(models.Model):
                 return True
             try:
                 need_to_done_queue = True
-                if is_cancelled_shopify_order(order_data):
+                if is_cash_only_shopify_order(order_data):
                     order._sync_shopify_discount_data(order_data)
                     order._process_shopify_cancelled_import(order_data, queue_line)
                     continue

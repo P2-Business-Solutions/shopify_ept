@@ -9,7 +9,7 @@ from odoo.exceptions import UserError
 
 from .. import shopify
 from ..shopify.pyactiveresource.connection import ClientError
-from .shopify_order_utils import is_cancelled_shopify_order
+from .shopify_order_utils import is_cash_only_shopify_order
 
 
 class ShopifyPaymentGateway(models.Model):
@@ -95,9 +95,9 @@ class ShopifyPaymentGateway(models.Model):
              ('financial_status', '=', order_response.get('financial_status')),
              ('shopify_order_payment_status.status', '=', order_status)
              ])
-        if (not workflow_config and is_cancelled_shopify_order(order_response)
+        if (not workflow_config and is_cash_only_shopify_order(order_response)
                 and order_response.get('financial_status') in ('refunded', 'partially_refunded')):
-            # A cancellation only needs the original gateway's payment setup.
+            # Cash-only refunds need the original gateway's payment setup.
             workflow_config = self.env['sale.auto.workflow.configuration.ept'].search([
                 ('shopify_instance_id', '=', instance.id),
                 ('payment_gateway_id', '=', shopify_payment_gateway.id),

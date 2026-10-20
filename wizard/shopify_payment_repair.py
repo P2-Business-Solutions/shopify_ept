@@ -61,6 +61,7 @@ class ShopifyPaymentRepair(models.TransientModel):
             treatment = {'gross': 'Original invoice', 'net': 'Refunds already included in invoice',
                          'prepayment': 'Customer prepayment before shipment; leave customer credit open for the shipment invoice',
                          'cancelled_cash': 'Fully refunded cancellation before fulfillment; receipt and refund only',
+                         'archived_refund_cash': 'Fully refunded archived order with all items removed; receipt and refund only',
                          'net_with_credits': 'Previously audited net invoice; later refunds recorded separately'}[plan['mode']]
             sections.append(Markup('<p>Invoice treatment: %s. Replace legacy payments: %s. Create credit notes: %s.</p>')
                             % (escape(treatment), escape(', '.join(map(str, plan['replace_ids'])) or 'None'),
