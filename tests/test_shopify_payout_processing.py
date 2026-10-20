@@ -65,7 +65,7 @@ class TestShopifyPayoutProcessing(unittest.TestCase):
 
     def _transaction(self, identifier):
         return SimpleNamespace(id=11, transaction_id=identifier, transaction_type='refund',
-                               order_id=SimpleNamespace(name='SO123'), source_order_id='123',
+                               order_id=SimpleNamespace(name='SO123', state='sale', invoice_ids=Records()), source_order_id='123',
                                shop_cash_kind=False, _historical_collection_entry=Mock(return_value=False),
                                _refund_credit_reference=Mock(return_value=False))
 

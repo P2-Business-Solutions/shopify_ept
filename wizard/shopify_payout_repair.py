@@ -6,7 +6,9 @@ from markupsafe import Markup, escape
 from odoo import api, Command, fields, models, _
 from odoo.exceptions import UserError
 from psycopg2 import OperationalError
-from ..models.shopify_payment_plan import fingerprint
+from ..models.shopify_payment_plan import cash_events, fingerprint
+from ..models.shopify_order_utils import is_cash_only_shopify_order
+from ..models.shopify_refund_plan import source_date
 from ..models.shopify_repair_evidence import source_review
 
 
@@ -208,6 +210,9 @@ class ShopifyPayoutRepair(models.Model):
             raise UserError(_('Import or correct the order before repairing its current-period accounting.'))
         order.check_access('write')
         plan = order._build_shopify_cash_plan(repair=True, source=source)
+        if (plan['mode'] == 'archived_refund_cash' and any(
+                source_date(event['timestamp'], self.timezone) < self.cutover_date for event in plan['events'])):
+            raise UserError(_('This archived order has cash before cutover. Review its opening-balance treatment before recording customer payments.'))
         return dict(kind='order', order_id=order.id, cash=plan)
 
     def action_preview(self):
@@ -217,7 +222,7 @@ class ShopifyPayoutRepair(models.Model):
         self._check_manager()
         self.env.cr.execute('SELECT id FROM shopify_payout_repair_ept WHERE id = %s FOR UPDATE', [self.id])
         self.invalidate_recordset()
-        groups, exceptions = {}, []
+        groups, exceptions, cash_only_sources = {}, [], {}
         transactions = (case.transaction_ids if case else self.payout_ids.payout_transaction_ids).filtered(
             lambda row: row.transaction_type in ('charge', 'refund', 'payment_refund') or row.shop_cash_kind)
         refreshed = self.env['shopify.payout.report.line.ept']
@@ -232,6 +237,19 @@ class ShopifyPayoutRepair(models.Model):
             try:
                 orders = (transaction.payout_id._shop_cash_orders_for_preview(transaction)
                           if transaction.shop_cash_kind else transaction._repair_order())
+                cash_only_order = False
+                if (orders and not transaction.shop_cash_kind and orders.state == 'cancel'
+                        and not orders.invoice_ids.filtered(lambda move: move.state != 'cancel')):
+                    if orders.id not in cash_only_sources:
+                        cash_only_sources[orders.id] = orders._shopify_cash_source()
+                    payload, source_transactions = cash_only_sources[orders.id]
+                    if is_cash_only_shopify_order(payload):
+                        try:
+                            source_events = cash_events(source_transactions, orders.shopify_order_id, orders.currency_id.name)
+                            cash_only_order = all(source_date(row['timestamp'], self.timezone) >= self.cutover_date
+                                                  for row in source_events)
+                        except ValueError as error:
+                            raise UserError(str(error)) from error
                 return_plan = transaction._refund_return_plan(self, evidence=evidence)
                 if return_plan:
                     key = ('return_refund', transaction.payout_id.instance_id.id, return_plan['refund_id'])
@@ -246,7 +264,7 @@ class ShopifyPayoutRepair(models.Model):
                         if key not in groups:
                             groups[key] = [self.env['shopify.payout.report.line.ept'], order, False, {}]
                         groups[key][0] |= transaction
-                elif orders and orders.invoice_ids.filtered(lambda move: move.state != 'cancel'):
+                elif orders and (cash_only_order or orders.invoice_ids.filtered(lambda move: move.state != 'cancel')):
                     key = ('order', orders.id)
                     if key not in groups:
                         groups[key] = [self.env['shopify.payout.report.line.ept'], orders, False, {}]
@@ -351,6 +369,9 @@ class ShopifyPayoutRepair(models.Model):
         if cash['mode'] == 'prepayment':
             return _('%(count)s captured payment(s): record customer credit now for the payout and apply the same payment(s) when the shipment invoice posts.',
                      count=len(cash['events']))
+        if cash['mode'] == 'archived_refund_cash':
+            return _('Fully refunded archived order: record/reuse %(count)s original cash movements and match their payouts. '
+                     'Customer balance clears; no invoice or credit note is created.', count=len(cash['events']))
         return _('%(mode)s: %(count)s cash transactions; %(replace)s net payment(s) to reverse; %(credits)s credit(s) to create. The invoice total is retained.',
                  mode=cash['mode'], count=len(cash['events']), replace=len(cash['replace_ids']), credits=len(cash['credits']))
 
@@ -571,8 +592,8 @@ class ShopifyPayoutRepairLine(models.Model):
                 sections.append(table([_('Shopify transaction'), _('Type'), _('Processor'), _('Source time'), _('Amount')],
                     [[row[key] for key in ('id', 'kind', 'gateway', 'timestamp', 'amount')] for row in evidence['events']]))
             sections.append(Markup('<p>Historical fulfillment: %s</p>') % escape(evidence.get('fulfillment_result', '')))
-            sections.append(Markup('<p>Shopify payment status: %s. Fulfillment status: %s. Cancelled at: %s.</p>') %
-                tuple(escape(evidence.get(key) or '—') for key in ('financial_status', 'fulfillment_status', 'cancelled_at')))
+            sections.append(Markup('<p>Shopify payment status: %s. Fulfillment status: %s. Cancelled at: %s. Archived at: %s.</p>') %
+                tuple(escape(evidence.get(key) or '—') for key in ('financial_status', 'fulfillment_status', 'cancelled_at', 'archived_at')))
             if evidence.get('fulfillment'):
                 sections.append(table([_('Fulfillment'), _('Status'), _('Source time'), _('Before cutover'), _('Issue')],
                     [[row.get(key, '') for key in ('id', 'status', 'timestamp', 'before_cutover', 'issue')]
@@ -837,6 +858,10 @@ class ShopifyPayoutRepairLine(models.Model):
                     sections.append(Markup('<p>Record customer prepayment for payout reconciliation. Leave customer credit open '
                                            'until the shipment invoice posts, then apply the same payment. '
                                            'No invoice is created; the payment date and payout match are retained.</p>'))
+                if cash.get('mode') == 'archived_refund_cash':
+                    sections.append(Markup('<p>Fully refunded archived order with zero current value, all items removed and no fulfillment. '
+                                           'Record/reuse the original receipt and refund separately, clear their customer balance, '
+                                           'and match each exact payout line. No invoice, credit note or Shopify cancellation is created.</p>'))
                 documents = self.env['account.move'].browse(cash.get('document_ids', []))
                 for document in documents:
                     sections.append(Markup('<p>Keep %s: %s %s.</p>') %

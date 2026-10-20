@@ -149,6 +149,34 @@ class TestShopifyPaymentPlan(unittest.TestCase):
         events = plan.cash_events([self.raw[0], transaction('full', 'refund', '242.10', parent_id='charge')], 'order', 'USD')
         self.assertEqual(plan.invoice_mode(events, 242.10, 242.10, compare), 'gross')
 
+    def test_archived_removed_order_proves_full_cash_reversal_without_cancellation(self):
+        events = plan.cash_events([self.raw[0], transaction('full', 'refund', '242.10', parent_id='charge')], 'order', 'USD')
+        payload = dict(closed_at='2026-08-07T13:07:25-04:00', financial_status='refunded',
+                       currency='USD', current_total_price='0.00', fulfillments=[], fulfillment_status=None,
+                       line_items=[dict(id='removed', quantity=1, current_quantity=0)])
+        plan.prove_archived_refund_cash(payload, events)
+        self.assertNotIn('cancelled_at', payload)
+
+    def test_archived_cash_requires_archive_removed_items_zero_value_and_full_refund(self):
+        events = plan.cash_events([self.raw[0], transaction('full', 'refund', '242.10', parent_id='charge')], 'order', 'USD')
+        valid = dict(closed_at='2026-08-07T13:07:25-04:00', financial_status='refunded',
+                     currency='USD', current_total_price='0.00', fulfillments=[],
+                     line_items=[dict(id='removed', quantity=1, current_quantity=0)])
+        for changes in ({'closed_at': None}, {'closed_at': True}, {'closed_at': 'not-a-date'},
+                        {'closed_at': '2026-08-07T13:07:25'}, {'financial_status': 'partially_refunded'},
+                        {'fulfillments': None}, {'fulfillments': [{'id': 'shipment'}]},
+                        {'fulfillment_status': 'fulfilled'}, {'current_total_price': '0.01'}, {'current_total_price': '0.001'},
+                        {'current_total_price': None}, {'line_items': []},
+                        {'line_items': [dict(id='retained', quantity=1, current_quantity=1)]},
+                        {'line_items': [dict(id='unknown', quantity=1)]},
+                        {'line_items': [dict(id='invalid', quantity=1, current_quantity=-1)]}):
+            with self.subTest(changes=changes), self.assertRaises(plan.PaymentPlanError):
+                plan.prove_archived_refund_cash(dict(valid, **changes), events)
+        with self.assertRaises(plan.PaymentPlanError):
+            plan.prove_archived_refund_cash(valid, self.events)
+        with self.assertRaises(plan.PaymentPlanError):
+            plan.prove_archived_refund_cash(dict(valid, currency='EUR'), events)
+
     def test_audited_net_invoice_allows_only_new_refund_credit(self):
         events = self.events + plan.cash_events([
             self.raw[0], transaction('later', 'refund', '25', parent_id='charge')], 'order', 'USD')[1:]

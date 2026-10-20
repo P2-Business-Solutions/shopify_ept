@@ -25,6 +25,17 @@ class TestShopifyOrderUtils(unittest.TestCase):
         self.assertEqual(UTILS.filter_importable_order_lines(lines, include_removed=True), lines)
         self.assertEqual(lines[0]['current_quantity'], 0)
 
+    def test_archived_refunded_candidate_does_not_forge_cancellation(self):
+        payload = dict(closed_at='2026-08-07T13:07:25-04:00', financial_status='refunded',
+                       fulfillments=[], fulfillment_status=None, cancelled_at=None, cancel_reason=None)
+        self.assertTrue(UTILS.is_cash_only_shopify_order(payload))
+        self.assertFalse(UTILS.is_cancelled_shopify_order(payload))
+        for changes in ({'closed_at': None}, {'financial_status': 'partially_refunded'},
+                        {'fulfillments': None}, {'fulfillments': [{'id': 'shipment'}]},
+                        {'fulfillment_status': 'fulfilled'}):
+            with self.subTest(changes=changes):
+                self.assertFalse(UTILS.is_cash_only_shopify_order(dict(payload, **changes)))
+
     def test_removed_order_lines_are_excluded(self):
         lines = [
             {"id": 101, "quantity": 2, "current_quantity": 2},

@@ -583,6 +583,11 @@ class ShopifyPaymentReportEpt(models.Model):
                         invoices = self.env['account.move']
                     invoice = invoices.filtered(lambda move: move.state == 'posted')[:1]
                 else:
+                    if (transaction.transaction_type in ('charge', 'refund', 'payment_refund')
+                            and transaction.order_id.state == 'cancel'
+                            and not transaction.order_id.invoice_ids.filtered(lambda move: move.state != 'cancel')):
+                        raise UserError(_('This cancelled Odoo order has no active invoice or credit note. '
+                                          'Use Bulk Repair Transactions to verify its source and record the original receipt/refund cash.'))
                     reviewed = self.env.context.get('shopify_bulk_repaired_line_ids')
                     if reviewed is not None and transaction.transaction_type in ('charge', 'refund', 'payment_refund'):
                         domain = []

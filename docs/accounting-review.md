@@ -277,3 +277,27 @@ ledger behavior; they do not validate the live Shopify API, Enterprise widget, o
 every production customization. Complete this staging check before production rollout.
 
 See [configuration and repair instructions](shopify-payment-repair.md).
+
+## Archived full refunds, version 18.0.3.51
+
+The isolated Odoo 18/PostgreSQL 16 run completed **349 connector tests with zero
+failures and zero errors**. Three Enterprise bank-widget checks were skipped; the
+remaining 346 passed. Manufacturing and Payment Payout Reconciliation were installed.
+The standalone run passed **161 tests** and skipped 493 Odoo-dependent tests, which
+were exercised through the database suite where selected by Odoo. Python compilation
+and `git diff --check` also passed.
+
+The archived-order tests verify separate original 735 receipt/refund payments, their
+source dates and transaction IDs, closed customer receivables, and reuse on retry.
+A payout containing both movements and its processing fee matches both cash lines
+without an invoice or credit note. Existing separate diagnoses regroup into one order
+case while the superseded case history remains archived. Tests also cover original
+removed order lines, paid-workflow fallback, no deliveries/manufacturing/notifications,
+customer mapping, active stock, changed source after preview, outside receivable
+allocations, invalid full-refund evidence, retryable import failure, and pre-cutover
+opening-balance review.
+
+The source is a controlled fixture, not a live merchant API call. The owner must
+upgrade the deployed connector to 18.0.3.51 before live closeout. Verify both exact
+payout matches and zero customer/outstanding residuals in Enterprise, then capture
+the actual resolution in Tango with screenshots at every retained step.

@@ -92,6 +92,218 @@ class TestShopifyCashSync(PayoutTestCase):
             self.assertEqual(payments.move_id, original_moves)
             self.assertEqual(len(order.shopify_payment_audit_ids), 1)
 
+    def _archived_refund_fixture(self):
+        """An archived, removed, fully refunded sale without cancellation."""
+        order, payload, events, queue_line = self._cancelled_fixture()
+        order.write({'state': 'cancel', 'canceled_in_shopify': False})
+        order.order_line.filtered(lambda line: line.shopify_line_id == 'retained').price_unit = 690
+        for event in events:
+            event['amount'] = '735.00'
+        payload.update(cancelled_at=None, cancel_reason=None, closed_at=events[1]['processed_at'],
+                       currency=order.currency_id.name, current_total_price='0.00',
+                       customer={'id': 'archived-customer'},
+                       line_items=[dict(id=line.shopify_line_id, quantity=1, current_quantity=0,
+                                        price=line.price_unit, name=line.name)
+                                   for line in order.order_line])
+        self.env['shopify.res.partner.ept'].create({
+            'shopify_instance_id': self.instance.id, 'shopify_customer_id': 'archived-customer',
+            'partner_id': self.partner.id})
+        queue_line.order_data = json.dumps(dict(payload, transaction=events))
+        return order, payload, events, queue_line
+
+    def test_archived_refund_preview_records_cash_and_preserves_source_status(self):
+        order, payload, events, _queue_line = self._archived_refund_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            preview = self.env['shopify.payment.repair.ept'].create({'order_ids': [Command.set(order.ids)]})
+            preview.action_preview()
+            self.assertEqual(preview.state, 'preview', preview.preview_html)
+            self.assertEqual(preview.plan_json[0]['mode'], 'archived_refund_cash')
+            preview.action_apply()
+            payments = self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)])
+            self.assertEqual(payments.mapped('amount'), [735, 735])
+            self.assertEqual(set(payments.mapped('shopify_order_transaction_id')), {'charge', 'refund'})
+            self.assertEqual(set(payments.mapped('date')), {fields.Date.to_date(row['processed_at'][:10]) for row in events})
+            self.assertTrue(all(pay._seek_for_lines()[1].reconciled for pay in payments))
+            self.assertFalse(any(pay._seek_for_lines()[0].reconciled for pay in payments))
+            self.assertFalse(order.invoice_ids)
+            self.assertFalse(order.picking_ids)
+            self.assertFalse(order.canceled_in_shopify)
+            moves = payments.move_id
+            self.assertEqual(order._sync_shopify_cash(), payments)
+            self.assertEqual(payments.move_id, moves)
+            self.assertEqual(len(order.shopify_payment_audit_ids), 1)
+
+    def test_archived_refund_workspace_matches_both_cash_lines(self):
+        try:
+            from .test_shopify_historical_collection import TestShopifyHistoricalCollection as MatchFixtures
+        except ImportError:
+            from test_shopify_historical_collection import TestShopifyHistoricalCollection as MatchFixtures
+        order, payload, events, _queue_line = self._archived_refund_fixture()
+        payout = self._payout('archived-refund')
+        payout.amount = -3
+        payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'charge').write({
+            'order_id': order.id, 'source_order_id': order.shopify_order_id,
+            'source_order_transaction_id': 'charge', 'amount': 735})
+        self.env['shopify.payout.report.line.ept'].create({
+            'payout_id': payout.id, 'transaction_id': 'archived-refund-cash', 'order_id': order.id,
+            'source_order_id': order.shopify_order_id, 'source_order_transaction_id': 'refund',
+            'transaction_type': 'refund', 'amount': -735, 'is_remaining_statement': True})
+        with patch.object(type(payout), 'check_for_invoice_refund', wraps=payout.check_for_invoice_refund) as legacy:
+            payout.generate_bank_statement()
+            self.assertTrue(all(call.args[0].transaction_type == 'fees' for call in legacy.call_args_list))
+        workspace = self.env['shopify.payout.repair.ept'].browse(payout.action_bulk_repair_transactions()['res_id'])
+        old_cases = self.env['shopify.payout.repair.line.ept'].create([
+            {'wizard_id': workspace.id, 'transaction_ids': [Command.set(row.ids)],
+             'order_id': order.id, 'kind': 'review', 'status': 'review', 'detail': 'Pre-upgrade diagnosis'}
+            for row in payout.payout_transaction_ids.filtered(lambda row: row.transaction_type in ('charge', 'refund'))])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            workspace.action_preview()
+            case = workspace.line_ids
+            self.assertFalse(any(old_cases.mapped('active')))
+            self.assertEqual(case.status, 'ready', case.detail)
+            self.assertIn('Fully refunded archived order', case.detail)
+            self.assertEqual(len(case.transaction_ids), 2)
+            with MatchFixtures._matcher(self, payout):
+                workspace.action_apply()
+            self.assertEqual(case.reconciliation_status, 'matched', workspace.result)
+            payments = case.payment_ids
+            self.assertEqual(len(payments), 2)
+            self.assertTrue(all(pay._seek_for_lines()[0].reconciled for pay in payments))
+            self.assertTrue(all(pay._seek_for_lines()[1].reconciled for pay in payments))
+            self.assertTrue(all(payout.payout_statement_line_ids.mapped('is_reconciled')))
+            self.assertFalse(order.invoice_ids)
+            self.assertFalse(order.canceled_in_shopify)
+            count = self.env['account.move'].search_count([])
+            order._sync_shopify_cash()
+            self.assertEqual(self.env['account.move'].search_count([]), count)
+
+    def test_archived_refund_with_cash_before_cutover_is_not_recorded_by_workspace(self):
+        order, payload, events, _queue_line = self._archived_refund_fixture()
+        for event in events:
+            event['processed_at'] = '2026-07-31T10:00:00-04:00'
+        payout = self._payout('archived-migration')
+        payout.payout_transaction_ids.filtered(lambda row: row.transaction_type == 'charge').write({
+            'order_id': order.id, 'source_order_id': order.shopify_order_id,
+            'source_order_transaction_id': 'charge', 'amount': 735})
+        workspace = self.env['shopify.payout.repair.ept'].browse(payout.action_bulk_repair_transactions()['res_id'])
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            workspace.action_preview()
+            self.assertEqual(workspace.line_ids.status, 'review')
+            self.assertIn('opening-balance', workspace.line_ids.detail)
+        self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+
+    def test_archived_refund_requires_exact_customer_and_no_active_stock(self):
+        order, payload, events, _queue_line = self._archived_refund_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            payload['customer'] = {'id': 'unknown'}
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(repair=True)
+            payload['customer'] = {'id': 'archived-customer'}
+            warehouse = self.instance.shopify_warehouse_id
+            self.env['stock.picking'].create({
+                'picking_type_id': warehouse.out_type_id.id, 'sale_id': order.id,
+                'location_id': warehouse.lot_stock_id.id,
+                'location_dest_id': self.partner.property_stock_customer.id})
+            with self.assertRaises(UserError):
+                order._sync_shopify_cash()
+        self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+
+    def test_archived_refund_source_change_after_preview_does_not_post(self):
+        order, payload, events, _queue_line = self._archived_refund_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            preview = self.env['shopify.payment.repair.ept'].create({'order_ids': [Command.set(order.ids)]})
+            preview.action_preview()
+            payload['line_items'][0]['current_quantity'] = 1
+            with self.assertRaises(UserError):
+                preview.action_apply()
+        self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+        self.assertFalse(order.shopify_payment_audit_ids)
+
+    def test_archived_refund_existing_order_import_bypasses_fulfillment_and_retries(self):
+        order, payload, events, queue_line = self._archived_refund_fixture()
+        order.state = 'draft'
+        self.instance.import_order_after_date = fields.Date.to_date('2020-01-01')
+        notification_count = self.env['mail.notification'].search_count([])
+        with patch.object(type(self.instance), 'connect_in_shopify'), \
+                patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)), \
+                patch.object(type(order), 'search_existing_shopify_order', return_value=order), \
+                patch.object(type(order), 'apply_shopify_location_and_warehouse', side_effect=AssertionError('Unexpected fulfillment workflow')):
+            self.env['sale.order'].import_shopify_orders(queue_line, self.instance)
+            self.assertEqual(queue_line.state, 'done')
+            self.assertEqual(order.state, 'cancel')
+            self.assertFalse(order.canceled_in_shopify)
+            queue_line.write({'state': 'draft', 'order_data': json.dumps(dict(payload, transaction=events))})
+            self.env['sale.order'].import_shopify_orders(queue_line, self.instance)
+            self.assertEqual(queue_line.state, 'done')
+            self.assertEqual(len(order.shopify_payment_audit_ids), 1)
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
+        self.assertEqual(self.env['mail.notification'].search_count([]), notification_count)
+
+    def test_archived_refund_invalid_source_keeps_import_retryable_without_payments(self):
+        order, payload, events, queue_line = self._archived_refund_fixture()
+        order.state = 'draft'
+        events[1]['amount'] = '734.00'
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertFalse(order._process_shopify_cancelled_import(payload, queue_line))
+            self.assertEqual(queue_line.state, 'failed')
+            self.assertTrue(queue_line.order_data)
+            self.assertEqual(order.state, 'draft')
+            self.assertFalse(self.env['account.payment'].search([('shopify_cash_order_id', '=', order.id)]))
+            events[1]['amount'] = '735.00'
+            self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+            self.assertEqual(queue_line.state, 'done')
+
+    def test_archived_refund_new_order_keeps_original_lines_without_fulfillment(self):
+        _existing, payload, events, queue_line = self._archived_refund_fixture()
+        self.workflow.picking_policy = 'direct'
+        self.env['sale.auto.workflow.configuration.ept'].create({
+            'shopify_instance_id': self.instance.id, 'payment_gateway_id': self.gateway.id,
+            'financial_status': 'paid', 'shopify_order_payment_status': self.env.ref('shopify_ept.unshipped').id,
+            'auto_workflow_id': self.workflow.id})
+        self.product.default_code = 'ARCHIVED-TEST'
+        if 'mrp.production' in self.env:
+            self.product.write({'type': 'consu', 'is_storable': True})
+            routes = self.env.ref('mrp.route_warehouse0_manufacture') | self.env.ref('stock.route_warehouse0_mto')
+            routes.active = True
+            self.product.route_ids = routes
+            self.env['mrp.bom'].create({'product_tmpl_id': self.product.product_tmpl_id.id, 'product_qty': 1})
+        payload.update(source_name='web', tags='', payment_gateway_names=['shopify_payments'],
+                       transaction=events, total_discounts=0,
+                       line_items=[dict(id='original', sku='ARCHIVED-TEST', quantity=1, current_quantity=0,
+                                        price=735, requires_shipping=False, name='Removed archived item')])
+        mail_count = self.env['mail.mail'].search_count([])
+        notification_count = self.env['mail.notification'].search_count([])
+        mo_count = self.env['mrp.production'].search_count([]) if 'mrp.production' in self.env else 0
+        order = self.env['sale.order'].shopify_create_order(
+            self.instance, self.partner, self.partner, self.partner, queue_line, payload, payload['line_items'], 123)
+        self.assertEqual(order.order_line.shopify_line_id, 'original')
+        self.assertEqual(order.order_line.product_uom_qty, 1)
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            self.assertTrue(order._process_shopify_cancelled_import(payload, queue_line))
+        self.assertEqual(order.state, 'cancel')
+        self.assertFalse(order.canceled_in_shopify)
+        self.assertFalse(order.message_follower_ids)
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
+        self.assertEqual(self.env['mail.mail'].search_count([]), mail_count)
+        self.assertEqual(self.env['mail.notification'].search_count([]), notification_count)
+        if 'mrp.production' in self.env:
+            self.assertEqual(self.env['mrp.production'].search_count([]), mo_count)
+
+    def test_archived_refund_cash_refuses_outside_receivable_allocation(self):
+        order, payload, events, _queue_line = self._archived_refund_fixture()
+        with patch.object(type(order), '_shopify_cash_source', return_value=(payload, events)):
+            payments = order._sync_shopify_cash()
+            payments.move_id.line_ids.filtered(lambda line: line.account_type == 'asset_receivable').remove_move_reconcile()
+            _other, invoice, _source, _events = self._fixture(gross=True)
+            receipt = payments.filtered(lambda pay: pay.payment_type == 'inbound')
+            (receipt._seek_for_lines()[1] | invoice.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')).reconcile()
+            with self.assertRaises(UserError):
+                order._build_shopify_cash_plan(repair=True)
+
     def test_cancelled_queue_import_bypasses_auto_workflow_and_retries_existing_order(self):
         order, payload, events, queue_line = self._cancelled_fixture()
         self.instance.import_order_after_date = fields.Date.to_date('2020-01-01')

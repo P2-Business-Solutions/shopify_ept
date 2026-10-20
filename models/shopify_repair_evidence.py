@@ -15,7 +15,8 @@ def source_review(payload, transactions, order_id, currency, cutover, timezone):
         return result
     result.update(financial_status=payload.get('financial_status') or '',
                   fulfillment_status=payload.get('fulfillment_status') or '',
-                  cancelled_at=payload.get('cancelled_at') or '')
+                  cancelled_at=payload.get('cancelled_at') or '',
+                  archived_at=payload.get('closed_at') or '')
     try:
         events = cash_events(transactions, order_id, currency)
         gross = sum((money(row['amount']) for row in events if row['kind'] != 'refund'), Decimal(0))

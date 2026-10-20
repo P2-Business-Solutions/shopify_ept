@@ -7,7 +7,7 @@ from odoo import models, fields
 from .. import shopify
 from ..shopify.pyactiveresource.connection import ClientError
 from dateutil.relativedelta import relativedelta
-from .shopify_order_utils import is_cancelled_shopify_order
+from .shopify_order_utils import is_cash_only_shopify_order
 
 _logger = logging.getLogger("Shopify Order Queue Line")
 
@@ -47,7 +47,7 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
             source = json.loads(self.order_data or '{}')
         except (TypeError, ValueError):
             return False
-        return isinstance(source, dict) and is_cancelled_shopify_order(source)
+        return isinstance(source, dict) and is_cash_only_shopify_order(source)
 
     def create_order_queue_line(
             self, order_dict, instance, order_data, customer_name, customer_email,
@@ -137,7 +137,7 @@ class ShopifyOrderDataQueueLineEpt(models.Model):
         for order in orders_data:
             fulfillment_data = []
             order_payload = order if isinstance(order, dict) else order.to_dict()
-            cancelled = is_cancelled_shopify_order(order_payload)
+            cancelled = is_cash_only_shopify_order(order_payload)
             completed_pos = (order_payload.get('source_name') == 'pos' and
                              order_payload.get('fulfillment_status') in ('fulfilled', 'partial') and
                              any(row.get('status') == 'success' for row in order_payload.get('fulfillments', [])))

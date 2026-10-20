@@ -5,7 +5,8 @@ from odoo import Command, fields, models, _
 from odoo.exceptions import UserError
 from .. import shopify
 from ..shopify.pyactiveresource.connection import Error as ShopifyError
-from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, prove_cancelled_cash, prove_prepayment_cash, fingerprint, component_money, money
+from .shopify_payment_plan import cash_events, invoice_mode, prove_net_refunds, prove_cancelled_cash, prove_archived_refund_cash, prove_prepayment_cash, fingerprint, component_money, money
+from .shopify_order_utils import is_archived_refunded_shopify_order, is_cancelled_shopify_order
 from .shopify_refund_plan import prove_final_net_invoice, refund_components
 from .shopify_repair_error import ShopifyRepairBlocked
 
@@ -352,8 +353,11 @@ class SaleOrderPaymentSync(models.Model):
             invoices = documents.filtered(lambda move: move.move_type == 'out_invoice')
             credits = documents.filtered(lambda move: move.move_type == 'out_refund')
             cancelled_cash = not documents and self.state == 'cancel' and self.canceled_in_shopify
+            archived_cash = (not documents and self.state == 'cancel' and not self.canceled_in_shopify
+                             and is_archived_refunded_shopify_order(payload))
+            cash_only = cancelled_cash or archived_cash
             prepayment = not documents and self.state == 'sale' and not self.canceled_in_shopify
-            if (not invoices and not cancelled_cash and not prepayment) or documents.filtered(lambda move: move.company_id != self.company_id
+            if (not invoices and not cash_only and not prepayment) or documents.filtered(lambda move: move.company_id != self.company_id
                                                   or move.currency_id != self.currency_id):
                 raise ShopifyRepairBlocked(_('Posted invoices in the order company and currency are required.'), 'documents')
             if documents.invoice_line_ids.sale_line_ids.order_id - self:
@@ -375,11 +379,26 @@ class SaleOrderPaymentSync(models.Model):
             receivable = documents.line_ids.filtered(lambda row: row.account_type == 'asset_receivable').account_id
             if cancelled_cash:
                 prove_cancelled_cash(payload, events, self.currency_id.compare_amounts)
+            if archived_cash:
+                prove_archived_refund_cash(payload, events)
+                customer_id = str((payload.get('customer') or {}).get('id') or '')
+                mapping = self.env['shopify.res.partner.ept'].search([
+                    ('shopify_instance_id', '=', self.shopify_instance_id.id),
+                    ('shopify_customer_id', '=', customer_id)]) if customer_id else self.env['shopify.res.partner.ept']
+                if (len(mapping) != 1 or not mapping.partner_id.active
+                        or not mapping.partner_id.commercial_partner_id.active
+                        or (mapping.partner_id.company_id and mapping.partner_id.company_id != self.company_id)
+                        or (mapping.partner_id.commercial_partner_id.company_id
+                            and mapping.partner_id.commercial_partner_id.company_id != self.company_id)
+                        or mapping.partner_id.commercial_partner_id != self.partner_id.commercial_partner_id):
+                    raise ShopifyRepairBlocked(_('The archived refund needs one active Shopify customer mapping to this order\'s customer.'), 'customer')
+                if self.picking_ids.filtered(lambda picking: picking.state != 'cancel'):
+                    raise UserError(_('The archived refunded order still has stock movements. Review or cancel them before recording its cash.'))
             if prepayment:
                 if str(payload.get('id')) != self.shopify_order_id:
                     raise UserError(_('Shopify returned another order.'))
                 prove_prepayment_cash(payload, events, self.amount_total, self.currency_id.compare_amounts)
-            if cancelled_cash or prepayment:
+            if cash_only or prepayment:
                 if self.picking_ids.filtered(lambda picking: picking.state == 'done'):
                     raise UserError(_('The order has completed stock movements. Review its accounting manually.'))
                 receivable = self.partner_id.commercial_partner_id.with_company(self.company_id).property_account_receivable_id
@@ -394,12 +413,13 @@ class SaleOrderPaymentSync(models.Model):
                 raise UserError(_('The invoice or refunds from the previous net-invoice audit are missing. Review the history.'))
             embedded_amount = sum(money(refund_events[key]['amount']) for key in embedded_ids)
             try:
-                mode = 'prepayment' if prepayment else 'cancelled_cash' if cancelled_cash else invoice_mode(
+                mode = ('prepayment' if prepayment else 'archived_refund_cash' if archived_cash
+                        else 'cancelled_cash' if cancelled_cash else invoice_mode(
                     events, sum(invoices.mapped('amount_total')), sum(credits.mapped('amount_total')),
-                    self.currency_id.compare_amounts, embedded_amount)
+                    self.currency_id.compare_amounts, embedded_amount))
             except ValueError as error:
                 raise ShopifyRepairBlocked(str(error), 'documents') from error
-            credit_values = [] if cancelled_cash or prepayment else self._shopify_refund_documents(
+            credit_values = [] if cash_only or prepayment else self._shopify_refund_documents(
                 payload, events, invoices, credits, mode, embedded_ids)
             if mode == 'net':
                 embedded_ids = sorted(refund_events)
@@ -452,8 +472,8 @@ class SaleOrderPaymentSync(models.Model):
                 liquidity, counterpart, writeoffs = matched._seek_for_lines()
                 matches = counterpart.matched_debit_ids | counterpart.matched_credit_ids
                 allocated_moves = (matches.debit_move_id | matches.credit_move_id).move_id - matched.move_id
-                if cancelled_cash and allocated_moves - candidates.move_id:
-                    raise UserError(_('A cancellation payment is applied outside this order\'s receipt/refund group.'))
+                if cash_only and allocated_moves - candidates.move_id:
+                    raise UserError(_('A cash-only payment is applied outside this order\'s receipt/refund group.'))
                 if (len(liquidity) != 1 or writeoffs or len(counterpart) != 1
                         or counterpart.account_id != receivable
                         or liquidity.account_id != method.payment_account_id
@@ -655,7 +675,7 @@ class SaleOrderPaymentSync(models.Model):
         return True
 
     def _process_shopify_cancelled_import(self, payload, queue_line):
-        """Cancel without fulfillment; keep failed cash recording retryable."""
+        """Import cancelled/archived refunds without running fulfillment rules."""
         self.ensure_one()
         self.check_access('write')
         self = self.with_context(tracking_disable=True, mail_create_nosubscribe=True,
@@ -663,18 +683,33 @@ class SaleOrderPaymentSync(models.Model):
         queue_line = queue_line.with_env(self.env)
         try:
             with self.env.cr.savepoint():
-                if not self.with_context(shopify_cancel_cash_only=True).cancel_shopify_order():
-                    raise UserError(_('This cancelled Shopify order has completed deliveries. Review its cancellation manually.'))
+                if is_cancelled_shopify_order(payload):
+                    if not self.with_context(shopify_cancel_cash_only=True).cancel_shopify_order():
+                        raise UserError(_('This cancelled Shopify order has completed deliveries. Review its cancellation manually.'))
+                else:
+                    # Archive status is not cancellation. Prove the current source
+                    # before cancelling only Odoo's unfulfilled sales demand.
+                    self._lock_shopify_cash()
+                    current, transactions = self._shopify_cash_source()
+                    events = cash_events(transactions, self.shopify_order_id, self.currency_id.name)
+                    prove_archived_refund_cash(current, events)
+                    if self.picking_ids.filtered(lambda picking: picking.state == 'done'):
+                        raise UserError(_('This archived refunded order has completed stock movements. Review its accounting manually.'))
+                    if is_cancelled_shopify_order(current):
+                        self.with_context(shopify_cancel_cash_only=True).cancel_shopify_order()
+                    elif not self.invoice_ids.filtered(lambda move: move.state != 'cancel'):
+                        self.with_context(disable_cancel_warning=True).action_cancel()
+                    payload = current
             has_cash = payload.get('financial_status') in ('paid', 'partially_paid', 'refunded', 'partially_refunded') or any(
                 row.get('status') == 'success' and row.get('kind') in ('sale', 'capture', 'refund')
                 for row in payload.get('transaction', []))
             if has_cash:
                 if not self._shopify_transaction_payments_enabled() or not self.auto_workflow_process_id.register_payment:
                     raise UserError(_('Enable Record Payments from Shopify Transactions on the store and Register Payment '
-                                      'on the gateway workflow, then retry this cancelled order to record its cash history.'))
+                                      'on the gateway workflow, then retry this cash-only order to record its cash history.'))
                 self._sync_shopify_cash()
         except Exception as error:
-            message = _('Cancelled Shopify order %(order)s needs financial review: %(reason)s',
+            message = _('Cash-only Shopify order %(order)s needs financial review: %(reason)s',
                         order=self.name, reason=str(error))
             self._message_log(body=message)
             self.env['common.log.lines.ept'].create_common_log_line_ept(
