@@ -1,4 +1,10 @@
-# Shopify payout repair update 18.0.3.52
+# Shopify payout repair update 18.0.3.53
+
+Opening-balance refunds with imported A2000 credit-memo allocations now validate and attach the same evidence during preview and apply. Previously the historical-refund preview omitted that evidence, so apply reported that source data or accounting had changed even when the reviewed allocation was unchanged. The saved case now shows its A2000 evidence and retains it in the clearing audit. Actual source changes and modified evidence files still stop accounting.
+
+Upgrade `shopify_ept` from 18.0.3.52, reopen the affected saved Bulk Repair workspace, and use Preview / Refresh before applying only reviewed ready cases. Reuse the already attached allocation CSV; do not import it again. The existing clearing entry and payout match are reused on subsequent runs. No new credit note, customer refund payment, sale or stock movement is required by this correction. The other two modules do not need a version change for this patch.
+
+## Previous update: 18.0.3.52
 
 Deploy with Payment Payout Reconciliation 18.0.1.21.0 and Loop Returns 18.0.1.15.0. Upgrade the payout module, Shopify connector and Loop connector together after deploying all three code changes. No existing posted accounting is automatically changed.
 

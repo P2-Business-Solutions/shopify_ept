@@ -16,6 +16,7 @@ if ODOO_AVAILABLE:
 class TestShopifyOpeningRefund(PayoutTestCase):
     _collection = CollectionFixtures._collection
     _matcher = CollectionFixtures._matcher
+    _evidence_csv = CollectionFixtures._evidence_csv
 
     @classmethod
     def setUpClass(cls):
@@ -47,6 +48,81 @@ class TestShopifyOpeningRefund(PayoutTestCase):
         payout.amount = -amount
         wizard.rematch_payouts = True
         return payout, wizard, payload, events
+
+    def _attach_refund_evidence(self, payout, wizard, events):
+        importer = self.env['shopify.opening.evidence.import.ept'].create(dict(
+            repair_id=wizard.id, reviewed=True,
+            csv_file=self._evidence_csv(payout, wizard, events[1:],
+                document_type='credit_memo', document_number='5001234',
+                document_amount='310.20', allocated_amount='283.30')))
+        importer.action_preview()
+        importer.action_apply()
+        return self.env['shopify.opening.evidence.ept'].search([
+            ('instance_id', '=', self.instance.id), ('transaction_id', '=', events[1]['id'])])
+
+    def test_attached_a2000_refund_allocation_previews_applies_and_reuses_exact_match(self):
+        payout, wizard, payload, events = self._refund('a2000')
+        payout.generate_bank_statement()
+        counts = {model: self.env[model].search_count([])
+                  for model in ('account.move', 'account.payment', 'sale.order', 'stock.picking')}
+        credits = self.env['account.move'].search_count([('move_type', '=', 'out_refund')])
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)), self._matcher(payout):
+            evidence = self._attach_refund_evidence(payout, wizard, events)
+            wizard.action_preview()
+            case = wizard.line_ids
+            self.assertEqual(case.status, 'ready', case.detail)
+            self.assertEqual(case.kind, 'opening_refund')
+            self.assertEqual(case.opening_evidence_id, evidence)
+            self.assertEqual(case.plan['a2000_evidence']['id'], evidence.id)
+            self.assertEqual(case.plan['a2000_evidence']['allocation'], 'application-1')
+            self.assertEqual(evidence.document_amount, 310.20)
+            self.assertEqual(evidence.allocated_amount, 283.30)
+            for model, count in counts.items():
+                self.assertEqual(self.env[model].search_count([]), count)
+            wizard.action_apply()
+            self.assertEqual(case.status, 'done', case.detail)
+            self.assertEqual(case.reconciliation_status, 'matched')
+            move = case.collection_move_ids
+            self.assertEqual(move.state, 'posted')
+            self.assertEqual(move.date, payout.payout_date)
+            self.assertEqual(move.line_ids.filtered(lambda line: line.account_id == self.outgoing).balance, -283.30)
+            self.assertTrue(payout.payout_statement_line_ids.is_reconciled)
+            self.assertEqual(payout.state, 'validated')
+            self.assertEqual(len(payout.repair_audit_ids), 1)
+            self.assertEqual(payout.repair_audit_ids.plan['a2000_evidence']['id'], evidence.id)
+            wizard.open_only = False
+            wizard.action_preview()
+            wizard.action_apply()
+            self.assertEqual(case.collection_move_ids, move)
+            self.assertEqual(len(payout.repair_audit_ids), 1)
+        for model in ('account.payment', 'sale.order', 'stock.picking'):
+            self.assertEqual(self.env[model].search_count([]), counts[model])
+        self.assertEqual(self.env['account.move'].search_count([('move_type', '=', 'out_refund')]), credits)
+
+    def test_changed_a2000_refund_file_after_preview_blocks_accounting(self):
+        import base64
+        payout, wizard, payload, events = self._refund('a2000-file-changed')
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            evidence = self._attach_refund_evidence(payout, wizard, events)
+            wizard.action_preview()
+            evidence.attachment_id.datas = base64.b64encode(b'changed after preview')
+            wizard.action_apply()
+        self.assertEqual(wizard.line_ids.status, 'review')
+        self.assertIn('evidence file changed', wizard.line_ids.detail)
+        self.assertFalse(wizard.line_ids.collection_move_ids)
+        self.assertFalse(payout.repair_audit_ids)
+
+    def test_changed_source_after_a2000_refund_preview_still_blocks_accounting(self):
+        payout, wizard, payload, events = self._refund('a2000-source-changed')
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            self._attach_refund_evidence(payout, wizard, events)
+            wizard.action_preview()
+            payload['note'] = 'changed after accounting review'
+            wizard.action_apply()
+        self.assertEqual(wizard.line_ids.status, 'review')
+        self.assertIn('changed after preview', wizard.line_ids.detail)
+        self.assertFalse(wizard.line_ids.collection_move_ids)
+        self.assertFalse(payout.repair_audit_ids)
 
     def test_one_apply_posts_and_matches_opening_refund_without_repeating_return_or_cash(self):
         payout, wizard, payload, events = self._refund()
