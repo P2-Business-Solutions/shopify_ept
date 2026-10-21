@@ -1,0 +1,43 @@
+<odoo>
+    <record id="opening_evidence_company_rule" model="ir.rule">
+        <field name="name">Opening evidence company</field><field name="model_id" ref="model_shopify_opening_evidence_ept"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+    <record id="shopify_opening_evidence_import_form" model="ir.ui.view">
+        <field name="name">shopify.opening.evidence.import.ept.form</field><field name="model">shopify.opening.evidence.import.ept</field>
+        <field name="arch" type="xml"><form string="Import A2000 Opening Evidence">
+            <group readonly="state == 'done'"><field name="repair_id"/><field name="filename" invisible="1"/>
+                <field name="csv_file" filename="filename" required="1"/><field name="reviewed"/><field name="state" invisible="1"/></group>
+            <p>Upload reviewed A2000 allocations with these columns: order_id, transaction_id, document_type, document_number, status, currency, document_amount, allocated_amount, document_date, allocation_reference.</p>
+            <p>document_type is invoice or credit_memo; status must be PAID. Every allocation must identify the exact Shopify cash transaction. A different document total requires an allocation reference from the supporting application detail.</p>
+            <field name="preview_html" nolabel="1"/><footer>
+                <button name="action_preview" type="object" string="Preview Allocations" invisible="state == 'done'"/>
+                <button name="action_apply" type="object" string="Attach Reviewed Evidence" class="btn-primary" invisible="state != 'preview'"/>
+                <button special="cancel" string="Close"/></footer>
+        </form></field>
+    </record>
+    <record id="opening_evidence_workspace_button" model="ir.ui.view">
+        <field name="name">shopify.payout.repair.opening.evidence</field><field name="model">shopify.payout.repair.ept</field>
+        <field name="inherit_id" ref="view_shopify_payout_bulk_repair"/>
+        <field name="arch" type="xml"><xpath expr="//field[@name='historical_collection_account_id']" position="after">
+            <button name="action_import_opening_evidence" type="object" string="Import A2000 Opening Evidence" groups="account.group_account_manager"/>
+        </xpath></field>
+    </record>
+    <record id="opening_evidence_form" model="ir.ui.view">
+        <field name="name">shopify.opening.evidence.ept.form</field><field name="model">shopify.opening.evidence.ept</field>
+        <field name="arch" type="xml"><form create="false" edit="false" delete="false"><group>
+            <field name="instance_id"/><field name="source_order_id"/><field name="transaction_id"/>
+            <field name="document_type"/><field name="document_number"/><field name="document_date"/>
+            <field name="document_amount"/><field name="allocated_amount"/><field name="currency_id"/>
+            <field name="allocation_reference"/><field name="attachment_id"/><field name="file_hash"/>
+            <field name="create_uid"/><field name="create_date"/>
+        </group></form></field>
+    </record>
+    <record id="opening_evidence_case_field" model="ir.ui.view">
+        <field name="name">shopify.repair.case.opening.evidence</field><field name="model">shopify.payout.repair.ept</field>
+        <field name="inherit_id" ref="view_shopify_payout_bulk_repair"/>
+        <field name="arch" type="xml"><xpath expr="//field[@name='visible_line_ids']/list" position="inside">
+            <field name="opening_evidence_id" optional="show"/>
+        </xpath></field>
+    </record>
+</odoo>

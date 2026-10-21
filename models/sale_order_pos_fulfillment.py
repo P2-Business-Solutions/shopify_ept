@@ -11,6 +11,7 @@ class SaleOrderPosFulfillment(models.Model):
     def process_shopify_pos_fulfillments(self, payload, queue_line=False):
         """Resume imports atomically, using fulfillment IDs to prevent double stock moves."""
         self.ensure_one()
+        self = self.with_context(shopify_order_response=payload)
         if self.state == 'cancel':
             raise UserError(_('A cancelled sales order cannot receive POS fulfillments.'))
         with self.env.cr.savepoint():

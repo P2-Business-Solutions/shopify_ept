@@ -305,3 +305,69 @@ class TestShopifyHistoricalCollection(PayoutTestCase):
             shopify_instance_id=self.instance.id, shopify_order_id=payload['id']))
         with self.assertRaisesRegex(UserError, 'cleared from opening balances'):
             order._build_shopify_cash_plan(repair=True)
+
+    def _evidence_csv(self, payout, wizard, events, **changes):
+        import base64
+        import csv
+        import io
+        row = dict(order_id=payout.payout_transaction_ids.source_order_id, transaction_id=events[0]['id'],
+            document_type='invoice', document_number='5134960', status='PAID', currency=payout.currency_id.name,
+            document_amount='287.83', allocated_amount='287.83',
+            document_date=str(wizard.cutover_date - timedelta(days=2)), allocation_reference='application-1')
+        row.update(changes)
+        stream = io.StringIO()
+        writer = csv.DictWriter(stream, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+        return base64.b64encode(stream.getvalue().encode())
+
+    def test_a2000_evidence_attaches_exact_paid_allocation_without_accounting_and_enriches_preview(self):
+        payout, workspace, payload, events = self._collection('evidence')
+        wizard = self.env['shopify.opening.evidence.import.ept'].create(dict(repair_id=workspace.id,
+            csv_file=self._evidence_csv(payout, workspace, events), reviewed=True))
+        before = self.env['account.move'].search_count([])
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+            wizard.action_apply()
+            workspace.action_preview()
+        evidence = self.env['shopify.opening.evidence.ept'].search([('transaction_id', '=', events[0]['id'])])
+        self.assertEqual(evidence.document_number, '5134960')
+        self.assertTrue(evidence.attachment_id)
+        self.assertEqual(workspace.line_ids.plan['a2000_evidence']['id'], evidence.id)
+        self.assertEqual(self.env['account.move'].search_count([]), before)
+        with self.assertRaises(UserError):
+            evidence.write({'allocated_amount': 1})
+
+    def test_a2000_paid_header_does_not_replace_exact_cash_allocation_or_document_kind(self):
+        payout, workspace, payload, events = self._collection('bad-evidence')
+        wizard = self.env['shopify.opening.evidence.import.ept'].create(dict(repair_id=workspace.id,
+            csv_file=self._evidence_csv(payout, workspace, events, document_amount='735', allocated_amount='735'), reviewed=True))
+        with self.assertRaisesRegex(UserError, 'exact cash amount'):
+            wizard.action_preview()
+        wizard.csv_file = self._evidence_csv(payout, workspace, events, document_type='credit_memo')
+        with self.assertRaises(UserError):
+            wizard.action_preview()
+
+    def test_opening_evidence_action_opens_empty_upload_form(self):
+        payout, workspace, payload, events = self._collection('upload-form')
+        action = workspace.action_import_opening_evidence()
+        importer = self.env['shopify.opening.evidence.import.ept'].browse(action['res_id'])
+        self.assertEqual(importer.repair_id, workspace)
+        self.assertFalse(importer.csv_file)
+        importer.reviewed = True
+        with self.assertRaisesRegex(UserError, 'Upload the reviewed'):
+            importer.action_preview()
+
+    def test_changed_a2000_attachment_blocks_cash_repair(self):
+        import base64
+        payout, workspace, payload, events = self._collection('changed-file')
+        importer = self.env['shopify.opening.evidence.import.ept'].create(dict(repair_id=workspace.id,
+            csv_file=self._evidence_csv(payout, workspace, events), reviewed=True))
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            importer.action_preview()
+            importer.action_apply()
+            evidence = self.env['shopify.opening.evidence.ept'].search([('transaction_id', '=', events[0]['id'])])
+            evidence.attachment_id.datas = base64.b64encode(b'changed')
+            workspace.action_preview()
+        self.assertEqual(workspace.line_ids.status, 'review')
+        self.assertIn('evidence file changed', workspace.line_ids.detail)

@@ -1987,3 +1987,46 @@ class TestShopifyCashSync(PayoutTestCase):
             with self.assertRaises(UserError):
                 order._sync_shopify_cash()
             self.assertEqual(self.env['account.payment'].search([('partner_id', '=', self.partner.id)]), payment)
+
+    def _credit_repair_case(self):
+        order, invoice, payload, events = self._fixture(gross=True)
+        order.action_confirm()
+        payout = self.env['shopify.payout.report.ept'].create(dict(instance_id=self.instance.id,
+            payout_reference_id='credit-repair', payout_date=fields.Date.today(), payout_status='paid',
+            currency_id=order.currency_id.id, amount=-45,
+            payout_transaction_ids=[Command.create(dict(transaction_id='refund-payout', transaction_type='refund',
+                source_order_id=order.shopify_order_id, source_order_transaction_id='refund', amount=-45,
+                currency_id=order.currency_id.id, is_remaining_statement=True))]))
+        wizard = self.env['shopify.credit.repair.ept'].create({'transaction_id': payout.payout_transaction_ids.id})
+        return order, invoice, payload, events, payout, wizard
+
+    def test_credit_repair_prepares_exact_draft_without_payments_and_retains_invoice_accounts(self):
+        order, invoice, payload, events, payout, wizard = self._credit_repair_case()
+        before = self.env['account.payment'].search_count([])
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+            action = wizard.action_apply()
+        note = self.env['account.move'].browse(action['res_id'])
+        self.assertEqual(note.state, 'draft')
+        self.assertEqual(note.amount_total, 45)
+        self.assertEqual(note.invoice_line_ids.account_id, self.revenue)
+        self.assertEqual(note.reversed_entry_id, invoice)
+        self.assertEqual(self.env['account.payment'].search_count([]), before)
+        self.assertEqual(note.shopify_refund_id, 'refund-doc')
+
+    def test_credit_repair_reuses_wrong_unsettled_credit_and_rechecks_source(self):
+        order, invoice, payload, events, payout, wizard = self._credit_repair_case()
+        note = self.env['account.move'].create(dict(move_type='out_refund', journal_id=self.sales_journal.id,
+            partner_id=self.partner.id, invoice_date=fields.Date.today(), reversed_entry_id=invoice.id,
+            invoice_line_ids=[Command.create(dict(name='Incomplete', account_id=self.revenue.id,
+                quantity=1, price_unit=40, tax_ids=[Command.clear()]))]))
+        note.action_post()
+        note.line_ids.remove_move_reconcile()
+        wizard.credit_note_id = note
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+            action = wizard.action_apply()
+        self.assertEqual(action['res_id'], note.id)
+        self.assertEqual(note.state, 'draft')
+        self.assertEqual(note.amount_total, 45)
+        self.assertTrue(self.env['ir.attachment'].search_count([('res_model', '=', 'account.move'), ('res_id', '=', note.id)]))

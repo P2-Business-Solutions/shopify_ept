@@ -795,50 +795,51 @@ class SaleOrder(models.Model):
                          sale_order.name, order_number)
             message = ""
             try:
-                context = dict(self.env.context)
-                if not self._context.get('shopify_order_financial_status'):
-                    context.update({'shopify_order_financial_status': order_response.get(
-                        "financial_status")})
-                context.update({'order_data_line': order_data_line,
-                                'shopify_order_response': order_response,
-                                'shopify_order_transactions': order_response.get('transaction', [])})
-                self.env.context = context
-                if pos_order and sale_order.shopify_order_status in ("fulfilled", "partial"):
-                    sale_order.process_shopify_pos_fulfillments(order_response, order_data_line)
-                    created_by = ('Scheduled Action' if order_data_line and
-                                  order_data_line.shopify_order_data_queue_id.created_by == "scheduled_action"
-                                  else self.env.user.name)
-                    message = self.create_shipped_order_refund(
-                        shopify_financial_status, order_response, sale_order, created_by)
-                elif sale_order.shopify_order_status == "fulfilled":
-                    sale_order.auto_workflow_process_id.shipped_order_workflow_ept(sale_order)
-                    if order_data_line and order_data_line.shopify_order_data_queue_id.created_by == "scheduled_action":
-                        created_by = 'Scheduled Action'
-                    else:
-                        created_by = self.env.user.name
-                    # Below code add for create partially/fully refund
-                    message = self.create_shipped_order_refund(shopify_financial_status, order_response, sale_order,
-                                                               created_by)
-                elif not sale_order.is_risky_order:
-                    if sale_order.shopify_order_status == "partial":
-                        sale_order.process_order_fullfield_qty(order_response)
-                        sale_order.with_context(
-                            shopify_order_financial_status=order_response.get("financial_status"),
-                            shopify_order_transactions=order_response.get("transaction", []),
-                        ).process_orders_and_invoices_ept()
-                        if order_data_line and order_data_line.shopify_order_data_queue_id.created_by == \
-                                "scheduled_action":
+                with self.env.cr.savepoint():
+                    context = dict(self.env.context)
+                    if not self._context.get('shopify_order_financial_status'):
+                        context.update({'shopify_order_financial_status': order_response.get(
+                            "financial_status")})
+                    context.update({'order_data_line': order_data_line,
+                                    'shopify_order_response': order_response,
+                                    'shopify_order_transactions': order_response.get('transaction', [])})
+                    self.env.context = context
+                    if pos_order and sale_order.shopify_order_status in ("fulfilled", "partial"):
+                        sale_order.process_shopify_pos_fulfillments(order_response, order_data_line)
+                        created_by = ('Scheduled Action' if order_data_line and
+                                      order_data_line.shopify_order_data_queue_id.created_by == "scheduled_action"
+                                      else self.env.user.name)
+                        message = self.create_shipped_order_refund(
+                            shopify_financial_status, order_response, sale_order, created_by)
+                    elif sale_order.shopify_order_status == "fulfilled":
+                        sale_order.auto_workflow_process_id.shipped_order_workflow_ept(sale_order)
+                        if order_data_line and order_data_line.shopify_order_data_queue_id.created_by == "scheduled_action":
                             created_by = 'Scheduled Action'
                         else:
                             created_by = self.env.user.name
                         # Below code add for create partially/fully refund
                         message = self.create_shipped_order_refund(shopify_financial_status, order_response, sale_order,
                                                                    created_by)
-                    else:
-                        sale_order.with_context(
-                            shopify_order_financial_status=order_response.get("financial_status"),
-                            shopify_order_transactions=order_response.get("transaction", []),
-                        ).process_orders_and_invoices_ept()
+                    elif not sale_order.is_risky_order:
+                        if sale_order.shopify_order_status == "partial":
+                            sale_order.process_order_fullfield_qty(order_response)
+                            sale_order.with_context(
+                                shopify_order_financial_status=order_response.get("financial_status"),
+                                shopify_order_transactions=order_response.get("transaction", []),
+                            ).process_orders_and_invoices_ept()
+                            if order_data_line and order_data_line.shopify_order_data_queue_id.created_by == \
+                                    "scheduled_action":
+                                created_by = 'Scheduled Action'
+                            else:
+                                created_by = self.env.user.name
+                            # Below code add for create partially/fully refund
+                            message = self.create_shipped_order_refund(shopify_financial_status, order_response, sale_order,
+                                                                       created_by)
+                        else:
+                            sale_order.with_context(
+                                shopify_order_financial_status=order_response.get("financial_status"),
+                                shopify_order_transactions=order_response.get("transaction", []),
+                            ).process_orders_and_invoices_ept()
 
 
             except Exception as error:

@@ -71,7 +71,7 @@ class TestShopifyPosFulfillment(PayoutTestCase):
             'created_at': '2026-10-13T12:00:00-04:00', 'payment_gateway_names': ['pos_cash'],
             'line_items': [{'id': 101, 'quantity': quantity, 'fulfillable_quantity': 0,
                             'price': '25.00', 'sku': 'POS-SKU'}],
-            'fulfillments': [{'id': 501, 'status': 'success', 'location_id': 201,
+            'fulfillments': [{'id': 501, 'status': 'success', 'created_at': '2026-10-13T16:00:00Z', 'location_id': 201,
                               'line_items': [{'id': 101, 'quantity': quantity, 'sku': 'POS-SKU'}]}],
         }
         for warehouse in (self.warehouse, self.store):
@@ -127,7 +127,7 @@ class TestShopifyPosFulfillment(PayoutTestCase):
         self.assertEqual(self._stock(self.store), 9)
         payload['fulfillment_status'] = 'fulfilled'
         payload['fulfillments'].append({
-            'id': 502, 'status': 'success', 'location_id': 301,
+            'id': 502, 'status': 'success', 'created_at': '2026-10-13T16:00:00Z', 'location_id': 301,
             'line_items': [{'id': 101, 'quantity': 2}],
         })
         order.process_shopify_pos_fulfillments(payload)
@@ -387,7 +387,7 @@ class TestShopifyPosFulfillment(PayoutTestCase):
     def test_overfulfilled_order_rolls_back_deliveries_and_stock(self):
         order, payload = self._fixture()
         payload['fulfillments'].append({
-            'id': 502, 'status': 'success', 'location_id': 201,
+            'id': 502, 'status': 'success', 'created_at': '2026-10-13T16:00:00Z', 'location_id': 201,
             'line_items': [{'id': 101, 'quantity': 1}],
         })
         with self.assertRaisesRegex(UserError, 'exceeds the undelivered quantity'):
@@ -407,3 +407,65 @@ class TestShopifyPosFulfillment(PayoutTestCase):
             ('product_id', '=', self.product.id), ('location_id', '=', self.warehouse.lot_stock_id.id),
         ]).mapped('quantity')), 10)
         self.assertEqual(self._stock(self.store), 10)
+
+    def test_import_retains_invoice_delivery_move_and_move_line_source_dates(self):
+        order, payload = self._fixture()
+        self.instance.shopify_store_time_zone = 'America/New_York'
+        order.process_shopify_pos_fulfillments(payload)
+        self.assertEqual(str(order.invoice_ids.invoice_date), '2026-10-13')
+        self.assertEqual(str(order.invoice_ids.date), '2026-10-13')
+        self.assertEqual(str(order.picking_ids.date_done), '2026-10-13 16:00:00')
+        self.assertEqual(str(order.picking_ids.move_ids.date), '2026-10-13 16:00:00')
+        self.assertEqual(set(order.picking_ids.move_line_ids.mapped('date')), {order.picking_ids.date_done})
+
+    def test_missing_dated_fulfillment_rolls_back_delivery_and_invoice(self):
+        order, payload = self._fixture()
+        del payload['fulfillments'][0]['created_at']
+        with self.assertRaises(UserError):
+            order.process_shopify_pos_fulfillments(payload)
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
+        self.assertEqual(self._stock(self.store), 10)
+
+    def _dated_stock_category(self, method='standard'):
+        accounts = self.env['account.account'].create([
+            dict(name=name, code=code, account_type='asset_current',
+                 company_ids=[Command.set(self.env.company.ids)])
+            for name, code in [('Stock valuation', 'DTVALUE'), ('Stock input', 'DTINPUT'), ('Stock output', 'DTOUT')]])
+        journal = self.env['account.journal'].create(dict(name='Dated Stock', code='DTST', type='general'))
+        category = self.env['product.category'].create(dict(name='Dated Standard Cost',
+            property_valuation='real_time', property_cost_method=method,
+            property_stock_valuation_account_id=accounts[0].id,
+            property_stock_account_input_categ_id=accounts[1].id,
+            property_stock_account_output_categ_id=accounts[2].id,
+            property_stock_journal=journal.id))
+        return category, accounts
+
+    def test_standard_cost_valuation_entry_uses_source_fulfillment_date(self):
+        order, payload = self._fixture()
+        category, accounts = self._dated_stock_category()
+        self.product.write({'categ_id': category.id, 'standard_price': 10})
+        order.process_shopify_pos_fulfillments(payload)
+        moves = order.picking_ids.move_ids.stock_valuation_layer_ids.account_move_id
+        self.assertTrue(moves)
+        self.assertEqual(set(moves.mapped('date')), {fields.Date.to_date('2026-10-13')})
+        self.assertEqual(sum(moves.line_ids.filtered(lambda item: item.account_id == accounts[2]).mapped('debit')), 20)
+
+    def test_historical_average_cost_is_held_before_stock_or_invoice(self):
+        order, payload = self._fixture()
+        category, _accounts = self._dated_stock_category('average')
+        self.product.categ_id = category
+        with self.assertRaisesRegex(UserError, 'valuation review'):
+            order.process_shopify_pos_fulfillments(payload)
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
+        self.assertEqual(self._stock(self.store), 10)
+
+    def test_invoice_policy_uses_source_order_or_fulfillment_date(self):
+        order, payload = self._fixture()
+        payload['created_at'] = '2026-10-12T12:00:00-04:00'
+        target = order.with_context(shopify_order_response=payload)
+        self.workflow.invoice_date_is_order_date = True
+        self.assertEqual(str(target._prepare_invoice()['invoice_date']), '2026-10-12')
+        self.workflow.invoice_date_is_order_date = False
+        self.assertEqual(str(target._prepare_invoice()['invoice_date']), '2026-10-13')
