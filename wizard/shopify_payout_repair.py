@@ -150,6 +150,27 @@ class ShopifyPayoutRepair(models.Model):
                                 collection_account=self.historical_collection_account_id.id,
                                 open_only=self.open_only, rematch=self.rematch_payouts))
 
+    def _with_opening_evidence(self, transactions, opening):
+        """Validate and attach identical cash evidence during preview and apply."""
+        if opening['kind'] not in ('collection', 'opening_refund'):
+            return opening
+        transactions.ensure_one()
+        evidence_row = self.env['shopify.opening.evidence.ept'].search([
+            ('instance_id', '=', transactions.payout_id.instance_id.id),
+            ('transaction_id', '=', transactions.source_order_transaction_id)])
+        if evidence_row:
+            evidence_row._check_file_integrity()
+            if (evidence_row.source_order_id != transactions.source_order_id
+                    or evidence_row.currency_id != transactions.payout_id.currency_id
+                    or evidence_row.currency_id.compare_amounts(evidence_row.allocated_amount, abs(transactions.amount))
+                    or evidence_row.source_hash != fingerprint(dict(event=opening['event'], amount=opening['amount'],
+                                                                   currency=transactions.payout_id.currency_id.id))):
+                raise UserError(_('The attached A2000 allocation conflicts with this source cash event.'))
+            opening['a2000_evidence'] = dict(id=evidence_row.id, document=evidence_row.document_number,
+                kind=evidence_row.document_type, allocation=evidence_row.allocation_reference,
+                attachment=evidence_row.attachment_id.id, original_source_hash=evidence_row.source_hash)
+        return opening
+
     def _plan(self, transactions, order, historical=False, collection=False, evidence=None):
         if transactions.payout_id - self.payout_ids:
             raise UserError(_('The repair contains transactions outside the selected payouts.'))
@@ -196,31 +217,18 @@ class ShopifyPayoutRepair(models.Model):
                         and pay.partner_id.commercial_partner_id == order.partner_id.commercial_partner_id)
                     for pay in payments]
         if historical:
-            return transactions.sorted('id')[:1]._historical_refund_plan(
+            plan = transactions.sorted('id')[:1]._historical_refund_plan(
                 self.cutover_date, self.timezone, self.sales_journal_id, self.post_historical,
                 opening_account=self.historical_collection_account_id,
                 opening_confirmed=self.clear_historical_collections, source=source)
+            return self._with_opening_evidence(transactions, plan)
         if collection:
             if len(transactions) != 1:
                 raise UserError(_('Review each historical collection against its exact payout transaction.'))
             opening = transactions._historical_collection_plan(
                 self.cutover_date, self.timezone, self.historical_collection_account_id,
                 self.clear_historical_collections, source=source)
-            evidence_row = self.env['shopify.opening.evidence.ept'].search([
-                ('instance_id', '=', transactions.payout_id.instance_id.id),
-                ('transaction_id', '=', transactions.source_order_transaction_id)])
-            if evidence_row:
-                evidence_row._check_file_integrity()
-                if (evidence_row.source_order_id != transactions.source_order_id
-                        or evidence_row.currency_id != transactions.payout_id.currency_id
-                        or evidence_row.currency_id.compare_amounts(evidence_row.allocated_amount, abs(transactions.amount))
-                        or evidence_row.source_hash != fingerprint(dict(event=opening['event'], amount=opening['amount'],
-                                                                       currency=transactions.payout_id.currency_id.id))):
-                    raise UserError(_('The attached A2000 allocation conflicts with this source cash event.'))
-                opening['a2000_evidence'] = dict(id=evidence_row.id, document=evidence_row.document_number,
-                    kind=evidence_row.document_type, allocation=evidence_row.allocation_reference,
-                    attachment=evidence_row.attachment_id.id, original_source_hash=evidence_row.source_hash)
-            return opening
+            return self._with_opening_evidence(transactions, opening)
         if len(order) != 1:
             raise UserError(_('Import or correct the order before repairing its current-period accounting.'))
         order.check_access('write')
