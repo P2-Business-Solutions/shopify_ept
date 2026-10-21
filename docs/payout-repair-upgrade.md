@@ -1,6 +1,6 @@
 # Shopify payout repair update 18.0.3.52
 
-Deploy with Payment Payout Reconciliation 18.0.1.20.0 and Loop Returns 18.0.1.15.0. Upgrade the payout module, Shopify connector and Loop connector together after deploying all three code changes. No existing posted accounting is automatically changed.
+Deploy with Payment Payout Reconciliation 18.0.1.21.0 and Loop Returns 18.0.1.15.0. Upgrade the payout module, Shopify connector and Loop connector together after deploying all three code changes. No existing posted accounting is automatically changed.
 
 - Imported invoices retain source order dates when the workflow requests order dates; otherwise completed shipments use their latest successful source fulfillment date. Imported stock moves, move lines, deliveries and valuation journal entries retain their exact fulfillment dates. Missing/ambiguous source dates, locked periods and historical FIFO/average-cost automatic valuation require review. Existing historical misdated postings require controller-directed correction.
 - **Prepare Credit Repair** on an individual payout refund previews the successful source refund's invoice components. It prepares a new draft or corrects a selected unsettled, unlocked credit, retaining its prior details as an attachment. Review/post the draft, then use the existing credit-link and payout matching actions. Paid/allocated or hash-locked credits require separate review.
