@@ -1,0 +1,19 @@
+<odoo>
+    <record id="shopify_credit_repair_form" model="ir.ui.view">
+        <field name="name">shopify.credit.repair.ept.form</field><field name="model">shopify.credit.repair.ept</field>
+        <field name="arch" type="xml"><form string="Prepare Credit Repair">
+            <group readonly="state == 'done'"><field name="transaction_id"/><field name="credit_note_id" domain="[('move_type', '=', 'out_refund'), ('state', 'in', ['draft', 'posted'])]"/><field name="state" invisible="1"/></group>
+            <field name="preview_html" nolabel="1"/><footer>
+                <button name="action_preview" type="object" string="Preview Credit Components" invisible="state == 'done'"/>
+                <button name="action_apply" type="object" string="Prepare Reviewed Draft" class="btn-primary" invisible="state != 'preview'"/>
+                <button special="cancel" string="Close"/>
+            </footer></form></field>
+    </record>
+    <record id="shopify_payout_credit_repair_button" model="ir.ui.view">
+        <field name="name">shopify.payout.credit.repair.button</field><field name="model">shopify.payout.report.ept</field>
+        <field name="inherit_id" ref="shopify_payout_report_form_view"/>
+        <field name="arch" type="xml"><xpath expr="//field[@name='payout_transaction_ids']/list" position="inside">
+            <button name="action_prepare_credit_repair" type="object" string="Prepare Credit Repair" groups="account.group_account_manager" invisible="transaction_type not in ['refund', 'payment_refund'] or shop_cash_kind"/>
+        </xpath></field>
+    </record>
+</odoo>

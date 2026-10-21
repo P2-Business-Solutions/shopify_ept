@@ -11,3 +11,6 @@ from . import shopify_auth_ept
 from . import shopify_payment_repair
 from . import shopify_payout_repair
 from . import shopify_refund_credit_link
+from . import shopify_credit_repair
+
+from . import shopify_opening_evidence

@@ -24,6 +24,16 @@ class PayoutTestCase(TransactionCase):
     def setUpClass(cls):
         super().setUpClass()
         company = cls.env.company
+        # Integration runs may start before a localization chart is installed.
+        for kind, field_name, code in (
+                ('asset_receivable', 'property_account_receivable_id', 'SHTREC'),
+                ('liability_payable', 'property_account_payable_id', 'SHTPAY')):
+            account = cls.env['account.account'].search([
+                ('company_ids', 'in', company.ids), ('account_type', '=', kind)], limit=1)
+            if not account:
+                account = cls.env['account.account'].create(dict(name=kind, code=code,
+                    account_type=kind, reconcile=True, company_ids=[Command.set(company.ids)]))
+            cls.env['ir.default'].set('res.partner', field_name, account.id, company_id=company.id)
         accounts = cls.env['account.account'].create([
             {
                 'name': name,

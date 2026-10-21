@@ -1,0 +1,9 @@
+# Shopify payout repair update 18.0.3.52
+
+Deploy with Payment Payout Reconciliation 18.0.1.21.0 and Loop Returns 18.0.1.15.0. Upgrade the payout module, Shopify connector and Loop connector together after deploying all three code changes. No existing posted accounting is automatically changed.
+
+- Imported invoices retain source order dates when the workflow requests order dates; otherwise completed shipments use their latest successful source fulfillment date. Imported stock moves, move lines, deliveries and valuation journal entries retain their exact fulfillment dates. Missing/ambiguous source dates, locked periods and historical FIFO/average-cost automatic valuation require review. Existing historical misdated postings require controller-directed correction.
+- **Prepare Credit Repair** on an individual payout refund previews the successful source refund's invoice components. It prepares a new draft or corrects a selected unsettled, unlocked credit, retaining its prior details as an attachment. Review/post the draft, then use the existing credit-link and payout matching actions. Paid/allocated or hash-locked credits require separate review.
+- **Import A2000 Opening Evidence** in Bulk Repair attaches verified PAID invoice/credit-memo allocations to exact cash transactions. It retains the export file, checksum and reviewer, and exposes its evidence in the case and accounting audit. It does not query A2000 from the Odoo server or post cash during import. A2000 MCP can prepare the export outside Odoo.
+
+The full CSV schema, upgrade sequence and related PayPal/Authorize/Loop procedures are in the payout repository's [repair upgrade instructions](https://github.com/P2-Business-Solutions/odoo-payment-reconciliation-app/blob/main/docs/repair-upgrade.md). Tango capture updates follow the module upgrades and live validation.
