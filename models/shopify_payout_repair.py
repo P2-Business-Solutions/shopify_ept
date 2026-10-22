@@ -169,7 +169,7 @@ class ShopifyPayoutRepairLine(models.Model):
         if not self.source_order_id or not self.source_order_transaction_id:
             raise UserError(_('The payout refund is missing its Shopify order or exact transaction ID. Reimport the payout to refresh its source links, then preview again.'))
         order = self._repair_order()
-        if order and order.invoice_ids.filtered(lambda move: move.state != 'cancel'):
+        if order and order.invoice_ids.filtered(lambda move: move.state != 'cancel')._shopify_cash_documents():
             raise UserError(_('This order has accounting documents. Use its normal payment-repair workflow.'))
         if not cutover:
             raise UserError(_('Select the fulfillment cutover date.'))
@@ -240,6 +240,7 @@ class ShopifyPayoutRepairLine(models.Model):
             ('shopify_instance_id', '=', instance.id), ('shopify_refund_id', '=', str(refund['id'])),
             ('move_type', '=', 'out_refund'), ('state', '!=', 'cancel'),
         ])
+        credits = credits._shopify_cash_documents()
         amount = sum(float(row['amount']) for row in refund_events)
         if len(credits) > 1:
             raise UserError(_('Several credit notes identify this Shopify refund. Review them before proceeding.'))

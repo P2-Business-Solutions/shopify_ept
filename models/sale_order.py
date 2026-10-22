@@ -3670,10 +3670,10 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                                                queue_line)
         # Check For Refunds created for order or not.
         refund_invoices = self.invoice_ids.filtered(
-            lambda x: x.move_type == "out_refund" and x.state == "posted")
+            lambda x: x.move_type == "out_refund" and x.state == "posted")._shopify_cash_documents()
         if not refund_invoices:
             # Creating Refunds for invoces of the cancel orders.When refund is not done
-            invoices = self.invoice_ids.filtered(lambda x: x.move_type == "out_invoice" and x.state == "posted")
+            invoices = self.invoice_ids.filtered(lambda x: x.move_type == "out_invoice" and x.state == "posted")._shopify_cash_documents()
             for invoice_id in invoices:
                 move_reversal = self.env["account.move.reversal"].with_context(
                     {"active_model": "account.move", "active_ids": invoice_id.ids},
@@ -3822,7 +3822,7 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
 					   "- Create and validate the invoice manually from the Sales Order.\n"
 					   "- Reprocess the queue.") % order_name
             return message
-        invoices = self.invoice_ids.filtered(lambda x: x.move_type == "out_invoice")
+        invoices = self.invoice_ids.filtered(lambda x: x.move_type == "out_invoice")._shopify_cash_documents()
         for invoice in invoices:
             if not invoice.state == "posted":
                 message = ("System tried to generate a refund, but the invoice for Order: %s is not in the Posted state.\n"
@@ -3830,7 +3830,7 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
 						   "- Create and validate the invoice manually from the Sales Order.\n"
 						   "- Reprocess the queue.") % order_name
                 return message
-        refund_invoices = self.invoice_ids.filtered(lambda x: x.move_type == "out_refund" and x.state == "posted")
+        refund_invoices = self.invoice_ids.filtered(lambda x: x.move_type == "out_refund" and x.state == "posted")._shopify_cash_documents()
         if refund_invoices:
             total_refund_amount = 0.0
             for refund_invoice in refund_invoices:
@@ -3840,7 +3840,7 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         for refund_data_line in refunds_data:
             if refund_data_line.get('refund_line_items') or refund_data_line.get('order_adjustments'):
                 existing_refund = account_move_obj.search([("shopify_refund_id", "=", refund_data_line.get('id')),
-                                                           ("shopify_instance_id", "=", self.shopify_instance_id.id)])
+                                                           ("shopify_instance_id", "=", self.shopify_instance_id.id)])._shopify_cash_documents()
                 if existing_refund:
                     continue
                 new_move, payment_id = self.with_context(

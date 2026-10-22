@@ -136,7 +136,7 @@ class SaleOrderPaymentSync(models.Model):
                 ('shopify_instance_id', '=', self.shopify_instance_id.id),
                 ('company_id', '=', self.company_id.id), ('shopify_refund_id', '=', str(refund.get('id'))),
                 ('move_type', '=', 'out_refund'), ('state', '!=', 'cancel'), ('id', 'not in', credits.ids),
-            ], limit=1)
+            ])._shopify_cash_documents()
             if unlinked:
                 raise UserError(_('An existing reviewed credit note identifies this refund but is not linked to this order. Review its identity and order link first.'))
             prepared.append({'values': self._shopify_credit_values(
@@ -338,7 +338,7 @@ class SaleOrderPaymentSync(models.Model):
         payload, transactions = source or self._shopify_cash_source()
         try:
             events = cash_events(transactions, self.shopify_order_id, self.currency_id.name)
-            documents = self.invoice_ids.filtered(lambda move: move.state != 'cancel')
+            documents = self.invoice_ids.filtered(lambda move: move.state != 'cancel')._shopify_cash_documents()
             # Applying a standalone credit reconciles receivables but does not add
             # sale-line links. Only an explicit order link makes it a candidate;
             # source refund identity is validated separately, never inferred.
@@ -346,6 +346,7 @@ class SaleOrderPaymentSync(models.Model):
                 ('move_type', '=', 'out_refund'), ('state', '!=', 'cancel'),
                 ('shopify_refund_order_id', '=', self.id),
             ])
+            referenced_credits = referenced_credits._shopify_cash_documents()
             standalone_credits = referenced_credits - documents
             documents |= referenced_credits
             if documents.filtered(lambda move: move.state != 'posted'):

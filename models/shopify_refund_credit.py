@@ -53,6 +53,10 @@ class ShopifyRefundCreditMove(models.Model):
 
     shopify_refund_reference_ids = fields.One2many('shopify.refund.reference.ept', 'credit_note_id', readonly=True)
 
+    def _shopify_cash_documents(self):
+        """Integrations exclude audited duplicate/correction pairs from cash repair."""
+        return self
+
     def _shopify_refund_ledger_fingerprint(self):
         self.ensure_one()
         # Residuals change as individual refunds settle; the posted ledger must not.
@@ -68,7 +72,7 @@ class ShopifyRefundCreditMove(models.Model):
             ('shopify_instance_id', '=', transaction.payout_id.instance_id.id),
             '|', ('shopify_source_order_id', '=', transaction.source_order_id),
             ('shopify_refund_order_id.shopify_order_id', '=', transaction.source_order_id),
-        ]) if transaction.source_order_id else self.browse()
+        ])._shopify_cash_documents() if transaction.source_order_id else self.browse()
 
     def _check_shopify_refund_credit_source(self, transaction, document):
         """Integration hook to validate a return's existing source identity."""
@@ -136,6 +140,8 @@ class ShopifyRefundCreditLine(models.Model):
         payout._check_payout_reimport_period()
         company, currency = instance.shopify_company_id, payout.currency_id
         credit.check_access('write')
+        if credit._shopify_cash_documents() != credit:
+            raise UserError(_('This document was neutralized through a reviewed duplicate-credit repair.'))
         if (len(credit) != 1 or credit.move_type != 'out_refund' or credit.state != 'posted'
                 or credit.company_id != company or credit.currency_id != currency):
             raise UserError(_('Select a posted customer credit note in the payout company and currency.'))
@@ -218,7 +224,7 @@ class ShopifyRefundCreditLine(models.Model):
             ('shopify_instance_id', '=', instance.id), ('shopify_refund_id', '=', str(document['id'])),
             ('move_type', '=', 'out_refund'), ('state', '!=', 'cancel'), ('id', '!=', credit.id),
         ])
-        if duplicates:
+        if duplicates._shopify_cash_documents():
             raise UserError(_('Another credit note already represents this Shopify refund.'))
         references = self.env['shopify.refund.reference.ept'].search([
             ('instance_id', '=', instance.id), ('transaction_id', 'in', [row['id'] for row in refunds])])
