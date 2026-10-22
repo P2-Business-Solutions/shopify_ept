@@ -74,6 +74,14 @@ class ShopifyRefundCreditMove(models.Model):
         """Integration hook to validate a return's existing source identity."""
         return True
 
+    def _shopify_refund_credit_document_ids(self, document):
+        """Integrations can prove per-document portions of a combined credit."""
+        return {str(document['id'])}
+
+    def _shopify_refund_credit_amount(self, document):
+        self.ensure_one()
+        return self.amount_total
+
 
 class ShopifyRefundCreditLine(models.Model):
     _inherit = 'shopify.payout.report.line.ept'
@@ -163,7 +171,7 @@ class ShopifyRefundCreditLine(models.Model):
                    for doc in payload.get('refunds', [])) != 1 for row in refunds):
             raise UserError(_('A refund transaction occurs in more than one source document.'))
         amount = sum(float(row['amount']) for row in refunds)
-        if currency.compare_amounts(credit.amount_total, amount):
+        if currency.compare_amounts(credit._shopify_refund_credit_amount(document), amount):
             raise UserError(_('The credit total must equal all successful cash refunds in this Shopify refund document.'))
         partner = credit.commercial_partner_id
         mappings = self.env['shopify.res.partner.ept'].search([
@@ -181,10 +189,11 @@ class ShopifyRefundCreditLine(models.Model):
             ]).commercial_partner_id if email else self.env['res.partner']
             if partners != partner:
                 raise UserError(_('The Shopify customer must identify this credit customer through a unique mapping or email.'))
+        document_ids = credit._shopify_refund_credit_document_ids(document)
         if ((credit.shopify_instance_id and credit.shopify_instance_id != instance)
                 or (credit.shopify_source_order_id and credit.shopify_source_order_id != self.source_order_id)
                 or (credit.shopify_refund_order_id and credit.shopify_refund_order_id != order)
-                or (credit.shopify_refund_id and credit.shopify_refund_id != str(document['id']))):
+                or (credit.shopify_refund_id and credit.shopify_refund_id not in document_ids)):
             raise UserError(_('The credit note already identifies a different Shopify source.'))
         source_orders = credit.invoice_line_ids.sale_line_ids.order_id | credit.reversed_entry_id.invoice_line_ids.sale_line_ids.order_id
         if source_orders.filtered(lambda so: so.shopify_instance_id != instance or so.shopify_order_id != self.source_order_id):
@@ -216,12 +225,12 @@ class ShopifyRefundCreditLine(models.Model):
         if references.filtered(lambda row: row.credit_note_id != credit):
             raise UserError(_('A source refund is already linked to another credit note.'))
         if credit.shopify_refund_reference_ids.filtered(
-                lambda row: row.instance_id != instance or row.refund_id != str(document['id'])):
+                lambda row: row.instance_id != instance or row.refund_id not in document_ids):
             raise UserError(_('This credit note is already assigned to another refund document.'))
         ar = credit.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')
         if len(ar.account_id) != 1 or not ar.account_id.reconcile or ar.account_id.deprecated:
             raise UserError(_('The credit needs one reconcilable customer receivable account.'))
-        self._check_refund_credit_allocations(credit, refunds)
+        self._check_refund_credit_allocations(credit, refunds + credit.shopify_refund_reference_ids.mapped('source'))
         return dict(kind='credit_link', line_id=self.id, source_order_id=self.source_order_id,
             source_name=payload.get('name') or self.source_order_id, refund_id=str(document['id']),
             credit_id=credit.id, amount=amount, events=refunds,
@@ -263,8 +272,9 @@ class ShopifyRefundCreditLine(models.Model):
             raise UserError(_('An accounting manager must review and describe this refund credit link.'))
         credit = self.env['account.move'].browse(plan['credit_id'])
         instance = self.payout_id.instance_id
+        document_ids = credit._shopify_refund_credit_document_ids({'id': plan['refund_id']})
         credit.write(dict(shopify_instance_id=instance.id, shopify_source_order_id=self.source_order_id,
-            shopify_refund_id=plan['refund_id'], is_refund_in_shopify=True,
+            shopify_refund_id=plan['refund_id'] if len(document_ids) == 1 else False, is_refund_in_shopify=True,
             shopify_refund_order_id=self._repair_order().id))
         references = self.env['shopify.refund.reference.ept']
         for event in plan['events']:
