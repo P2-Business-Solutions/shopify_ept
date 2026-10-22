@@ -410,7 +410,9 @@ class ShopifyPayoutRepairLine(models.Model):
         if not credit:
             credit = self.env['account.move'].with_company(company).with_context(
                 tracking_disable=True, mail_create_nosubscribe=True).create(plan['values'])
-        if currency.compare_amounts(credit.amount_total, plan['amount']):
+        allocated_amount = (credit._shopify_refund_credit_amount({'id': plan['refund_id']})
+                            if plan.get('refund_id') else credit.amount_total)
+        if currency.compare_amounts(allocated_amount, plan['amount']):
             raise UserError(_('The prepared credit total differs from Shopify.'))
         if plan['post'] and credit.state == 'draft':
             credit.action_post()
@@ -440,11 +442,15 @@ class ShopifyPayoutRepairLine(models.Model):
                         raise UserError(_('The refund payment did not post on its source date.'))
                 payments |= payment
             receivables = credit.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')
+            residual_before = credit.amount_residual
+            newly_allocated = sum(abs(line.amount_residual_currency if line.currency_id else line.amount_residual)
+                                  for payment in payments for line in payment._seek_for_lines()[1])
             for payment in payments:
                 receivables |= payment._seek_for_lines()[1]
             receivables.filtered(lambda line: not line.reconciled).reconcile()
-            if receivables.filtered(lambda line: not line.reconciled):
-                raise UserError(_('The refund credit and payments leave a customer balance.'))
+            if (any(not line.reconciled for payment in payments for line in payment._seek_for_lines()[1])
+                    or currency.compare_amounts(credit.amount_residual, residual_before - newly_allocated)):
+                raise UserError(_('The refund payments did not settle their exact allocated credit amount.'))
         self.env['shopify.payout.repair.audit.ept']._record_repair({
             'payout_ids': [Command.set((payouts or self.payout_id).ids)], 'company_id': company.id,
             'source_order_id': self.source_order_id, 'plan': plan,
