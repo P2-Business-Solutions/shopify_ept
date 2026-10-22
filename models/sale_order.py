@@ -35,6 +35,7 @@ from .shopify_order_utils import (
     get_shopify_line_discount_allocations,
     get_shopify_order_fiscal_position_vals,
     get_shopify_warehouse_hold_vals,
+    is_removed_order_line,
 )
 from .shopify_transaction_utils import find_transaction_id
 
@@ -449,12 +450,12 @@ class SaleOrder(models.Model):
         @author: Meera Sidapara on Date 16-June-2022.
         Task: 193010 - Shopify Multi currency changes
         """
-        if float(price_set['shop_money']['amount']) > 0.0 and price_set['shop_money'][
-            'currency_code'] == order_response.get('presentment_currency'):
-            price = price_set['shop_money']['amount']
-        elif float(price_set['presentment_money']['amount']) > 0.0 and price_set['presentment_money'][
-            'currency_code'] == order_response.get('presentment_currency'):
-            price = price_set['presentment_money']['amount']
+        for money_type in ('shop_money', 'presentment_money'):
+            money = (price_set or {}).get(money_type) or {}
+            if (money.get('currency_code') == order_response.get('presentment_currency')
+                    and money.get('amount') is not None):
+                price = money['amount']
+                break
         return float(price)
 
     def create_shopify_duties_lines(self, duties_line, order_response, instance):
@@ -1348,7 +1349,7 @@ class SaleOrder(models.Model):
         if self._shopify_skip_exact_tax_line(instance, order_response):
             return False
         tax_amount = self._get_shopify_order_tax_amount(instance, order_response)
-        if float_is_zero(tax_amount, precision_digits=2):
+        if tax_amount is None or self.currency_id.is_zero(tax_amount):
             _logger.info("Skipping Shopify exact tax line for Odoo order(%s) and Shopify order(%s): total tax is zero.",
                          self.name, order_response.get("order_number"))
             return False
@@ -1371,12 +1372,25 @@ class SaleOrder(models.Model):
         return order_line
 
     def _get_shopify_order_tax_amount(self, instance, order_response):
-        """Return the Shopify total tax in the currency used for the imported order."""
-        tax_amount = order_response.get("total_tax") or 0.0
-        if instance.order_visible_currency and order_response.get("total_tax_set"):
-            tax_amount = self.get_price_based_on_customer_visible_currency(
-                order_response.get("total_tax_set"), order_response, tax_amount)
-        return float(tax_amount or 0.0)
+        """Prefer tax after edits/removals; omitted totals are not a zero tax."""
+        if is_cash_only_shopify_order(order_response):
+            # Cash-only imports retain the original items for refund evidence.
+            return self._get_shopify_order_amount(instance, order_response, "total_tax")
+        tax_amount = self._get_shopify_order_amount(instance, order_response, "current_total_tax")
+        if tax_amount is None:
+            tax_amount = self._get_shopify_order_amount(instance, order_response, "total_tax")
+        return tax_amount
+
+    def _get_shopify_order_amount(self, instance, order_response, field_name):
+        """Read an explicitly supplied amount in the imported order's currency."""
+        money_set = order_response.get("%s_set" % field_name) or {}
+        amount = order_response.get(field_name)
+        if amount is None:
+            amount = (money_set.get("shop_money") or {}).get("amount")
+        if instance.order_visible_currency and money_set:
+            amount = self.get_price_based_on_customer_visible_currency(
+                money_set, order_response, amount or 0.0)
+        return float(amount) if amount is not None else None
 
     def _shopify_apply_external_order_adjustments(self, instance, order_response):
         """Extension hook for a payment source outside Shopify.
@@ -1424,43 +1438,37 @@ class SaleOrder(models.Model):
             return False
 
         tax_amount = self._get_shopify_order_tax_amount(instance, order_response)
+        if tax_amount is None:
+            return False
         adjustment_id = "shopify-tax-adjustment"
         tax_lines = self.order_line.filtered(
             lambda line: line.product_id == tax_product
         )
-        adjustment_line = tax_lines.filtered(
-            lambda line: line.shopify_line_id == adjustment_id
-        )[:1]
-        tax_line = (tax_lines - adjustment_line)[:1]
-        if not tax_line:
+        if not tax_lines:
             return bool(self.create_shopify_tax_line(order_response, instance))
 
-        if float_compare(tax_line.price_unit, tax_amount, precision_digits=2) == 0:
-            if adjustment_line and not float_is_zero(
-                    adjustment_line.price_unit, precision_digits=2):
-                adjustment_line.price_unit = 0.0
-                return True
+        # Include every base/adjustment line and its quantity. Earlier updates
+        # may have left duplicates; comparing only the first line hides them.
+        difference = tax_amount - sum(tax_lines.mapped("price_subtotal"))
+        if self.currency_id.is_zero(difference):
             return False
 
-        if float_is_zero(tax_line.qty_invoiced, precision_digits=2):
-            tax_line.price_unit = tax_amount
-            if adjustment_line:
-                adjustment_line.price_unit = 0.0
+        mutable_lines = tax_lines.filtered(lambda line: not line.qty_invoiced)
+        tax_line = (mutable_lines.filtered(
+            lambda line: line.shopify_line_id == adjustment_id
+        ) or mutable_lines)[:1]
+        if tax_line:
+            tax_line.write({
+                "price_unit": tax_line.price_subtotal + difference,
+                "product_uom_qty": 1, "discount": 0, "tax_id": [(5, 0, 0)],
+            })
             return True
 
-        adjustment_amount = tax_amount - tax_line.price_unit
-        if adjustment_line:
-            if float_compare(
-                    adjustment_line.price_unit, adjustment_amount, precision_digits=2) != 0:
-                adjustment_line.price_unit = adjustment_amount
-                return True
-            return False
-        if float_is_zero(adjustment_amount, precision_digits=2):
-            return False
-
+        # Preserve invoiced sale lines as well as posted invoice values. A new
+        # delta remains invoiceable even after an earlier delta was invoiced.
         line_vals = self.prepare_vals_for_sale_order_line(
             tax_product, _("%s - adjustment") % tax_product.name,
-            adjustment_amount, 1
+            difference, 1
         )
         line_vals.update({
             "name": _("%s - adjustment") % tax_product.name,
@@ -2870,8 +2878,10 @@ class SaleOrder(models.Model):
                     order._shopify_resolve_shipping_lines(order_data, instance)
                 previous_external_error = order._shopify_external_order_error()
                 order_with_transactions = order.with_context(
-                    shopify_order_transactions=order_data.get("transaction", [])
+                    shopify_order_transactions=order_data.get("transaction", []),
+                    shopify_defer_order_update_invoice=True,
                 )
+                added_products = updated_quantities = False
                 order._sync_shopify_discount_data(order_data)
                 if instance.is_delivery_multi_warehouse and order.state in ("draft", "sent"):
                     pos_order = order_data.get("source_name", "") == "pos"
@@ -2887,16 +2897,22 @@ class SaleOrder(models.Model):
 
                 if (instance.add_new_product_order_webhook or is_manual_update) and \
                         order_data.get('fulfillment_status') != 'fulfilled':
-                    need_to_done_queue = False
-                    order_with_transactions.add_new_product_in_order_webhook_ept(instance, queue_line, order_data)
+                    added_products = order_with_transactions.add_new_product_in_order_webhook_ept(
+                        instance, queue_line, order_data)
+                    if queue_line.state == 'failed':
+                        continue
 
                 if (instance.update_qty_order_webhook or is_manual_update) and \
-                        order_data.get('fulfillment_status') not in ['fulfilled', 'partial']:
-                    need_to_done_queue = False
-                    order_with_transactions.update_qty_in_order_webhook_ept(instance, queue_line, order_data)
+                        order_data.get('fulfillment_status') != 'fulfilled':
+                    updated_quantities = order_with_transactions.update_qty_in_order_webhook_ept(
+                        instance, queue_line, order_data)
+                    if queue_line.state == 'failed':
+                        continue
 
                 if is_manual_update:
                     order_with_transactions.update_shopify_shipping_lines_ept(instance, order_data)
+                updated_discounts = order_with_transactions.update_discount_price_in_order_line_webhook(
+                    order_with_transactions._get_shopify_order_discount_data(order_data), order_data)
                 # External payment attributes can arrive on a normal order
                 # update, before the connector resumes the invoice workflow.
                 if not order_data.get('cancel_reason'):
@@ -2905,8 +2921,18 @@ class SaleOrder(models.Model):
                         continue
                     if previous_external_error and queue_line.state == "failed":
                         queue_line.state = "draft"
-                if is_manual_update:
-                    order_with_transactions.update_shopify_tax_line_ept(instance, order_data)
+                updated_tax = order_with_transactions.update_shopify_tax_line_ept(instance, order_data)
+                workflow = order.auto_workflow_process_id
+                if (queue_line.state != "failed" and workflow
+                        and shopify_status not in ('refunded', 'partially_refunded')
+                        and (added_products or updated_discounts or updated_tax
+                             or (updated_quantities and instance.update_qty_to_invoice_order_webhook))):
+                    order_lines = order.order_line.filtered(lambda line: line.product_id.invoice_policy == 'order')
+                    if (order_lines.filtered(lambda line: line.product_id.type == 'consu' and line.product_id.is_storable)
+                            or len(order.order_line) == len(order_lines.filtered(
+                                lambda line: line.product_id.type in ['service', 'consu']
+                                and not line.product_id.is_storable))):
+                        order_with_transactions.webhook_call_auto_invoice_workflow(workflow)
 
                 pos_fulfillment = (order_data.get('source_name') == 'pos' and
                                    order_data.get('fulfillment_status') in ('fulfilled', 'partial'))
@@ -3217,6 +3243,8 @@ class SaleOrder(models.Model):
                 _logger.info("Creating order lines for Odoo order(%s) and Shopify order is (%s).", self.name,
                              order_number)
                 self.webhook_create_shopify_order_lines(new_line_data, order_response, instance)
+                if self.env.context.get('shopify_defer_order_update_invoice'):
+                    return True
                 work_flow_process_record = self.auto_workflow_process_id
                 if work_flow_process_record:
                     order_lines = self.mapped('order_line').filtered(lambda l: l.product_id.invoice_policy == 'order')
@@ -3226,6 +3254,8 @@ class SaleOrder(models.Model):
                         lambda l: l.product_id.type in ['service', 'consu'] and not l.product_id.is_storable)):
                         return True
                     self.webhook_call_auto_invoice_workflow(work_flow_process_record)
+                return True
+        return False
 
     def prepare_data_for_not_exist_product_in_order(self, order_data):
         """
@@ -3249,7 +3279,7 @@ class SaleOrder(models.Model):
             price = line.get("price")
             if instance.order_visible_currency:
                 price = self.get_price_based_on_customer_visible_currency(line.get("price_set"), order_response, price)
-            order_line = self.shopify_create_sale_order_line(line, product, line.get("quantity"),
+            order_line = self.shopify_create_sale_order_line(line, product, line.get("current_quantity", line.get("quantity")),
                                                              product.name, price,
                                                              order_response)
             if is_gift_card_line:
@@ -3360,15 +3390,14 @@ class SaleOrder(models.Model):
         existing_order_qty_data = self.prepare_existing_order_data_of_qty(response_data)
         data = []
         is_updated_qty = False
+        blocked_quantity_update = False
         for shopify_line_id in shopify_line_ids:
             r_qty = response_data.get(shopify_line_id)
             e_o_qty = existing_order_qty_data.get(shopify_line_id) or 0.0
             if not e_o_qty and r_qty == e_o_qty:
-                queue_line.write({'state': 'done', 'processed_at': datetime.now()})
                 continue
             effective_qty = r_qty - e_o_qty
             if effective_qty == 0:
-                queue_line.write({'state': 'done', 'processed_at': datetime.now()})
                 continue
             order_line = sale_line_obj.search([('order_id', '=', self.id), ('shopify_line_id', '=', shopify_line_id)],
                                               limit=1)
@@ -3378,6 +3407,7 @@ class SaleOrder(models.Model):
                     n_update_qty = n_update_qty * -1
                 delivered_qty = order_line.qty_delivered
                 if n_update_qty < delivered_qty:
+                    blocked_quantity_update = True
                     message = "The user manually adjusted the quantity in Shopify. However, it is not possible to automatically adjust the quantity in Odoo because the product %s has already been delivered in order  %s.\n \
 You can take the following actions manually:\n 1. Reserve Order: If the order has not been shipped to the customer from your warehouse yet, you can reserve the order line with same quantity.\n 3. Create Credit Note: If an invoice has already been created, you can generate a credit note accordingly for that quantity." % (
                         order_line.product_id.default_code, self.name)
@@ -3394,13 +3424,17 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                 total_qty = effective_qty + e_o_qty
                 data.append([1, order_line.id, {'product_uom_qty': total_qty}])
                 is_updated_qty = True
-        if is_updated_qty and discount_data:
-            discount_line_data = self.update_discount_price_in_order_line_webhook(discount_data, order_data)
+        if is_updated_qty:
+            self.write({'order_line': data})
+        queue_line.write({'state': 'failed' if blocked_quantity_update else 'done',
+                          'processed_at': datetime.now()})
+        if blocked_quantity_update or self.env.context.get('shopify_defer_order_update_invoice'):
+            return is_updated_qty
+        updated_discounts = self.update_discount_price_in_order_line_webhook(discount_data, order_data)
         work_flow_process_record = self.auto_workflow_process_id
-        if is_updated_qty and work_flow_process_record:
+        if (is_updated_qty or updated_discounts) and work_flow_process_record:
             queue_line.write({'state': 'done', 'processed_at': datetime.now()})
             order_lines = self.mapped('order_line').filtered(lambda l: l.product_id.invoice_policy == 'order')
-            self.write({'order_line': data})
             if not order_lines.filtered(
                     lambda l: l.product_id.type == 'consu' and l.product_id.is_storable) and len(
                 self.order_line) != len(order_lines.filtered(
@@ -3408,6 +3442,7 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
                 return True
             if instance.update_qty_to_invoice_order_webhook:
                 self.webhook_call_auto_invoice_workflow(work_flow_process_record)
+        return is_updated_qty or updated_discounts
 
     def webhook_call_auto_invoice_workflow(self, work_flow_process_record):
         """
@@ -3430,56 +3465,103 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
             if work_flow_process_record.register_payment:
                 self.paid_invoice_ept(invoices)
 
-    def update_discount_price_in_order_line_webhook(self, discount_data, order_response):
-        """
-        Zeros out the existing discount line's quantity and creates a new, financially
-        accurate discount line using the existing helper method, ONLY IF the new
-        total discount amount is greater than the current total discount.
+    def _get_shopify_order_discount_data(self, order_response):
+        """Keep explicit zero allocations and clear removed product/shipping lines.
 
-        :param discount_data: Dict {discount_line_id_key: new_total_discount_amount}
-        :param order_response: Dictionary containing the Shopify order response data.
-        :returns: boolean indicating if any discount line was updated/created.
+        Shopify can retain historical allocations on removed items. Missing
+        allocations on a partial payload do not erase previously imported data.
+        """
+        discount_data = {}
+        for line in ((order_response.get('line_items') or [])
+                     + (order_response.get('shipping_lines') or [])):
+            if line.get('id') is None:
+                continue
+            if is_removed_order_line(line) or line.get('is_removed'):
+                amount = 0.0
+            elif 'discount_allocations' in line:
+                amount = self._get_shopify_discount_allocation_amount(
+                    self.shopify_instance_id, line, order_response)
+            else:
+                continue
+            discount_data['discount_%s' % line['id']] = amount
+        return discount_data
+
+    def update_discount_price_in_order_line_webhook(self, discount_data, order_response):
+        """Replace changed discounts, including decreases and removals, once.
+
+        Zero the old sale lines so Odoo retains their invoice links. Reconcile
+        the net amount of all linked lines, rather than the first unit price.
         """
         instance = self.shopify_instance_id
         is_updated = False
-
-        existing_discount_lines = self.order_line.filtered(lambda ol: ol.shopify_related_line_id)
+        adjustment_key = 'discount_order_adjustment'
+        existing_discount_lines = self.order_line.filtered(
+            lambda line: (line.shopify_related_line_id or '').startswith('discount_'))
         original_order_lines = self.order_line - existing_discount_lines
+        response_lines = {
+            str(line['id']): line
+            for line in ((order_response.get('line_items') or [])
+                         + (order_response.get('shipping_lines') or []))
+            if line.get('id') is not None
+        }
+        current_order_discount = self._get_shopify_order_amount(
+            instance, order_response, 'current_total_discounts')
+        discount_data = dict(discount_data)
+        if current_order_discount is not None and self.currency_id.is_zero(current_order_discount):
+            # The explicit order total also clears discounts when a webhook
+            # omits the old line or its allocations entirely.
+            discount_data.update({line.shopify_related_line_id: 0.0 for line in existing_discount_lines})
+            discount_data = {key: 0.0 for key in discount_data}
 
         for shopify_line_id_key, new_total_discount_amount in discount_data.items():
-            original_shopify_id = shopify_line_id_key.replace('discount_', '')
-            discount_line_to_zero = existing_discount_lines.filtered(
-                lambda ol: ol.shopify_related_line_id == shopify_line_id_key and not float_is_zero(ol.product_uom_qty,
-                                                                                                   precision_digits=4)
-            )
-            original_line = original_order_lines.filtered(
-                lambda ol: ol.shopify_line_id == original_shopify_id
-            )
-            if not discount_line_to_zero or not original_line:
+            if shopify_line_id_key == adjustment_key:
                 continue
-            discount_line_record = discount_line_to_zero[0]
-            original_product_line_record = original_line[0]  # The line used for 'previous_line' context
-            current_total_discount = abs(discount_line_record.price_unit)
-            if float_compare(new_total_discount_amount, current_total_discount, precision_digits=4) == 1:
-                _logger.info(
-                    "Discount increased detected for Shopify line ID %s. Zeroing out old line and creating new for order %s.",
-                    original_shopify_id, self.name)
-                if discount_line_record.product_uom_qty > 0:
-                    discount_line_record.write({'product_uom_qty': 0.0})
-                # Look up discount code from the original line item in the response
-                line_discount_code = False
-                for resp_line in order_response.get('line_items', []):
-                    if str(resp_line.get('id')) == original_shopify_id:
-                        line_discount_code = self._get_discount_code_for_line(resp_line, order_response)
-                        break
-                discount_config = self._get_discount_code_config(instance, line_discount_code)
-                self._create_discount_or_gift_card_line(
-                    instance, discount_config, line_discount_code,
-                    original_product_line_record.product_id.name,
-                    new_total_discount_amount, order_response,
-                    previous_line=original_product_line_record)
+            original_shopify_id = shopify_line_id_key[len('discount_'):]
+            discount_lines = existing_discount_lines.filtered(
+                lambda line: line.shopify_related_line_id == shopify_line_id_key)
+            original_line = original_order_lines.filtered(
+                lambda line: line.shopify_line_id == original_shopify_id)[:1]
+            current_total_discount = -sum(discount_lines.mapped('price_subtotal'))
+            if not self.currency_id.is_zero(new_total_discount_amount - current_total_discount):
+                if not original_line and not self.currency_id.is_zero(new_total_discount_amount):
+                    continue
+                discount_lines.filtered(lambda line: line.product_uom_qty).write({'product_uom_qty': 0.0})
+                if not self.currency_id.is_zero(new_total_discount_amount):
+                    source_line = response_lines.get(original_shopify_id, {})
+                    line_discount_code = self._get_discount_code_for_line(source_line, order_response)
+                    discount_config = self._get_discount_code_config(instance, line_discount_code)
+                    self._create_discount_or_gift_card_line(
+                        instance, discount_config, line_discount_code,
+                        original_line.product_id.name, new_total_discount_amount,
+                        order_response, previous_line=original_line)
                 is_updated = True
-            # If the discount decreased/removed, the update is skipped.
+            if original_line and original_shopify_id in response_lines:
+                line_discount_code = self._get_discount_code_for_line(
+                    response_lines[original_shopify_id], order_response)
+                line_total = original_line.price_unit * original_line.product_uom_qty
+                free_product_code = (line_discount_code if line_total > 0 and
+                                     self.currency_id.compare_amounts(new_total_discount_amount, line_total) >= 0
+                                     else False)
+                if original_line.shopify_discount_code != free_product_code:
+                    original_line.write({'shopify_discount_code': free_product_code})
+
+        if current_order_discount is not None:
+            # Historical allocations can survive partial removals and differ
+            # by a rounding cent. Shopify's current collected total wins.
+            discount_lines = self.order_line.filtered(
+                lambda line: (line.shopify_related_line_id or '').startswith('discount_'))
+            adjustments = discount_lines.filtered(
+                lambda line: line.shopify_related_line_id == adjustment_key)
+            other_lines = discount_lines - adjustments
+            required_adjustment = -current_order_discount - sum(other_lines.mapped('price_subtotal'))
+            if not self.currency_id.is_zero(required_adjustment - sum(adjustments.mapped('price_subtotal'))):
+                adjustments.filtered(lambda line: line.product_uom_qty).write({'product_uom_qty': 0.0})
+                if not self.currency_id.is_zero(required_adjustment):
+                    adjustment = self._create_discount_or_gift_card_line(
+                        instance, False, False, _('Shopify order adjustment'),
+                        -required_adjustment, order_response, previous_line=False)
+                    adjustment.write({'shopify_related_line_id': adjustment_key})
+                is_updated = True
         if is_updated:
             self._apply_discount_code_analytic_account(instance, order_response)
         return is_updated
@@ -3491,23 +3573,20 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         """
         response_data = {}
         shopify_line_ids = []
-        discount_data = {}
-        instance = self.shopify_instance_id
-        for line in order_data.get('line_items'):
+        discount_data = self._get_shopify_order_discount_data(order_data)
+        for line in order_data.get('line_items') or []:
             line_id = line.get('id')
             if order_data.get('financial_status') == "refunded":
                 qty = int(line.get('quantity'))
             else:
-                qty = int(line.get('fulfillable_quantity'))
+                # Fulfillable quantity excludes units already fulfilled. It is
+                # not the current ordered quantity after a Shopify edit.
+                qty = int(line.get('current_quantity', line.get('quantity')))
             if response_data.get(line_id):
                 qty = qty + response_data.get(line_id)
                 response_data.update({line_id: qty})
             else:
                 response_data.update({line_id: qty})
-            discount_amount = self._get_shopify_discount_allocation_amount(instance, line, order_data)
-            if discount_amount > 0.0:
-                discount_key = f"discount_{line_id}"
-                discount_data[discount_key] = discount_amount
             shopify_line_ids.append(line_id)
         response_data['discount_data'] = discount_data
         return response_data, shopify_line_ids
@@ -3519,6 +3598,10 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         """
         data = {}
         for line in self.order_line.filtered(lambda ol: ol.shopify_line_id):
+            # Tax/shipping adjustments have connector-owned, nonnumeric IDs.
+            # They must not be mistaken for Shopify product line items.
+            if not line.shopify_line_id.isdigit() or int(line.shopify_line_id) not in response_data:
+                continue
             line_id = int(line.shopify_line_id)
             qty = line.product_uom_qty
             if line.qty_delivered > 0:
@@ -3536,10 +3619,10 @@ You can take the following actions manually:\n 1. Reserve Order: If the order ha
         This method is use to get the discount allocation amount for the order line.
         """
         discount_amount = 0.0
-        for discount_allocation in line.get('discount_allocations', []):
+        for discount_allocation in line.get('discount_allocations') or []:
             if instance.order_visible_currency:
                 discount_total_price = self.get_price_based_on_customer_visible_currency(
-                    discount_allocation.get("amount_set"), order_data, 0)
+                    discount_allocation.get("amount_set"), order_data, discount_allocation.get("amount") or 0)
                 if discount_total_price:
                     discount_amount += float(discount_total_price)
             else:
