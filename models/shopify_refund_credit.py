@@ -82,6 +82,11 @@ class ShopifyRefundCreditMove(models.Model):
         """Integrations can prove per-document portions of a combined credit."""
         return {str(document['id'])}
 
+    def _shopify_refund_credit_accepts_document(self, document):
+        """Integrations can recognize their own legacy placeholder identity."""
+        self.ensure_one()
+        return not self.shopify_refund_id or self.shopify_refund_id in self._shopify_refund_credit_document_ids(document)
+
     def _shopify_refund_credit_amount(self, document):
         self.ensure_one()
         return self.amount_total
@@ -199,7 +204,7 @@ class ShopifyRefundCreditLine(models.Model):
         if ((credit.shopify_instance_id and credit.shopify_instance_id != instance)
                 or (credit.shopify_source_order_id and credit.shopify_source_order_id != self.source_order_id)
                 or (credit.shopify_refund_order_id and credit.shopify_refund_order_id != order)
-                or (credit.shopify_refund_id and credit.shopify_refund_id not in document_ids)):
+                or not credit._shopify_refund_credit_accepts_document(document)):
             raise UserError(_('The credit note already identifies a different Shopify source.'))
         source_orders = credit.invoice_line_ids.sale_line_ids.order_id | credit.reversed_entry_id.invoice_line_ids.sale_line_ids.order_id
         if source_orders.filtered(lambda so: so.shopify_instance_id != instance or so.shopify_order_id != self.source_order_id):
