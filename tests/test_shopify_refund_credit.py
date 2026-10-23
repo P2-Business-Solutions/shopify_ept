@@ -69,6 +69,12 @@ class TestShopifyRefundCredit(PayoutTestCase):
             self.assertEqual(len(credit.shopify_refund_reference_ids), 1)
             self.assertEqual(self.env['account.payment'].search_count([]), before_payments)
 
+    def test_unknown_credit_source_id_is_not_treated_as_a_legacy_alias(self):
+        payout, workspace, payload, events, credit, wizard = self._case()
+        credit.shopify_refund_id = 'another-refund'
+        with self.assertRaisesRegex(UserError, 'different Shopify source'):
+            payout.payout_transaction_ids._refund_credit_link_plan(credit, (payload, events))
+
     def test_customer_email_can_prove_existing_credit_without_shopify_mapping(self):
         payout, workspace, payload, events, credit, wizard = self._case()
         self.env['shopify.res.partner.ept'].search([('partner_id', '=', self.partner.id)]).unlink()
