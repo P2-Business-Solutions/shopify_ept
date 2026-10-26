@@ -175,11 +175,91 @@ class TestShopifyHistoricalCollection(PayoutTestCase):
     def test_identified_and_unidentified_existing_receipts_block_duplicate_clearing(self):
         for identified in (True, False):
             payout, wizard, payload, events = self._collection(str(identified))
-            self._payment(events[0], identified=identified)
+            payment = self._payment(events[0], identified=identified)
             with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
                 wizard.action_preview()
             self.assertEqual(wizard.line_ids.status, 'review')
             self.assertIn('payment may already record', wizard.line_ids.detail)
+            self.assertIn(payment.display_name, wizard.line_ids.detail)
+            self.assertIn(payload['name'], wizard.line_ids.detail)
+            self.assertIn(events[0]['id'], wizard.line_ids.detail)
+
+    def test_other_reconciled_capture_for_same_customer_amount_and_date_does_not_block(self):
+        payout, wizard, payload, events = self._collection()
+        other, _wizard, _payload, other_events = self._collection('other')
+        payment = self._payment(other_events[0])
+        payment.shopify_source_order_id = other_events[0]['order_id']
+        payment.action_post()
+        other.generate_bank_statement()
+        outstanding = payment.move_id.line_ids.filtered(lambda line: line.account_id == self.outstanding)
+        with self._matcher(other):
+            other.shopify_reconcile_bank_statement_line_ept(other.payout_statement_line_ids.id, outstanding.ids)
+        self.assertTrue(outstanding.reconciled)
+        self.assertTrue(other.payout_statement_line_ids.is_reconciled)
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+        self.assertEqual(wizard.line_ids.status, 'ready', wizard.line_ids.detail)
+        self.assertFalse(payout.repair_audit_ids)
+
+    def test_different_identified_capture_on_same_order_does_not_block(self):
+        payout, wizard, payload, events = self._collection()
+        payment = self._payment(dict(events[0], id='another-capture'))
+        payment.shopify_source_order_id = payload['id']
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+        self.assertEqual(wizard.line_ids.status, 'ready', wizard.line_ids.detail)
+
+    def test_exact_capture_still_blocks_when_customer_amount_or_date_differ(self):
+        payout, wizard, payload, events = self._collection()
+        payment = self._payment(events[0])
+        payment.write(dict(partner_id=self.env['res.partner'].create(dict(name='Other Customer')).id,
+                           amount=1, date=payout.payout_date + timedelta(days=1),
+                           shopify_source_order_id='conflicting-order'))
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+        self.assertEqual(wizard.line_ids.status, 'review')
+        self.assertIn('payment may already record', wizard.line_ids.detail)
+
+    def test_order_identity_without_capture_still_blocks_even_outside_fallback_dates(self):
+        for link in ('source', 'cash_order'):
+            payout, wizard, payload, events = self._collection(link)
+            payment = self._payment(events[0])
+            values = dict(shopify_order_transaction_id=False, date=payout.payout_date + timedelta(days=1))
+            if link == 'source':
+                values['shopify_source_order_id'] = payload['id']
+            else:
+                order = self.env['sale.order'].create(dict(name=payload['name'], partner_id=self.partner.id,
+                    shopify_instance_id=self.instance.id, shopify_order_id=payload['id']))
+                values['shopify_cash_order_id'] = order.id
+            payment.write(values)
+            # Exercise the payment guard without the earlier existing-order guard.
+            with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)), \
+                    patch.object(type(payout.payout_transaction_ids), '_repair_order', return_value=self.env['sale.order']):
+                wizard.action_preview()
+            self.assertEqual(wizard.line_ids.status, 'review')
+            self.assertIn('payment may already record', wizard.line_ids.detail)
+
+    def test_known_other_source_order_or_cash_order_does_not_block_legacy_fallback(self):
+        for link in ('source', 'cash_order'):
+            payout, wizard, payload, events = self._collection(link)
+            payment = self._payment(events[0], identified=False)
+            if link == 'source':
+                payment.shopify_source_order_id = 'another-source-order'
+            else:
+                order = self.env['sale.order'].create(dict(partner_id=self.partner.id,
+                    shopify_instance_id=self.instance.id, shopify_order_id='another-source-order'))
+                payment.shopify_cash_order_id = order
+            with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+                wizard.action_preview()
+            self.assertEqual(wizard.line_ids.status, 'ready', wizard.line_ids.detail)
+
+    def test_another_store_with_same_capture_id_does_not_block_fallback(self):
+        payout, wizard, payload, events = self._collection()
+        other_instance = self.instance.copy(dict(name='Another Store', shopify_host='another-test.example.com'))
+        self._payment(events[0]).shopify_instance_id = other_instance
+        with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+            wizard.action_preview()
+        self.assertEqual(wizard.line_ids.status, 'ready', wizard.line_ids.detail)
 
     def test_current_collection_and_current_fulfillment_are_not_historical_cash(self):
         for kind in ('collection', 'fulfillment'):

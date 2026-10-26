@@ -225,6 +225,20 @@ class TestShopifyOpeningRefund(PayoutTestCase):
             self.assertEqual(wizard.line_ids.status, 'review')
             self.assertFalse(payout.repair_audit_ids)
 
+    def test_other_identified_refund_with_same_customer_amount_and_date_does_not_block(self):
+        for same_order in (True, False):
+            payout, wizard, payload, events = self._refund(str(same_order))
+            self.env['account.payment'].create(dict(partner_id=self.partner.id, partner_type='customer',
+                payment_type='outbound', journal_id=self.journal.id,
+                payment_method_line_id=self.journal.outbound_payment_method_line_ids[:1].id,
+                amount=283.30, date=payout.payout_date, currency_id=payout.currency_id.id,
+                shopify_instance_id=self.instance.id, shopify_order_transaction_id='another-refund-' + str(same_order),
+                shopify_source_order_id=payload['id'] if same_order else 'another-order'))
+            with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):
+                wizard.action_preview()
+            self.assertEqual(wizard.line_ids.status, 'ready', wizard.line_ids.detail)
+            self.assertFalse(payout.repair_audit_ids)
+
     def test_changed_source_and_closed_payout_leave_refund_unposted(self):
         payout, wizard, payload, events = self._refund()
         with patch.object(type(payout.payout_transaction_ids), '_repair_source', return_value=(payload, events)):

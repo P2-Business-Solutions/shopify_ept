@@ -170,13 +170,19 @@ class ShopifyHistoricalCollectionLine(models.Model):
             ('shopify_instance_id', '=', instance.id), ('payment_type', '=', 'outbound' if refund else 'inbound'),
             ('state', 'not in', ('canceled', 'rejected')),
             *([('shopify_order_transaction_id', '=', event['id'])] if refund else [
-                '|', ('shopify_order_transaction_id', '=', event['id']), ('shopify_source_order_id', '=', self.source_order_id)]),
+                '|', ('shopify_order_transaction_id', '=', event['id']),
+                '&', ('shopify_order_transaction_id', '=', False),
+                '|', ('shopify_source_order_id', '=', self.source_order_id),
+                '&', ('shopify_cash_order_id.shopify_instance_id', '=', instance.id),
+                ('shopify_cash_order_id.shopify_order_id', '=', self.source_order_id)]),
         ])
         partners = self.env['shopify.res.partner.ept'].search([
             ('shopify_instance_id', '=', instance.id),
             ('shopify_customer_id', '=', str((payload.get('customer') or {}).get('id') or '')),
         ]).partner_id.commercial_partner_id
         if partners:
+            # Customer/amount/date are only a fallback for missing source identity.
+            # Another identified capture (even on the same order) is different cash.
             payments |= self.env['account.payment'].search([
                 ('company_id', '=', company.id), ('journal_id', '=', journal.id),
                 ('partner_id.commercial_partner_id', 'in', partners.ids), ('payment_type', '=', 'outbound' if refund else 'inbound'),
@@ -184,9 +190,23 @@ class ShopifyHistoricalCollectionLine(models.Model):
                 ('date', 'in', sorted({event['date'], str(source_date(event['timestamp'], timezone)),
                                       str(payout.payout_date)})),
                 ('state', 'not in', ('canceled', 'rejected')),
+                ('shopify_instance_id', 'in', [False, instance.id]),
+                ('shopify_order_transaction_id', 'in', [False, event['id']]),
+                ('shopify_source_order_id', 'in', [False, self.source_order_id]),
+                '|', ('shopify_cash_order_id', '=', False),
+                '&', ('shopify_cash_order_id.shopify_instance_id', '=', instance.id),
+                ('shopify_cash_order_id.shopify_order_id', '=', self.source_order_id),
             ])
         if payments:
-            raise UserError(_('An Odoo payment may already record this collection/refund. Verify its source reference and use payment matching instead of opening-balance clearing.'))
+            matches = []
+            for payment in payments:
+                matches.append(_('%(payment)s: Shopify order %(order)s; transaction %(transaction)s',
+                    payment=payment.display_name,
+                    order=payment.shopify_cash_order_id.display_name or payment.shopify_source_order_id or _('not recorded'),
+                    transaction=payment.shopify_order_transaction_id or _('not recorded')))
+            raise UserError(_('An Odoo payment may already record this collection/refund. Verify its source reference and use payment matching instead of opening-balance clearing.')
+                + '\n\n' + _('Expected Shopify order %(order)s / transaction %(transaction)s.\nMatching payments:\n%(payments)s',
+                             order=name, transaction=event['id'], payments='\n'.join(matches)))
         statements = payout.payout_statement_line_ids.filtered(lambda row: row.payout_line_id == self)
         if len(statements) > 1:
             raise UserError(_('The cash transaction has several bank statement lines. Review the duplicates.'))

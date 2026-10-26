@@ -1,4 +1,10 @@
-# Shopify payout repair update 18.0.3.53
+# Shopify payout repair update 18.0.3.57
+
+Opening-balance collection/refund previews now respect the existing payment's Shopify store, order and exact cash transaction identity. A different identified capture/refund no longer blocks another transaction solely because its customer, amount and date match. Same-order receipts without a transaction ID and unidentified same-customer/amount/date payments still require review. The warning lists the matching payments and the expected source order/transaction so accountants can inspect the actual evidence.
+
+Upgrade `shopify_ept` to 18.0.3.57, reopen the affected Bulk Repair workspace and use Preview / Refresh. Existing posted accounting is retained. This correction needs no changes to the payout or Loop modules.
+
+## Previous update: 18.0.3.53
 
 Opening-balance refunds with imported A2000 credit-memo allocations now validate and attach the same evidence during preview and apply. Previously the historical-refund preview omitted that evidence, so apply reported that source data or accounting had changed even when the reviewed allocation was unchanged. The saved case now shows its A2000 evidence and retains it in the clearing audit. Actual source changes and modified evidence files still stop accounting.
 

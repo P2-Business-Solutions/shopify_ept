@@ -411,6 +411,13 @@ Production was inspected without posting or matching those transactions.
 
 ## Historical collections settling after cutover
 
+The existing-payment check uses Shopify store, source order and exact cash
+transaction IDs. Identified payments for another capture/refund or another order
+do not block a transaction just because customer, amount and date match. A receipt
+linked to the same order without a transaction ID, or an unidentified payment
+matching the customer/amount/date, still requires review to avoid duplicate cash.
+The warning names matching payments and their recorded order/transaction IDs.
+
 In version **18.0.3.31**, a missing-order collection is checked against the exact
 successful Shopify Payments transaction and complete fulfillment before cutover.
 The collection must predate cutover in the selected business time zone and settle
