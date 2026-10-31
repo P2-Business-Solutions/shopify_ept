@@ -63,8 +63,11 @@ class ShopifyPayoutRepairLine(models.Model):
     def _repair_order(self):
         self.ensure_one()
         instance = self.payout_id.instance_id
+        from .shopify_repair_read import read_scope
+        scope = read_scope(self.env)
+        company_id = scope['company_id'] if scope else instance.shopify_company_id.id
         order = self.env['sale.order'].search([
-            ('shopify_instance_id', '=', instance.id), ('company_id', '=', instance.shopify_company_id.id),
+            ('shopify_instance_id', '=', instance.id), ('company_id', '=', company_id),
             ('shopify_order_id', '=', self.source_order_id),
         ], limit=2) if self.source_order_id else self.order_id
         if len(order) > 1 or (self.order_id and order != self.order_id):

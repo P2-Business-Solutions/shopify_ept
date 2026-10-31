@@ -2,6 +2,7 @@
 from odoo import api, Command, fields, models, _
 from odoo.exceptions import UserError
 from .shopify_payment_plan import cash_events, fingerprint
+from .shopify_repair_read_error import RepairEvidenceBlocked
 
 
 class ShopifyRefundReference(models.Model):
@@ -141,49 +142,57 @@ class ShopifyRefundCreditLine(models.Model):
 
     def _refund_credit_link_plan(self, credit, source=None):
         self.ensure_one()
-        payout, instance = self.payout_id, self.payout_id.instance_id
-        payout._check_payout_reimport_period()
-        company, currency = instance.shopify_company_id, payout.currency_id
+        self.payout_id._check_payout_reimport_period()
         credit.check_access('write')
+        return self._refund_credit_link_evidence_values(credit, source)
+
+    def _refund_credit_link_evidence_values(self, credit, source=None, scope_context=None):
+        """Shared complete predicate; the mutation adapter retains its write checks."""
+        self.ensure_one()
+        payout, instance = self.payout_id, self.payout_id.instance_id
+        company = (self.env['res.company'].browse(scope_context['company_id'])
+                   if scope_context else instance.shopify_company_id)
+        currency = payout.currency_id
+        credit.check_access('read')
         if credit._shopify_cash_documents() != credit:
-            raise UserError(_('This document was neutralized through a reviewed duplicate-credit repair.'))
+            raise RepairEvidenceBlocked('CREDIT_NEUTRALIZED', _('This document was neutralized through a reviewed duplicate-credit repair.'))
         if (len(credit) != 1 or credit.move_type != 'out_refund' or credit.state != 'posted'
                 or credit.company_id != company or credit.currency_id != currency):
-            raise UserError(_('Select a posted customer credit note in the payout company and currency.'))
+            raise RepairEvidenceBlocked('CREDIT_COMPANY_CURRENCY_STATE_MISMATCH', _('Select a posted customer credit note in the payout company and currency.'))
         if (self.shop_cash_kind or self.transaction_type not in ('refund', 'payment_refund')
                 or self.amount >= 0 or not self.source_order_id or not self.source_order_transaction_id):
-            raise UserError(_('The payout must identify an individual negative refund and its exact Shopify order transaction.'))
+            raise RepairEvidenceBlocked('SOURCE_REFUND_IDENTITY_INVALID', _('The payout must identify an individual negative refund and its exact Shopify order transaction.'))
         if company.with_context(ignore_exceptions=True)._get_violated_lock_dates(credit.date, True, credit.journal_id):
-            raise UserError(_('The credit note is in a closed accounting period.'))
+            raise RepairEvidenceBlocked('PERIOD_LOCKED', _('The credit note is in a closed accounting period.'))
         payload, transactions = source or self._repair_source()
         if str(payload.get('id')) != self.source_order_id:
-            raise UserError(_('The source order differs from the payout refund.'))
+            raise RepairEvidenceBlocked('SOURCE_ORDER_MISMATCH', _('The source order differs from the payout refund.'))
         try:
             events = cash_events(transactions, self.source_order_id, currency.name)
         except ValueError as error:
-            raise UserError(str(error)) from error
+            raise RepairEvidenceBlocked('SOURCE_CASH_INVALID', str(error)) from error
         event = next((row for row in events if row['id'] == self.source_order_transaction_id), None)
         if (not event or event['kind'] != 'refund' or event['gateway'] != 'shopify_payments'
                 or currency.compare_amounts(float(event['amount']), -self.amount)):
-            raise UserError(_('The payout does not match its exact successful Shopify Payments refund.'))
+            raise RepairEvidenceBlocked('SOURCE_REFUND_CASH_MISMATCH', _('The payout does not match its exact successful Shopify Payments refund.'))
         documents = [row for row in payload.get('refunds', [])
                      if event['id'] in {str(tx.get('id')) for tx in row.get('transactions', [])}]
         if len(documents) != 1 or not documents[0].get('id'):
-            raise UserError(_('The refund must identify exactly one Shopify refund document.'))
+            raise RepairEvidenceBlocked('SOURCE_REFUND_DOCUMENT_AMBIGUOUS', _('The refund must identify exactly one Shopify refund document.'))
         document = documents[0]
         credit._check_shopify_refund_credit_source(self, document)
         if ('payout_refund_reference_ids' in credit._fields and credit.payout_refund_reference_ids):
-            raise UserError(_('This credit already has another processor refund assignment. Review that settlement before linking Shopify cash.'))
+            raise RepairEvidenceBlocked('CREDIT_ALREADY_ASSIGNED', _('This credit already has another processor refund assignment. Review that settlement before linking Shopify cash.'))
         ids = {str(row.get('id')) for row in document.get('transactions', [])}
         refunds = [row for row in events if row['kind'] == 'refund' and row['id'] in ids]
         if any(row['gateway'] != 'shopify_payments' for row in refunds):
-            raise UserError(_('This refund document includes another processor; review its separate settlement.'))
+            raise RepairEvidenceBlocked('SOURCE_MULTI_PROCESSOR', _('This refund document includes another processor; review its separate settlement.'))
         if any(sum(row['id'] in {str(tx.get('id')) for tx in doc.get('transactions', [])}
                    for doc in payload.get('refunds', [])) != 1 for row in refunds):
-            raise UserError(_('A refund transaction occurs in more than one source document.'))
+            raise RepairEvidenceBlocked('SOURCE_TRANSACTION_DUPLICATE', _('A refund transaction occurs in more than one source document.'))
         amount = sum(float(row['amount']) for row in refunds)
         if currency.compare_amounts(credit._shopify_refund_credit_amount(document), amount):
-            raise UserError(_('The credit total must equal all successful cash refunds in this Shopify refund document.'))
+            raise RepairEvidenceBlocked('CREDIT_AMOUNT_MISMATCH', _('The credit total must equal all successful cash refunds in this Shopify refund document.'))
         partner = credit.commercial_partner_id
         mappings = self.env['shopify.res.partner.ept'].search([
             ('shopify_instance_id', '=', instance.id),
@@ -192,55 +201,55 @@ class ShopifyRefundCreditLine(models.Model):
         order = self._repair_order()
         if mappings or order:
             if (mappings and mappings != partner) or (order and order.partner_id.commercial_partner_id != partner):
-                raise UserError(_('The credit customer differs from the Shopify order/customer mapping.'))
+                raise RepairEvidenceBlocked('CUSTOMER_MAPPING_CONFLICT', _('The credit customer differs from the Shopify order/customer mapping.'))
         else:
             email = str((payload.get('customer') or {}).get('email') or payload.get('email') or '').strip()
             partners = self.env['res.partner'].search([
                 ('email', '=ilike', email), '|', ('company_id', '=', False), ('company_id', '=', company.id),
             ]).commercial_partner_id if email else self.env['res.partner']
             if partners != partner:
-                raise UserError(_('The Shopify customer must identify this credit customer through a unique mapping or email.'))
+                raise RepairEvidenceBlocked('CUSTOMER_IDENTITY_AMBIGUOUS', _('The Shopify customer must identify this credit customer through a unique mapping or email.'))
         document_ids = credit._shopify_refund_credit_document_ids(document)
         if ((credit.shopify_instance_id and credit.shopify_instance_id != instance)
                 or (credit.shopify_source_order_id and credit.shopify_source_order_id != self.source_order_id)
                 or (credit.shopify_refund_order_id and credit.shopify_refund_order_id != order)
                 or not credit._shopify_refund_credit_accepts_document(document)):
-            raise UserError(_('The credit note already identifies a different Shopify source.'))
+            raise RepairEvidenceBlocked('CREDIT_SOURCE_CONFLICT', _('The credit note already identifies a different Shopify source.'))
         source_orders = credit.invoice_line_ids.sale_line_ids.order_id | credit.reversed_entry_id.invoice_line_ids.sale_line_ids.order_id
         if source_orders.filtered(lambda so: so.shopify_instance_id != instance or so.shopify_order_id != self.source_order_id):
-            raise UserError(_('The credit or its original invoice belongs to another sales order.'))
+            raise RepairEvidenceBlocked('CREDIT_ORDER_CONFLICT', _('The credit or its original invoice belongs to another sales order.'))
         payout_rows = self.search([('payout_id.instance_id', '=', instance.id),
             ('source_order_transaction_id', 'in', [row['id'] for row in refunds]),
             ('transaction_type', 'in', ('refund', 'payment_refund'))])
         if any(len(payout_rows.filtered(lambda tx: tx.source_order_transaction_id == row['id'])) > 1 for row in refunds):
-            raise UserError(_('Several payout rows identify the same cash refund. Review their source identity before linking.'))
+            raise RepairEvidenceBlocked('PAYOUT_TRANSACTION_DUPLICATE', _('Several payout rows identify the same cash refund. Review their source identity before linking.'))
         clearing = self.env['account.move'].search([
             ('shopify_instance_id', '=', instance.id), ('state', '!=', 'cancel'),
             ('shopify_legacy_collection_transaction_id', 'in', [row['id'] for row in refunds]),
         ], limit=1)
         if clearing:
-            raise UserError(_('This refund already has opening-balance cash treatment. Review that entry before assigning a customer credit.'))
+            raise RepairEvidenceBlocked('OPENING_CASH_TREATMENT', _('This refund already has opening-balance cash treatment. Review that entry before assigning a customer credit.'))
         for transaction in payout_rows:
             settled = transaction.payout_id.payout_statement_line_ids.filtered(
                 lambda line: line.payout_line_id == transaction and line.is_reconciled)
             if settled and transaction._refund_credit_reference().credit_note_id != credit:
-                raise UserError(_('A payout refund is already reconciled without this reviewed credit link. Review its existing match first.'))
+                raise RepairEvidenceBlocked('STATEMENT_ALREADY_ALLOCATED', _('A payout refund is already reconciled without this reviewed credit link. Review its existing match first.'))
         duplicates = self.env['account.move'].search([
             ('shopify_instance_id', '=', instance.id), ('shopify_refund_id', '=', str(document['id'])),
             ('move_type', '=', 'out_refund'), ('state', '!=', 'cancel'), ('id', '!=', credit.id),
         ])
         if duplicates._shopify_cash_documents():
-            raise UserError(_('Another credit note already represents this Shopify refund.'))
+            raise RepairEvidenceBlocked('CREDIT_DUPLICATE', _('Another credit note already represents this Shopify refund.'))
         references = self.env['shopify.refund.reference.ept'].search([
             ('instance_id', '=', instance.id), ('transaction_id', 'in', [row['id'] for row in refunds])])
         if references.filtered(lambda row: row.credit_note_id != credit):
-            raise UserError(_('A source refund is already linked to another credit note.'))
+            raise RepairEvidenceBlocked('REFUND_ALREADY_ASSIGNED', _('A source refund is already linked to another credit note.'))
         if credit.shopify_refund_reference_ids.filtered(
                 lambda row: row.instance_id != instance or row.refund_id not in document_ids):
-            raise UserError(_('This credit note is already assigned to another refund document.'))
+            raise RepairEvidenceBlocked('CREDIT_ALREADY_ASSIGNED', _('This credit note is already assigned to another refund document.'))
         ar = credit.line_ids.filtered(lambda line: line.account_type == 'asset_receivable')
         if len(ar.account_id) != 1 or not ar.account_id.reconcile or ar.account_id.deprecated:
-            raise UserError(_('The credit needs one reconcilable customer receivable account.'))
+            raise RepairEvidenceBlocked('AR_ACCOUNT_UNSUPPORTED', _('The credit needs one reconcilable customer receivable account.'))
         self._check_refund_credit_allocations(credit, refunds + credit.shopify_refund_reference_ids.mapped('source'))
         return dict(kind='credit_link', line_id=self.id, source_order_id=self.source_order_id,
             source_name=payload.get('name') or self.source_order_id, refund_id=str(document['id']),
@@ -275,7 +284,7 @@ class ShopifyRefundCreditLine(models.Model):
                     allocated = (links.debit_move_id | links.credit_move_id).move_id - move
                     if allocated == credit and counterpart.account_id == ar.account_id:
                         continue
-            raise UserError(_('The credit is allocated to an unidentified payment, invoice or another statement. Review that allocation first.'))
+            raise RepairEvidenceBlocked('CREDIT_ALLOCATED_ELSEWHERE', _('The credit is allocated to an unidentified payment, invoice or another statement. Review that allocation first.'))
 
     def _register_refund_credit(self, plan, review_note):
         self.ensure_one()
