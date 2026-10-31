@@ -55,6 +55,7 @@ from . import sale_order_payment_sync
 from . import shopify_payout_repair
 from . import shopify_historical_collection
 from . import shopify_refund_credit
+from . import shopify_repair_read
 from . import shopify_source_dates
 
 from . import shopify_opening_evidence
