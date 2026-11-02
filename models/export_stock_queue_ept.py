@@ -52,13 +52,18 @@ class ShopifyExportStockQueueEpt(models.Model):
         @author: Nilam Kubavat @Emipro Technologies Pvt.Ltd on date 31-Aug-2022.
         Task Id : 199065
         """
-        for export_stock_queue in self:
-            queue_lines = export_stock_queue.export_stock_queue_line_ids
-            export_stock_queue.queue_line_total_records = len(queue_lines)
-            export_stock_queue.queue_line_draft_records = len(queue_lines.filtered(lambda x: x.state == "draft"))
-            export_stock_queue.queue_line_fail_records = len(queue_lines.filtered(lambda x: x.state == "failed"))
-            export_stock_queue.queue_line_done_records = len(queue_lines.filtered(lambda x: x.state == "done"))
-            export_stock_queue.queue_line_cancel_records = len(queue_lines.filtered(lambda x: x.state == "cancel"))
+        counts = {}
+        for queue, state, count in self.env["shopify.export.stock.queue.line.ept"]._read_group(
+                [("export_stock_queue_id", "in", self.ids)],
+                ["export_stock_queue_id", "state"], ["__count"]):
+            counts.setdefault(queue.id, {})[state] = count
+        for queue in self:
+            states = counts.get(queue.id, {})
+            queue.queue_line_total_records = sum(states.values())
+            queue.queue_line_draft_records = states.get("draft", 0)
+            queue.queue_line_fail_records = states.get("failed", 0)
+            queue.queue_line_done_records = states.get("done", 0)
+            queue.queue_line_cancel_records = states.get("cancel", 0)
 
     @api.depends("export_stock_queue_line_ids.state")
     def _compute_queue_state(self):
@@ -100,6 +105,7 @@ class ShopifyExportStockQueueEpt(models.Model):
         """
         if not export_stock_data:
             return self
+        self.env.cr.execute("SELECT pg_advisory_xact_lock(%s, %s)", (741913, instance.id))
 
         # Keep only the newest value for each product/location pair in this run.
         changes_by_key = {}
@@ -109,26 +115,20 @@ class ShopifyExportStockQueueEpt(models.Model):
 
         product_ids = list({key[0] for key in changes_by_key})
         location_ids = list({key[1] for key in changes_by_key})
-        state_records = self.env["shopify.inventory.export.state.ept"].sudo().search([
-            ("shopify_instance_id", "=", instance.id),
-            ("shopify_product_id", "in", product_ids),
-            ("location_id", "in", location_ids),
-        ])
-        states_by_key = {
-            (state.shopify_product_id.id, state.location_id): state
-            for state in state_records
-        }
         pending_lines = self.env["shopify.export.stock.queue.line.ept"].search([
             ("shopify_instance_id", "=", instance.id),
             ("shopify_product_id", "in", product_ids),
             ("location_id", "in", location_ids),
-            ("state", "=", "draft"),
-            ("export_stock_queue_id.is_process_queue", "=", False),
-        ])
-        pending_by_key = {
-            (line.shopify_product_id.id, line.location_id): line
-            for line in pending_lines
-        }
+            ("state", "in", ["draft", "failed"]),
+        ], order="id desc")
+        pending_lines.invalidate_recordset()
+        pending_by_key = {}
+        for line in pending_lines:
+            key = (line.shopify_product_id.id, line.location_id)
+            if key in pending_by_key:
+                line.write({"state": "cancel"})
+            else:
+                pending_by_key[key] = line
 
         affected_queues = self.browse()
         values_to_create = []
@@ -140,15 +140,17 @@ class ShopifyExportStockQueueEpt(models.Model):
                 pending_line.write({
                     "inventory_item_id": inventory_item_id,
                     "quantity": quantity,
+                    "state": "draft",
+                })
+                pending_line.export_stock_queue_id.write({
+                    "is_action_require": False, "queue_process_count": 0, "is_process_queue": False,
                 })
                 affected_queues |= pending_line.export_stock_queue_id
                 continue
 
-            previous_state = states_by_key.get(key)
-            if (not self.env.context.get("force_inventory_export")
-                    and previous_state and previous_state.quantity == quantity
-                    and previous_state.inventory_item_id == inventory_item_id):
-                continue
+            # Last exported stock is an audit, not a live Shopify quantity.
+            # Shopify orders can change it independently. Verify remotely in
+            # the processor before deciding that an unchanged value is a no-op.
 
             values_to_create.append({
                 "shopify_instance_id": instance.id,

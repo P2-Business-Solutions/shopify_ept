@@ -810,6 +810,34 @@ class ShopifyProductProductEpt(models.Model):
         return all_products
 
     @api.model
+    def _inventory_changed_product_ids(self, instance, since, cutoff):
+        """Include physical, reserved and planned stock changes for every stock field."""
+        self.env["stock.move"].flush_model(["product_id", "write_date", "state", "company_id"])
+        self.env["stock.quant"].flush_model(["product_id", "write_date", "company_id"])
+        self.env.cr.execute("""
+            SELECT product_id FROM stock_move
+            WHERE company_id = %s AND write_date >= %s AND write_date <= %s
+              AND state IN ('waiting', 'confirmed', 'partially_available', 'assigned', 'done', 'cancel')
+            UNION
+            SELECT product_id FROM stock_quant
+            WHERE company_id = %s AND write_date >= %s AND write_date <= %s
+        """, (instance.shopify_company_id.id, since, cutoff,
+              instance.shopify_company_id.id, since, cutoff))
+        changed = {row[0] for row in self.env.cr.fetchall()}
+        # A component change also changes its phantom kits, including nested kits.
+        pending = set(changed)
+        while pending and "mrp.bom.line" in self.env:
+            lines = self.env["mrp.bom.line"].search([
+                ("product_id", "in", list(pending)), ("bom_id.type", "=", "phantom"),
+                ("bom_id.company_id", "in", [False, instance.shopify_company_id.id]),
+            ])
+            parents = set()
+            for bom in lines.bom_id:
+                parents.update((bom.product_id or bom.product_tmpl_id.product_variant_ids).ids)
+            pending = parents - changed
+            changed.update(pending)
+        return list(changed)
+
     def export_stock_queue(self, instance, product_ids):
         """
         Find products with below condition
@@ -860,18 +888,11 @@ class ShopifyProductProductEpt(models.Model):
             return False
 
         export_stock_data = []
+        mapped_locations = location_ids.filtered("export_stock_warehouse_ids")
+        if not mapped_locations:
+            raise UserError(_("Map at least one Shopify location to its export warehouses before exporting inventory."))
         configuration_complete = True
-        for location_id in location_ids:
-            shopify_location_warehouse = location_id.export_stock_warehouse_ids or False
-            if not shopify_location_warehouse:
-                message = ("System tried to find the warehouse for Shopify location %s to export stock but it was not found.\n"
-							"Action Items:\n"
-							"- Verify the Shopify location under: Shopify → Configuration → Shopify Locations.\n"
-							"- Set the appropriate export stock warehouse mapping.") % location_id.name
-                self.shopify_create_log(instance, message, model)
-                configuration_complete = False
-                continue
-
+        for location_id in mapped_locations:
             odoo_product_ids = shopify_products.product_id.ids
             product_stock = self.check_stock(instance, odoo_product_ids, product_obj,
                                              location_id.export_stock_warehouse_ids)
@@ -883,6 +904,7 @@ class ShopifyProductProductEpt(models.Model):
                                   "%s with name %s for instance %s while Export stock" % (
                                       shopify_product.id, shopify_product.name, instance.name)
                         self.shopify_create_log(instance, message, model)
+                        configuration_complete = False
                         continue
                     if not shopify_product.fixed_stock_export:
                         quantity = self.compute_qty_for_export_stock(product_stock, shopify_product, odoo_product)
@@ -953,19 +975,21 @@ class ShopifyProductProductEpt(models.Model):
         :param warehouse:This arguments relocates warehouse of shopify export location.
         :return: This Method return product listing stock.
         """
-        product_stock = {}
-
-        if product_ids:
-            if instance.shopify_stock_field.name == "free_qty":
-                product_stock = prod_obj.get_free_qty_ept(warehouse, product_ids)
-
-            elif instance.shopify_stock_field.name == "virtual_available":
-                product_stock = prod_obj.get_forecasted_qty_ept(warehouse, product_ids)
-
-            elif instance.shopify_stock_field.name == "qty_available":
-                product_stock = prod_obj.get_onhand_qty_ept(warehouse, product_ids)
-
-        return product_stock
+        quantity_field = instance.shopify_stock_field.name
+        if quantity_field not in ("free_qty", "virtual_available", "qty_available"):
+            raise UserError(_("Select a valid Stock Field before exporting Shopify inventory."))
+        if not warehouse or any(item.company_id != instance.shopify_company_id for item in warehouse):
+            raise UserError(_("Export warehouses must belong to the Shopify instance company."))
+        products = prod_obj.with_company(instance.shopify_company_id).with_context(
+            location=warehouse.lot_stock_id.ids,
+            compute_child=True,
+            from_date=False,
+            to_date=False,
+        ).browse(product_ids)
+        # Native Odoo contexts include stock at each root and in its bins,
+        # and preserve the selected quantity field's reservation/kit semantics.
+        products.invalidate_recordset([quantity_field])
+        return {product.id: product[quantity_field] for product in products}
 
     def import_shopify_stock(self, instance, validate_inventory):
         """

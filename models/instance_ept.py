@@ -959,6 +959,12 @@ class ShopifyInstanceEpt(models.Model):
         view = self.env.ref('shopify_ept.action_shopify_common_log_line_ept').sudo().read()[0]
         return self.prepare_action(view, [('shopify_instance_id', '=', record_id)])
 
+    def write(self, values):
+        if "shopify_stock_field" in values and any(
+                record.shopify_stock_field.id != values["shopify_stock_field"] for record in self):
+            values = dict(values, shopify_last_date_update_stock=False)
+        return super().write(values)
+
     @api.model_create_multi
     def create(self, vals):
         """

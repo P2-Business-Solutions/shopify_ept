@@ -41,18 +41,37 @@ class ShopifyLocationEpt(models.Model):
     )
     active = fields.Boolean(default=True)
 
-    @api.constrains('export_stock_warehouse_ids')
+    @api.model_create_multi
+    def create(self, values_list):
+        records = super().create(values_list)
+        records.filtered('export_stock_warehouse_ids').instance_id.write({'shopify_last_date_update_stock': False})
+        return records
+
+    def write(self, values):
+        refresh = bool({"export_stock_warehouse_ids", "active"} & values.keys())
+        before = {record.id: (record.active, set(record.export_stock_warehouse_ids.ids)) for record in self} if refresh else {}
+        result = super().write(values)
+        if refresh:
+            changed = self.filtered(lambda record:
+                before[record.id] != (record.active, set(record.export_stock_warehouse_ids.ids)))
+            changed.instance_id.write({"shopify_last_date_update_stock": False})
+        return result
+
+    @api.constrains('export_stock_warehouse_ids', 'instance_id', 'active')
     def _check_locations_warehouse_ids(self):
         """Not allow to set warehouse in export warehouses in the Shopify location,
            if warehouse already set in a different location with the same instance.
            @author: Angel Patel @Emipro Technologies Pvt. Ltd on date 07/11/2019.
            :Task ID: 157407
         """
-        location_instance = self.instance_id
-        location_warehouse = self.export_stock_warehouse_ids
-        locations = self.search([('instance_id', '=', location_instance.id), ('id', '!=', self.id)])
-        for location in locations:
-            if any([location in location_warehouse.ids for location in location.export_stock_warehouse_ids.ids]):
+        for record in self:
+            if not record.active:
+                continue
+            warehouses = record.export_stock_warehouse_ids
+            if any(warehouse.company_id != record.instance_id.shopify_company_id for warehouse in warehouses):
+                raise ValidationError(_("Export warehouses must belong to the Shopify instance company."))
+            locations = self.search([('instance_id', '=', record.instance_id.id), ('id', '!=', record.id)])
+            if any(warehouses & location.export_stock_warehouse_ids for location in locations):
                 raise ValidationError(_("Can't set this warehouse in different locations with same instance."))
 
     @api.model

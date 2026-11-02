@@ -561,10 +561,13 @@ class ShopifyProcessImportExport(models.TransientModel):
             _logger.info("Exporting Stock by Cron for instance - %s", instance.name)
 
         export_cutoff = fields.Datetime.now()
-        products = product_obj.get_products_based_on_movement_date_ept(
-            last_update_date,
-            instance.shopify_company_id,
-        )
+        if not instance.shopify_last_date_update_stock and not self.export_stock_from:
+            products = shopify_product_obj.search([
+                ('shopify_instance_id', '=', instance.id), ('exported_in_shopify', '=', True),
+                ('inventory_management', '=', 'shopify'),
+            ]).product_id.ids
+        else:
+            products = shopify_product_obj._inventory_changed_product_ids(instance, last_update_date, export_cutoff)
 
         # find shopify product which has Fixed Stock Export boolean is true
         fixed_stock_products = self.search_product_for_fixed_stock_export(instance)
