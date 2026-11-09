@@ -90,6 +90,9 @@ class ShopifySourceDateMove(models.Model):
 
     def _action_done(self, cancel_backorder=False):
         dated = [(move, move._shopify_import_date()) for move in self]
+        pos_picking_id = self.env.context.get('_shopify_pos_completion_picking_id')
+        if len(self) > 1 and pos_picking_id and pos_picking_id in self.picking_id.ids:
+            return self._action_done_dated_pos_delivery(pos_picking_id, dated, cancel_backorder)
         if not any(date for _move, date in dated):
             return super()._action_done(cancel_backorder=cancel_backorder)
         result = self.env['stock.move']
@@ -110,6 +113,26 @@ class ShopifySourceDateMove(models.Model):
                         raise UserError(_('The valuation entry did not retain its source fulfillment date.'))
                 result |= done
         return result
+
+    def _action_done_dated_pos_delivery(self, picking_id, dated, cancel_backorder):
+        """Let core validate the entire POS delivery before it considers a backorder."""
+        payload = self.env.context.get('shopify_order_response') or {}
+        dates = {source_date for _move, source_date in dated}
+        if (payload.get('source_name') != 'pos' or any(move.picking_id.id != picking_id for move in self)
+                or len(dates) != 1 or False in dates):
+            raise UserError(_('A POS delivery must match one dated Shopify fulfillment before completing stock.'))
+        stamp, date = dates.pop()
+        with self.env.cr.savepoint():
+            self.write({'shopify_source_done_at': stamp, 'shopify_source_accounting_date': date})
+            target = self.with_context(force_period_date=date)
+            done = super(ShopifySourceDateMove, target)._action_done(cancel_backorder=cancel_backorder)
+            if done != self or any(move.state != 'done' for move in done):
+                raise UserError(_('Odoo did not complete every move on the Shopify POS fulfillment.'))
+            done.write({'date': stamp})
+            done.move_line_ids.write({'date': stamp})
+            if done.stock_valuation_layer_ids.account_move_id.filtered(lambda entry: entry.date != date):
+                raise UserError(_('The valuation entry did not retain its source fulfillment date.'))
+        return done
 
 
 class ShopifySourceDatePicking(models.Model):

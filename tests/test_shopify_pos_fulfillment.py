@@ -107,15 +107,43 @@ class TestShopifyPosFulfillment(PayoutTestCase):
         self.assertEqual(self._stock(self.store), 8)
         self.assertEqual(self._stock(self.warehouse), 10)
 
-    def test_repeated_import_does_not_duplicate_deliveries_stock_or_invoices(self):
+    def test_repeated_import_after_remapping_keeps_completed_delivery_and_invoice(self):
         order, payload = self._fixture()
         order.process_shopify_pos_fulfillments(payload)
         pickings, invoices, moves = order.picking_ids, order.invoice_ids, order.order_line.move_ids
+        location = self.env['shopify.location.ept'].search([
+            ('instance_id', '=', self.instance.id), ('shopify_location_id', '=', '201'),
+        ])
+        location.warehouse_for_order = self.warehouse
         order.process_shopify_pos_fulfillments(payload)
         self.assertEqual(order.picking_ids, pickings)
+        self.assertEqual(pickings.location_id, self.store.lot_stock_id)
         self.assertEqual(order.invoice_ids, invoices)
         self.assertEqual(order.order_line.move_ids, moves)
         self.assertEqual(self._stock(self.store), 8)
+        self.assertEqual(self._stock(self.warehouse), 10)
+
+    def test_retry_holds_incomplete_done_fulfillment_without_duplicating_stock_or_invoice(self):
+        order, payload = self._fixture(quantity=2)
+        payload['fulfillment_status'] = 'partial'
+        fulfillment_line = payload['fulfillments'][0]['line_items'][0]
+        fulfillment_line['quantity'] = 1
+        order.process_shopify_pos_fulfillments(payload)
+        picking, invoice, move = order.picking_ids, order.invoice_ids, order.order_line.move_ids
+        self.assertEqual(picking.state, 'done')
+        self.assertEqual(move.quantity, 1)
+        self.assertEqual(invoice.amount_total, 25)
+
+        payload['fulfillment_status'] = 'fulfilled'
+        fulfillment_line['quantity'] = 2
+        with self.assertRaisesRegex(UserError, 'fulfillment'):
+            order.process_shopify_pos_fulfillments(payload)
+
+        self.assertEqual(order.picking_ids, picking)
+        self.assertEqual(order.invoice_ids, invoice)
+        self.assertEqual(order.order_line.move_ids, move)
+        self.assertEqual(order.order_line.qty_delivered, 1)
+        self.assertEqual(self._stock(self.store), 9)
 
     def test_partial_fulfillments_split_same_line_between_locations_and_invoice_only_deliveries(self):
         order, payload = self._fixture(quantity=3)
@@ -441,15 +469,76 @@ class TestShopifyPosFulfillment(PayoutTestCase):
             property_stock_journal=journal.id))
         return category, accounts
 
-    def test_standard_cost_valuation_entry_uses_source_fulfillment_date(self):
+    def test_multi_item_standard_cost_fulfillment_keeps_source_dates_and_is_idempotent(self):
         order, payload = self._fixture()
+        self.instance.shopify_store_time_zone = 'America/New_York'
+        self.workflow.invoice_date_is_order_date = False
         category, accounts = self._dated_stock_category()
         self.product.write({'categ_id': category.id, 'standard_price': 10})
+        second_product = self.env['product.product'].create({
+            'name': 'Second POS Stock Item', 'default_code': 'POS-SKU-2', 'type': 'consu',
+            'is_storable': True, 'invoice_policy': 'delivery',
+            'property_account_income_id': self.revenue.id, 'taxes_id': [Command.clear()],
+            'categ_id': category.id, 'standard_price': 6,
+        })
+        self.env['sale.order.line'].create({
+            'order_id': order.id, 'product_id': second_product.id, 'product_uom_qty': 1,
+            'price_unit': 40, 'tax_id': [Command.clear()], 'shopify_line_id': '102',
+        })
+        payload['line_items'].append({
+            'id': 102, 'quantity': 1, 'fulfillable_quantity': 0, 'price': '40.00', 'sku': 'POS-SKU-2',
+        })
+        payload['created_at'] = '2026-10-12T12:00:00-04:00'
+        fulfillment = payload['fulfillments'][0]
+        fulfillment['line_items'].append({'id': 102, 'quantity': 1, 'sku': 'POS-SKU-2'})
+        fulfillment['created_at'] = '2026-10-14T01:23:45Z'
+        source_stamp = fields.Datetime.to_datetime('2026-10-14 01:23:45')
+        source_date = fields.Date.to_date('2026-10-13')
+        quants = self.env['stock.quant']
+        quants._update_available_quantity(second_product, self.warehouse.lot_stock_id, 5)
+
         order.process_shopify_pos_fulfillments(payload)
-        moves = order.picking_ids.move_ids.stock_valuation_layer_ids.account_move_id
-        self.assertTrue(moves)
-        self.assertEqual(set(moves.mapped('date')), {fields.Date.to_date('2026-10-13')})
-        self.assertEqual(sum(moves.line_ids.filtered(lambda item: item.account_id == accounts[2]).mapped('debit')), 20)
+        picking = order.picking_ids
+        self.assertEqual(len(picking), 1)
+        self.assertEqual(picking.state, 'done')
+        self.assertEqual(picking.shopify_fulfillment_id, '501')
+        self.assertEqual(picking.location_id, self.store.lot_stock_id)
+        self.assertEqual(picking.date_done, source_stamp)
+        moves = picking.move_ids
+        self.assertEqual(len(moves), 2)
+        self.assertEqual({move.sale_line_id.shopify_line_id: move.quantity for move in moves}, {'101': 2, '102': 1})
+        self.assertEqual(set(moves.mapped('state')), {'done'})
+        self.assertEqual(moves.location_id, self.store.lot_stock_id)
+        self.assertEqual(set(moves.mapped('date')), {source_stamp})
+        self.assertEqual(set(moves.move_line_ids.mapped('date')), {source_stamp})
+        valuations = moves.stock_valuation_layer_ids
+        self.assertEqual(len(valuations), 2)
+        self.assertEqual({layer.product_id.id: layer.quantity for layer in valuations}, {
+            self.product.id: -2, second_product.id: -1,
+        })
+        self.assertFalse(valuations.filtered(lambda layer: not layer.account_move_id))
+        entries = valuations.account_move_id
+        self.assertEqual(set(entries.mapped('date')), {source_date})
+        self.assertEqual(sum(entries.line_ids.filtered(lambda line: line.account_id == accounts[2]).mapped('debit')), 26)
+        invoice = order.invoice_ids
+        self.assertEqual(len(invoice), 1)
+        self.assertEqual(invoice.state, 'posted')
+        self.assertEqual(invoice.amount_total, 90)
+        self.assertEqual({line.product_id.id: line.quantity for line in invoice.invoice_line_ids}, {
+            self.product.id: 2, second_product.id: 1,
+        })
+        self.assertEqual(invoice.invoice_date, source_date)
+        self.assertEqual(invoice.date, source_date)
+
+        order.process_shopify_pos_fulfillments(payload)
+        self.assertEqual(order.picking_ids, picking)
+        self.assertEqual(order.invoice_ids, invoice)
+        self.assertEqual(order.order_line.move_ids, moves)
+        self.assertEqual(moves.stock_valuation_layer_ids, valuations)
+        self.assertEqual(self._stock(self.store), 8)
+        self.assertEqual(self._stock(self.warehouse), 10)
+        self.assertEqual(quants._get_available_quantity(second_product, self.store.lot_stock_id, allow_negative=True), -1)
+        self.assertEqual(quants._get_available_quantity(second_product, self.warehouse.lot_stock_id), 5)
 
     def test_historical_average_cost_is_held_before_stock_or_invoice(self):
         order, payload = self._fixture()

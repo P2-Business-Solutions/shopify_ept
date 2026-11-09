@@ -1,5 +1,7 @@
 """Record completed Shopify POS sales as deliveries before invoicing them."""
 
+from collections import defaultdict
+
 from odoo import models, _
 from odoo.exceptions import UserError
 from odoo.tools.float_utils import float_compare, float_is_zero
@@ -56,20 +58,8 @@ class SaleOrderPosFulfillment(models.Model):
             raise UserError(_('A POS fulfillment is missing its Shopify ID.'))
         picking = self.picking_ids.filtered(
             lambda row: row.shopify_fulfillment_id == fulfillment_id and row.state != 'cancel')
-        if picking.filtered(lambda row: row.state == 'done'):
-            return
-        location_id = fulfillment.get('location_id') or payload.get('location_id')
-        location = self.env['shopify.location.ept'].search([
-            ('instance_id', '=', self.shopify_instance_id.id),
-            ('shopify_location_id', '=', str(location_id)),
-        ], limit=1)
-        warehouse = location.warehouse_for_order
-        if not warehouse or warehouse.company_id != self.company_id:
-            raise UserError(_(
-                'Map Shopify POS fulfillment location %s to a warehouse in this company and retry.', location_id))
-        if warehouse.shopify_order_hold_reason_id and not self.is_on_hold:
-            raise UserError(_('Warehouse %s places imported deliveries on hold. Review the POS fulfillment before retrying.', warehouse.name))
-        customer_location = self.partner_shipping_id.property_stock_customer
+        if len(picking) > 1:
+            raise UserError(_('POS fulfillment %s has multiple deliveries. Review them before retrying.', fulfillment_id))
         specs = []
         for item in fulfillment.get('line_items', []):
             line = self.order_line.filtered(lambda row: row.shopify_line_id == str(item.get('id')))
@@ -89,7 +79,23 @@ class SaleOrderPosFulfillment(models.Model):
             else:
                 specs.append((line, line.product_id, line.product_uom,
                               quantity, line.product_uom_qty, False))
-        if not specs:
+        if picking.state == 'done':
+            # A later mapping change does not change where completed stock moved.
+            self._check_shopify_pos_delivery(picking, specs, completed=True)
+            return
+        location_id = fulfillment.get('location_id') or payload.get('location_id')
+        location = self.env['shopify.location.ept'].search([
+            ('instance_id', '=', self.shopify_instance_id.id),
+            ('shopify_location_id', '=', str(location_id)),
+        ], limit=1)
+        warehouse = location.warehouse_for_order
+        if not warehouse or warehouse.company_id != self.company_id:
+            raise UserError(_(
+                'Map Shopify POS fulfillment location %s to a warehouse in this company and retry.', location_id))
+        customer_location = self.partner_shipping_id.property_stock_customer
+        if warehouse.shopify_order_hold_reason_id and not self.is_on_hold:
+            raise UserError(_('Warehouse %s places imported deliveries on hold. Review the POS fulfillment before retrying.', warehouse.name))
+        if not specs and not picking:
             return
         carrier = self.env['delivery.carrier'].search_carrier_for_webhook_fulfillment(
             self.shopify_instance_id, fulfillment, preferred_carrier=self.carrier_id,
@@ -109,9 +115,13 @@ class SaleOrderPosFulfillment(models.Model):
             for line, product, uom, quantity, ordered, bom_line in specs:
                 self._shopify_pos_delivery_moves(
                     picking, line, product, uom, quantity, ordered, bom_line)
+        if (picking.location_id != warehouse.lot_stock_id or picking.picking_type_id != warehouse.out_type_id
+                or picking.location_dest_id != customer_location):
+            raise UserError(_('POS fulfillment delivery %s does not match its source warehouse or destination.', picking.name))
         if self.is_on_hold:
             self._apply_delivery_hold_to_pickings()
         picking.action_confirm()
+        self._check_shopify_pos_delivery(picking, specs)
         if picking.state != 'done':
             picking.action_assign()
             for move in picking.move_ids.filtered(lambda row: row.state not in ('done', 'cancel')):
@@ -119,15 +129,45 @@ class SaleOrderPosFulfillment(models.Model):
                     raise UserError(_('Reserve the required lots or serial numbers for POS delivery %s and retry.', picking.name))
                 move._set_quantity_done(move.product_uom_qty)
                 move.picked = True
-            picking.with_context(skip_sms=True, skip_backorder=True).button_validate()
-            if picking.state != 'done':
-                raise UserError(_('POS delivery %s could not be completed. Review its lots or serial numbers and retry.', picking.name))
+            picking.with_context(
+                skip_sms=True, skip_backorder=True, _shopify_pos_completion_picking_id=picking.id,
+            ).button_validate()
+        self._check_shopify_pos_delivery(picking, specs, completed=True)
         vals = {'updated_in_shopify': True}
         if carrier:
             vals['carrier_id'] = carrier.id
         if fulfillment.get('tracking_number'):
             vals['carrier_tracking_ref'] = fulfillment['tracking_number']
         picking.write(vals)
+
+    def _check_shopify_pos_delivery(self, picking, specs, *, completed=False):
+        """Compare the transfer with source quantities before completion and on retries."""
+        if picking.shopify_instance_id != self.shopify_instance_id:
+            raise UserError(_('POS fulfillment delivery %s belongs to another Shopify store.', picking.name))
+
+        moves = picking.move_ids.filtered(lambda move: move.state != 'cancel')
+        if completed and (picking.state != 'done' or moves.filtered(lambda move: move.state != 'done')):
+            raise UserError(_('POS fulfillment delivery %s is incomplete. Review it before retrying.', picking.name))
+
+        expected = defaultdict(float)
+        actual = defaultdict(float)
+        for line, product, uom, quantity, _ordered, bom_line in specs:
+            bom_line_id = bom_line.id if bom_line else False
+            expected[line, product, bom_line_id] += uom._compute_quantity(
+                quantity, product.uom_id, round=False)
+        for move in moves:
+            if move.location_id != picking.location_id or move.location_dest_id != picking.location_dest_id:
+                raise UserError(_('A move on POS fulfillment delivery %s uses another location.', picking.name))
+            quantity = move.quantity if move.state == 'done' else move.product_uom_qty
+            bom_line = getattr(move, 'bom_line_id', False)
+            bom_line_id = bom_line.id if bom_line else False
+            actual[move.sale_line_id, move.product_id, bom_line_id] += move.product_uom._compute_quantity(
+                quantity, move.product_id.uom_id, round=False)
+        if expected.keys() != actual.keys() or any(
+            float_compare(quantity, actual[key], precision_rounding=key[1].uom_id.rounding)
+            for key, quantity in expected.items()
+        ):
+            raise UserError(_('POS fulfillment quantities do not match delivery %s. Review it before retrying.', picking.name))
 
     def _shopify_pos_delivery_moves(self, picking, line, product, uom, quantity, ordered, bom_line):
         """Reuse legacy moves and pending deliveries rather than consuming stock twice."""
