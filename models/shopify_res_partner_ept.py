@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # See LICENSE file for full copyright and licensing details.
-from odoo import models, fields, api, tools
+from psycopg2.errors import UniqueViolation
+
+from odoo import _, api, Command, fields, models, tools
 
 
 class ShopifyResPartnerEpt(models.Model):
@@ -9,7 +11,16 @@ class ShopifyResPartnerEpt(models.Model):
 
     partner_id = fields.Many2one("res.partner", ondelete="cascade")
     shopify_instance_id = fields.Many2one("shopify.instance.ept", "Instances")
-    shopify_customer_id = fields.Char()
+    shopify_customer_id = fields.Char(index=True)
+    # Enforce uniqueness on new imports without rewriting ambiguous legacy mappings.
+    import_managed = fields.Boolean(copy=False, readonly=True)
+
+    def init(self):
+        self.env.cr.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS shopify_res_partner_ept_import_identity_uniq
+            ON shopify_res_partner_ept (shopify_instance_id, shopify_customer_id)
+            WHERE import_managed
+        """)
 
     @api.model
     @tools.ormcache()
@@ -33,94 +44,89 @@ class ShopifyResPartnerEpt(models.Model):
         customer_channel_id = self._get_ecom_customer_channel_id()
         return {"x_studio_customer_channel": customer_channel_id} if customer_channel_id else {}
 
-    def _set_ecom_customer_channel(self, partner):
-        customer_channel_vals = self._get_ecom_customer_channel_vals()
-        if partner and customer_channel_vals:
-            (partner | partner.commercial_partner_id).write(customer_channel_vals)
+    def _log_customer_import_failure(self, instance, queue_line, message):
+        order_line = queue_line if self.env.context.get("order_data_queue") else False
+        customer_line = queue_line if self.env.context.get("customer_data_queue") else False
+        self.env["common.log.lines.ept"].create_common_log_line_ept(
+            shopify_instance_id=instance.id, module="shopify_ept", model_name="res.partner",
+            message=message, shopify_order_data_queue_line_id=order_line.id if order_line else False,
+            shopify_customer_data_queue_line_id=customer_line.id if customer_line else False,
+            order_ref=order_line.shopify_order_id if order_line else False,
+        )
+        return False
 
-    def shopify_create_contact_partner(self, vals, instance, queue_line):
-        """
-        This method is used to create a contact type customer.
-        @author: Maulik Barad on Date 09-Sep-2020.
-        @change : pass category_id as tag on vals by Nilam Kubavat for task id : 190111 at 19/05/2022
-        """
-        partner_obj = self.env["res.partner"]
-        common_log_line_obj = self.env["common.log.lines.ept"]
-
-        shopify_instance_id = instance.id
-        shopify_customer_id = vals.get("id", False)
-        first_name = vals.get("first_name", "")
-        last_name = vals.get("last_name", "")
-        email = vals.get("email", "")
-        customer_channel_vals = self._get_ecom_customer_channel_vals()
-        
-        if not first_name and not last_name and not email:
-            message = ("System tried to create a customer but did not receive essential details like First Name, Last Name, or Email in the response.\n"
-				        "Action Items:\n"
-				        "- Verify the customer details in the queue response or directly on the Shopify store.\n"
-				        "- Update the customer data on the Shopify store, then re-import the customer or order using the specific order import functionality.")
-            common_log_line_obj.create_common_log_line_ept(shopify_instance_id=instance.id, module="shopify_ept",
-                                                           message=message,
-                                                           model_name='res.partner',
-                                                           shopify_order_data_queue_line_id=queue_line.id if self._context.get(
-                                                               'order_data_queue') else False,
-                                                           shopify_customer_data_queue_line_id=queue_line.id if self._context.get(
-                                                               'customer_data_queue') else False,
-                                                           order_ref=queue_line.shopify_order_id if self._context.get(
-                                                               'order_data_queue') else False)
+    def _accepts_shopify_orders(self, partner, instance, channel_vals):
+        commercial = partner.commercial_partner_id
+        company = instance.shopify_company_id
+        if (not partner.active or not commercial.active
+                or (partner | commercial).company_id - company):
             return False
+        return all(commercial[field].id == channel_id and partner[field].id in (False, channel_id)
+                   for field, channel_id in channel_vals.items())
 
-        name = ""
-        if first_name:
-            name = "%s" % first_name
-        if last_name:
-            name += " %s" % last_name if name else "%s" % last_name
-        if not name and email:
-            name = email
+    def shopify_create_contact_partner(self, vals, instance, queue_line=None, *, historical_partner=None):
+        """Resolve the Shopify identity before using any customer details to create a contact."""
+        customer_id = str(vals.get("id") or "").strip()
+        if not customer_id:
+            return self._log_customer_import_failure(instance, queue_line, _(
+                "Shopify did not provide a customer ID. Verify the customer in Shopify and retry the import."))
 
-        partner = self.search_shopify_partner(shopify_customer_id, shopify_instance_id)
-        tag_ids = []
-        if vals.get("tags"):
-            tags = vals.get("tags").split(",") if vals.get("tags") != '' else []
-            for tag in tags:
-                tag_ids.append(partner_obj.create_or_search_tag(tag))
-
-        if partner:
-            if not partner.parent_id:
-                partner = self.update_partner_with_company(instance, vals.get("default_address", {}), False, partner)
-            partner.write({"category_id": [(6, 0, tag_ids)]})
-            self._set_ecom_customer_channel(partner)
+        partner_obj = self.env["res.partner"]
+        channel_vals = self._get_ecom_customer_channel_vals()
+        mappings = self._find_shopify_customer_mapping(customer_id, instance.id)
+        if mappings:
+            if len(mappings) != 1 or not self._accepts_shopify_orders(mappings.partner_id, instance, channel_vals):
+                return self._log_customer_import_failure(instance, queue_line, _(
+                    "Shopify customer %(customer)s has an ambiguous, inactive, other-company, or non-Ecom mapping. "
+                    "Review the customer mapping before retrying this import.", customer=customer_id))
+            partner = mappings.partner_id
+            if "tags" in vals:
+                tag_ids = [partner_obj.create_or_search_tag(tag) for tag in (vals.get("tags") or "").split(",") if tag]
+                partner.category_id = [Command.set(tag_ids)]
             return partner
 
-        shopify_partner_values = {"shopify_customer_id": shopify_customer_id,
-                                  "shopify_instance_id": shopify_instance_id}
-        if email:
-            partner = partner_obj.search_partner_by_email(email)
+        email = vals.get("email") or False
+        phone = vals.get("phone") or False
+        name = " ".join(filter(None, (vals.get("first_name"), vals.get("last_name")))).strip() or email or phone
+        if not name and not historical_partner:
+            return self._log_customer_import_failure(instance, queue_line, _(
+                "Shopify did not provide a name, email, or phone for customer %(customer)s. "
+                "Verify the customer in Shopify and retry the import.", customer=customer_id))
 
-            if partner:
-                partner.write({"is_shopify_customer": True, "category_id": [(6, 0, tag_ids)]})
-                self._set_ecom_customer_channel(partner)
-                shopify_partner_values.update({"partner_id": partner.id})
-                self.create(shopify_partner_values)
-                return partner
+        try:
+            with self.env.cr.savepoint():
+                mapping = self.create({
+                    "shopify_instance_id": instance.id,
+                    "shopify_customer_id": customer_id,
+                    "import_managed": True,
+                })
+                mapping.partner_id = historical_partner or self._create_shopify_contact(
+                    vals, instance, name, email, phone, channel_vals)
+        except UniqueViolation as error:
+            if error.diag.constraint_name != "shopify_res_partner_ept_import_identity_uniq":
+                raise
+            return self._log_customer_import_failure(instance, queue_line, _(
+                "Shopify customer %(customer)s was mapped by another import. Retry to use the new mapping.",
+                customer=customer_id))
+        return mapping.partner_id
 
-        partner_vals = self.shopify_prepare_partner_vals(vals.get("default_address", {}), instance)
-        partner_vals.update({
-            "name": name,
-            "email": email,
-            "customer_rank": 1,
-            "is_shopify_customer": True,
-            "type": "contact",
-            "category_id": [(6, 0, tag_ids)],
-            "phone": vals.get("phone", "") if not partner_vals.get("phone") else partner_vals.get("phone")
-        })
-        partner_vals.update(customer_channel_vals)
-        partner = partner_obj.create(partner_vals)
+    def _create_shopify_contact(self, vals, instance, name, email, phone, channel_vals):
+        partner_obj = self.env["res.partner"]
+        address = vals.get("default_address") or {}
+        tag_ids = [partner_obj.create_or_search_tag(tag) for tag in (vals.get("tags") or "").split(",") if tag]
+        partner_vals = self.shopify_prepare_partner_vals(address, instance)
+        partner_vals.update(channel_vals, name=name, email=email, customer_rank=1, is_shopify_customer=True,
+                            type="contact", category_id=[Command.set(tag_ids)],
+                            phone=partner_vals.get("phone") or phone)
+        if instance.import_customer_as_company and address.get("company"):
+            company = partner_obj.create(dict(channel_vals, name=address["company"], email=email,
+                                              is_company=True, customer_rank=1, is_shopify_customer=True))
+            partner_vals["parent_id"] = company.id
+        return partner_obj.create(partner_vals)
 
-        shopify_partner_values.update({"partner_id": partner.id})
-        self.create(shopify_partner_values)
-        partner = self.update_partner_with_company(instance, vals.get("default_address", {}), False, partner)
-        return partner
+    def _find_shopify_customer_mapping(self, customer_id, instance_id):
+        return self.search([("shopify_customer_id", "=", customer_id),
+                            ("shopify_instance_id", "=", instance_id)], limit=2)
 
     def search_shopify_partner(self, shopify_customer_id, shopify_instance_id):
         """ This method is used to search the shopify partner.
@@ -128,14 +134,11 @@ class ShopifyResPartnerEpt(models.Model):
             @author: Haresh Mori @Emipro Technologies Pvt. Ltd on date 27 October 2020 .
             Task_id: 167537
         """
-        partner = False
-        shopify_partner = self.search([("shopify_customer_id", "=", shopify_customer_id),
-                                       ("shopify_instance_id", "=", shopify_instance_id)], limit=1)
-        if shopify_partner:
-            partner = shopify_partner.partner_id
-            return partner
-
-        return partner
+        if shopify_customer_id:
+            mappings = self._find_shopify_customer_mapping(str(shopify_customer_id), shopify_instance_id)
+            if len(mappings) == 1:
+                return mappings.partner_id
+        return False
 
     @api.model
     def shopify_create_or_update_address(self, instance, shopify_customer_data, parent_partner, partner_type="contact"):
@@ -144,6 +147,7 @@ class ShopifyResPartnerEpt(models.Model):
         @author: Maulik Barad on Date 09-Sep-2020.
         """
         partner_obj = self.env["res.partner"]
+        parent_partner = parent_partner.commercial_partner_id
 
         first_name = shopify_customer_data.get("first_name")
         last_name = shopify_customer_data.get("last_name")
@@ -151,29 +155,19 @@ class ShopifyResPartnerEpt(models.Model):
         if not first_name and not last_name:
             return False
 
-        company_name = shopify_customer_data.get("company")
+        company_name = shopify_customer_data.get("company") if not instance.import_customer_as_company else False
         partner_vals = self.shopify_prepare_partner_vals(shopify_customer_data)
         address_key_list = ["name", "street", "street2", "city", "zip", "phone", "state_id", "country_id"]
 
-        if company_name and not instance.import_customer_as_company:
+        if company_name:
             address_key_list.append("company_name")
-            partner_vals.update({"company_name": company_name})
+            partner_vals["company_name"] = company_name
 
         partner = partner_obj._find_partner_ept(partner_vals, address_key_list,
                                                 [("parent_id", "=", parent_partner.id), ("type", "=", partner_type)])
 
-        if not partner:
-            partner = partner_obj._find_partner_ept(partner_vals, address_key_list,
-                                                    [("parent_id", "=", parent_partner.id)])
-        if not partner:
-            partner = partner_obj._find_partner_ept(partner_vals, address_key_list)
-            if partner and not partner.child_ids and partner_type == 'invoice':
-                partner.write({"type": partner_type})
-
         if partner:
-            if not partner.parent_id:
-                partner = self.update_partner_with_company(instance, shopify_customer_data, parent_partner, partner)
-            if parent_partner.email:
+            if parent_partner.email and partner.email != parent_partner.email:
                 partner.write({'email': parent_partner.email})
             return partner
 
@@ -181,12 +175,8 @@ class ShopifyResPartnerEpt(models.Model):
         if parent_partner.email:
             partner_vals.update({'email': parent_partner.email})
         partner = partner_obj.create(partner_vals)
-
-        company_name and partner.write({"company_name": company_name})
-        partner = self.update_partner_with_company(instance, shopify_customer_data, parent_partner, partner)
-        if instance.import_customer_as_company and partner.parent_id:
-            partner.company_name = False
-
+        if company_name:
+            partner.company_name = company_name
         return partner
 
     def shopify_prepare_partner_vals(self, vals, instance=False):
@@ -233,52 +223,3 @@ class ShopifyResPartnerEpt(models.Model):
         }
         update_partner_vals = partner_obj.remove_special_chars_from_partner_vals(partner_vals)
         return update_partner_vals
-
-    def create_customer_as_company(self, vals, partner):
-        """
-        :param vals:
-        :param partner:
-        :return:
-        """
-        partner_obj = self.env["res.partner"]
-        # company = partner_obj.search(['|', ('name', '=', vals.get('company')),
-        #                               ('email', '=', vals.get('email')),
-        #                               ('is_company', '=', True)])
-        company = partner_obj.search([('name', '=', vals.get('company')), ('is_company', '=', True)])
-        partner_id = False
-        if partner and partner.parent_id:
-            partner_id = partner.parent_id.id
-        elif partner and not partner.parent_id:
-            partner_id = partner.id
-        if not company:
-            partner_vals = {
-                "name": vals.get('company'),
-                "is_company": True,
-                "customer_rank": 1,
-                # 'parent_id': partner.parent_id if partner and partner.parent_id else partner
-                'parent_id': partner_id
-            }
-            partner_vals.update(self._get_ecom_customer_channel_vals())
-            company = partner_obj.create(partner_vals)
-        else:
-            self._set_ecom_customer_channel(company)
-        return company
-
-    def update_partner_with_company(self, instance, address_details, parent_partner, partner):
-        """
-        :param instance:
-        :param address_details:
-        :param parent_partner:
-        :param partner:
-        :return:
-        """
-        if address_details.get('company') and instance.import_customer_as_company:
-            company_id = self.create_customer_as_company(address_details, parent_partner)
-            if company_id != partner:
-                if not parent_partner:
-                    if company_id and not partner.parent_id and company_id.parent_id != partner:
-                        partner.parent_id = company_id
-                else:
-                    if company_id and company_id.parent_id != partner:
-                        partner.parent_id = company_id
-        return partner

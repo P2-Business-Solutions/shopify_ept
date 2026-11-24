@@ -174,7 +174,7 @@ class ShopifyCustomerDataQueueLineEpt(models.Model):
             customer_data = json.loads(line.shopify_synced_customer_data)
             main_partner = shopify_partner_obj.with_context(customer_data_queue=True).shopify_create_contact_partner(customer_data, instance, line)
             if main_partner:
-                for address in customer_data.get("addresses"):
+                for address in customer_data.get("addresses") or []:
                     if address.get("default"):
                         continue
                     shopify_partner_obj.shopify_create_or_update_address(instance, address, main_partner, "other")

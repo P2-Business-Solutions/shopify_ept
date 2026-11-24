@@ -150,13 +150,12 @@ class ShopifyPayoutRepairLine(models.Model):
                     or (partner.commercial_partner_id.company_id
                         and partner.commercial_partner_id.company_id != company))):
             raise UserError(_('The Shopify email identifies ambiguous, inactive or other-company customers. Correct the customer mapping manually.'))
-        # This is the same entry point used by customer queues. Keep the regular
-        # customer's tags/channel handling; suppress import notifications only.
+        # Historical refunds can use reviewed email evidence to identify an existing account.
         customer = dict(customer, email=email)
         partner = mappings.with_company(company).with_context(
             tracking_disable=True, mail_create_nosubscribe=True, mail_create_nolog=True,
             order_data_queue=False, customer_data_queue=False,
-        ).shopify_create_contact_partner(customer, instance, self.env['shopify.customer.data.queue.line.ept'])
+        ).shopify_create_contact_partner(customer, instance, historical_partner=candidates[:1])
         if not partner:
             raise UserError(_('The customer importer did not create a customer mapping. Review the source customer details.'))
         return customer_id, partner

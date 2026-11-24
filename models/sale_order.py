@@ -151,14 +151,15 @@ class SaleOrder(models.Model):
 
         if pos_order:
             if order_response.get("customer"):
-                partner = res_partner_obj.create_shopify_pos_customer(order_response, instance)
+                partner = res_partner_obj.with_context(order_data_queue=True).create_shopify_pos_customer(
+                    order_response, instance, order_data_line)
             else:
                 partner = instance.shopify_default_pos_customer_id
-            if not partner:
-                message = ("It seems the imported order is a POS order, and the Shopify API did not provide customer details in the response.\n"
-                          "Action Items:\n"
-                          "- Set a default POS customer in the Shopify configuration.\n"
-                          "- Go to: Shopify → Configuration → Settings → POS Customer.")
+                if not partner:
+                    message = ("It seems the imported order is a POS order, and the Shopify API did not provide customer details in the response.\n"
+                               "Action Items:\n"
+                               "- Set a default POS customer in the Shopify configuration.\n"
+                               "- Go to: Shopify → Configuration → Settings → POS Customer.")
         else:
             if not any([order_response.get("customer", {}), order_response.get("billing_address", {}),
                         order_response.get("shipping_address", {})]):
@@ -186,8 +187,7 @@ class SaleOrder(models.Model):
                 order_data_line.write({"state": "failed", "processed_at": datetime.now()})
             return False, False, False
 
-        if partner.parent_id:
-            partner = partner.parent_id
+        partner = partner.commercial_partner_id
 
         invoice_address = order_response.get("billing_address") and \
                           shopify_res_partner_obj.shopify_create_or_update_address(instance,
